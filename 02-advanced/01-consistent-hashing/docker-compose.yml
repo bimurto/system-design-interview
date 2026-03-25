@@ -1,0 +1,10 @@
+services:
+  experiment:
+    image: python:3.11-slim
+    volumes:
+      - ./experiment.py:/experiment.py
+    command: python /experiment.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import hashlib; print('ok')"]
+      interval: 5s
+      retries: 3

@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  payment-service:
+    image: python:3.11-slim
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://app:secret@db:5432/payments
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ./payment_service.py:/payment_service.py
+    command: >
+      sh -c "pip install flask psycopg2-binary redis --quiet && python /payment_service.py"
+    ports:
+      - "5002:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s

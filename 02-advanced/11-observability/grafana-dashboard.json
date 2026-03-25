@@ -1,0 +1,79 @@
+{
+  "title": "Flask App — RED Method Dashboard",
+  "uid": "flask-red",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (req/s)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{
+        "expr": "sum(rate(http_requests_total[1m]))",
+        "legendFormat": "req/s"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "Error Rate (%)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{
+        "expr": "100 * sum(rate(http_requests_total{status_code=~\"5..\"}[1m])) / sum(rate(http_requests_total[1m]))",
+        "legendFormat": "error %"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "P99 Latency (seconds)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{
+        "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
+        "legendFormat": "p99"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Active Connections",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{
+        "expr": "http_active_connections",
+        "legendFormat": "active"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "Request Rate by Endpoint",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{
+        "expr": "sum(rate(http_requests_total[1m])) by (endpoint)",
+        "legendFormat": "{{endpoint}}"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Latency Percentiles",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+services:
+  redis-1:
+    image: redis:7
+    ports:
+      - "7001:7001"
+    command: >
+      redis-server --port 7001
+        --cluster-enabled yes
+        --cluster-config-file nodes.conf
+        --cluster-node-timeout 5000
+        --appendonly yes
+        --cluster-require-full-coverage no
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7001", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-2:
+    image: redis:7
+    ports:
+      - "7002:7002"
+    command: >
+      redis-server --port 7002
+        --cluster-enabled yes
+        --cluster-config-file nodes.conf
+        --cluster-node-timeout 5000
+        --appendonly yes
+        --cluster-require-full-coverage no
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7002", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-3:
+    image: redis:7
+    ports:
+      - "7003:7003"
+    command: >
+      redis-server --port 7003
+        --cluster-enabled yes
+        --cluster-config-file nodes.conf
+        --cluster-node-timeout 5000
+        --appendonly yes
+        --cluster-require-full-coverage no
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "7003", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  cluster-init:
+    image: redis:7
+    depends_on:
+      redis-1:
+        condition: service_healthy
+      redis-2:
+        condition: service_healthy
+      redis-3:
+        condition: service_healthy
+    command: >
+      bash -c "
+        sleep 2 &&
+        redis-cli --cluster create redis-1:7001 redis-2:7002 redis-3:7003
+          --cluster-replicas 0 --cluster-yes
+      "
+    restart: "no"

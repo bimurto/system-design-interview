@@ -1,0 +1,28 @@
+services:
+  redis-master:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica1:
+    image: redis:7
+    ports:
+      - "6380:6379"
+    command: redis-server --replicaof redis-master 6379
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  redis-replica2:
+    image: redis:7
+    ports:
+      - "6381:6379"
+    command: redis-server --replicaof redis-master 6379
+    depends_on:
+      redis-master:
+        condition: service_healthy

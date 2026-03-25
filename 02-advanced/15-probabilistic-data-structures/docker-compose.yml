@@ -1,0 +1,22 @@
+services:
+  redis-stack:
+    image: redis/redis-stack-server:7.2.0-v9
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  experiment:
+    image: python:3.11-slim
+    volumes:
+      - ./experiment.py:/experiment.py
+    command: >
+      sh -c "pip install redis mmh3 --quiet && python /experiment.py"
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis-stack

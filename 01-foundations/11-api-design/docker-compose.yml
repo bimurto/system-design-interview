@@ -1,0 +1,28 @@
+services:
+  rest-api:
+    image: python:3.11-slim
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./rest_api.py:/app/rest_api.py:ro
+    command: bash -c "pip install flask -q && python /app/rest_api.py"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  graphql-api:
+    image: python:3.11-slim
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./graphql_api.py:/app/graphql_api.py:ro
+    command: bash -c "pip install flask strawberry-graphql -q && python /app/graphql_api.py"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

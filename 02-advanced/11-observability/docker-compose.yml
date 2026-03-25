@@ -1,0 +1,63 @@
+services:
+  flask-app:
+    image: python:3.11-slim
+    volumes:
+      - ./flask_app.py:/flask_app.py
+    command: >
+      sh -c "pip install flask prometheus_client --quiet && python /flask_app.py"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      flask-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./grafana-dashboard.json:/var/lib/grafana/dashboards/app.json:ro
+      - ./grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  experiment:
+    image: python:3.11-slim
+    volumes:
+      - ./experiment.py:/experiment.py
+    command: >
+      sh -c "pip install requests --quiet && python /experiment.py"
+    depends_on:
+      grafana:
+        condition: service_healthy
+    environment:
+      - APP_HOST=flask-app
+      - PROM_HOST=prometheus

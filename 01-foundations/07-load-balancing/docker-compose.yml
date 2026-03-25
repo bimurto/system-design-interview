@@ -1,0 +1,141 @@
+services:
+  app1:
+    image: python:3.11-slim
+    environment:
+      APP_NAME: app1
+      LATENCY_MS: "50"
+    command: >
+      bash -c "pip install flask -q &&
+      python -c \"
+import os, time
+from flask import Flask, jsonify
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
+    time.sleep(delay)
+    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
+
+@app.route('/health')
+def health():
+    return 'ok', 200
+
+app.run(host='0.0.0.0', port=8000)
+\""
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app2:
+    image: python:3.11-slim
+    environment:
+      APP_NAME: app2
+      LATENCY_MS: "200"
+    command: >
+      bash -c "pip install flask -q &&
+      python -c \"
+import os, time
+from flask import Flask, jsonify
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
+    time.sleep(delay)
+    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
+
+@app.route('/health')
+def health():
+    return 'ok', 200
+
+app.run(host='0.0.0.0', port=8000)
+\""
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app3:
+    image: python:3.11-slim
+    environment:
+      APP_NAME: app3
+      LATENCY_MS: "50"
+    command: >
+      bash -c "pip install flask -q &&
+      python -c \"
+import os, time
+from flask import Flask, jsonify
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
+    time.sleep(delay)
+    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
+
+@app.route('/health')
+def health():
+    return 'ok', 200
+
+app.run(host='0.0.0.0', port=8000)
+\""
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app4:
+    image: python:3.11-slim
+    environment:
+      APP_NAME: app4
+      LATENCY_MS: "500"
+    command: >
+      bash -c "pip install flask -q &&
+      python -c \"
+import os, time
+from flask import Flask, jsonify
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
+    time.sleep(delay)
+    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
+
+@app.route('/health')
+def health():
+    return 'ok', 200
+
+app.run(host='0.0.0.0', port=8000)
+\""
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      app3:
+        condition: service_healthy
+      app4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

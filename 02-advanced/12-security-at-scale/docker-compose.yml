@@ -1,0 +1,49 @@
+services:
+  auth-service:
+    image: python:3.11-slim
+    volumes:
+      - ./auth_service.py:/auth_service.py
+    command: >
+      sh -c "pip install flask pyjwt --quiet && python /auth_service.py"
+    ports:
+      - "8001:8001"
+    environment:
+      - JWT_SECRET=supersecretkey_change_in_production
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api-service:
+    image: python:3.11-slim
+    volumes:
+      - ./api_service.py:/api_service.py
+    command: >
+      sh -c "pip install flask pyjwt --quiet && python /api_service.py"
+    ports:
+      - "8002:8002"
+    environment:
+      - JWT_SECRET=supersecretkey_change_in_production
+      - AUTH_HOST=auth-service
+    depends_on:
+      auth-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  experiment:
+    image: python:3.11-slim
+    volumes:
+      - ./experiment.py:/experiment.py
+    command: >
+      sh -c "pip install requests pyjwt --quiet && python /experiment.py"
+    depends_on:
+      api-service:
+        condition: service_healthy
+    environment:
+      - AUTH_HOST=auth-service
+      - API_HOST=api-service
