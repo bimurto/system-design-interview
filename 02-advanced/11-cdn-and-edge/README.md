@@ -19,6 +19,15 @@ Edge computing extends CDNs beyond caching to execute application logic at PoPs.
 
 ## How It Works
 
+**CDN Origin-Pull Request Flow:**
+1. Client's DNS resolver queries for the domain; the CDN's DNS system (via Anycast or GeoDNS) returns the IP of the nearest Point of Presence (PoP)
+2. Client opens an HTTPS connection to the PoP; TLS handshake terminates at the PoP — no TLS round trip to the origin
+3. PoP computes a cache key from the request (scheme + host + URI path + relevant query parameters)
+4. **Cache HIT:** PoP serves the cached response immediately (5–20ms latency); request never reaches the origin
+5. **Cache MISS:** PoP opens (or reuses) a persistent connection to the origin server and fetches the resource
+6. Origin responds with the resource and `Cache-Control` headers (e.g., `max-age=3600, public`)
+7. PoP stores the response in its edge cache according to the `Cache-Control` directives and returns it to the client; subsequent requests from nearby users hit the cache
+
 **Origin Pull vs Push:**
 
 ```

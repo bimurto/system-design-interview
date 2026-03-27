@@ -74,35 +74,38 @@ Work through all 39 topics in sequence. Earlier topics build vocabulary and intu
 | 10 | Networking Basics | Foundations | 45 min | TCP, HTTP versions, latency numbers |
 | 11 | API Design | Foundations | 45 min | REST, GraphQL, gRPC trade-offs |
 | 12 | Blob/Object Storage | Foundations | 45 min | S3 model, multipart upload, CDN |
-| 13 | Consistent Hashing | Advanced | 60 min | Hash ring, virtual nodes |
-| 14 | Distributed Transactions | Advanced | 60 min | 2PC, Saga pattern |
-| 15 | Consensus: Paxos & Raft | Advanced | 60 min | Leader election, log replication |
-| 16 | Event-Driven Architecture | Advanced | 60 min | Event sourcing, CQRS |
-| 17 | Message Queues & Kafka | Advanced | 60 min | Partitions, consumer groups |
-| 18 | Stream Processing | Advanced | 60 min | Windowing, watermarks |
-| 19 | Distributed Caching | Advanced | 60 min | Redis Cluster, hash slots |
-| 20 | Search Systems | Advanced | 60 min | Inverted index, BM25, Elasticsearch |
-| 21 | Rate Limiting Algorithms | Advanced | 45 min | Token bucket, sliding window |
-| 22 | CDN & Edge | Advanced | 45 min | Cache-control, origin pull |
-| 23 | Observability | Advanced | 60 min | Metrics, traces, logs, SLO |
-| 24 | Security at Scale | Advanced | 45 min | JWT, OAuth2, HTTPS |
-| 25 | Service Discovery | Advanced | 60 min | etcd, Consul, leader election |
-| 26 | Idempotency & Exactly-Once | Advanced | 60 min | Idempotency keys, Kafka transactions |
-| 27 | Probabilistic Data Structures | Advanced | 60 min | Bloom filter, HyperLogLog |
-| 28 | URL Shortener | Case Studies | 90 min | ID generation, redirect caching |
-| 29 | Twitter Timeline | Case Studies | 90 min | Fan-out on write vs read |
-| 30 | YouTube | Case Studies | 90 min | Video pipeline, adaptive bitrate |
-| 31 | Uber | Case Studies | 90 min | Geo-indexing, real-time matching |
-| 32 | WhatsApp | Case Studies | 90 min | Message delivery guarantees |
-| 33 | Google Drive | Case Studies | 90 min | Delta sync, deduplication |
-| 34 | Web Crawler | Case Studies | 90 min | URL frontier, politeness |
-| 35 | Search Engine | Case Studies | 90 min | Inverted index, ranking pipeline |
-| 36 | Notification System | Case Studies | 90 min | Multi-channel fan-out |
-| 37 | Distributed Rate Limiter | Case Studies | 90 min | Redis-backed enforcement |
-| 38 | Distributed Cache | Case Studies | 90 min | Redis internals, eviction |
-| 39 | Payment System | Case Studies | 90 min | Idempotency, double-entry ledger |
+| 13 | Proxies & Reverse Proxies | Foundations | 45 min | Reverse proxy, SSL termination, API gateway |
+| 14 | Failure Modes & Reliability | Foundations | 45 min | Timeouts, retries, circuit breaker, cascading failure |
+| 15 | Consistent Hashing | Advanced | 60 min | Hash ring, virtual nodes |
+| 16 | Distributed Transactions | Advanced | 60 min | 2PC, Saga pattern |
+| 17 | Consensus: Paxos & Raft | Advanced | 60 min | Leader election, log replication |
+| 18 | Event-Driven Architecture | Advanced | 60 min | Event sourcing, CQRS |
+| 19 | Message Queues — Fundamentals | Advanced | 60 min | At-least-once, DLQ, competing consumers, pub/sub |
+| 20 | Message Queues & Kafka | Advanced | 60 min | Partitions, consumer groups, log retention |
+| 21 | Stream Processing | Advanced | 60 min | Windowing, watermarks |
+| 22 | Distributed Caching | Advanced | 60 min | Redis Cluster, hash slots |
+| 23 | Search Systems | Advanced | 60 min | Inverted index, BM25, Elasticsearch |
+| 24 | Rate Limiting Algorithms | Advanced | 45 min | Token bucket, sliding window |
+| 25 | CDN & Edge | Advanced | 45 min | Cache-control, origin pull |
+| 26 | Observability | Advanced | 60 min | Metrics, traces, logs, SLO |
+| 27 | Security at Scale | Advanced | 45 min | JWT, OAuth2, HTTPS |
+| 28 | Service Discovery | Advanced | 60 min | etcd, Consul, leader election |
+| 29 | Idempotency & Exactly-Once | Advanced | 60 min | Idempotency keys, Kafka transactions |
+| 30 | Probabilistic Data Structures | Advanced | 60 min | Bloom filter, HyperLogLog |
+| 31 | URL Shortener | Case Studies | 90 min | ID generation, redirect caching |
+| 32 | Twitter Timeline | Case Studies | 90 min | Fan-out on write vs read |
+| 33 | YouTube | Case Studies | 90 min | Video pipeline, adaptive bitrate |
+| 34 | Uber | Case Studies | 90 min | Geo-indexing, real-time matching |
+| 35 | WhatsApp | Case Studies | 90 min | Message delivery guarantees |
+| 36 | Google Drive | Case Studies | 90 min | Delta sync, deduplication |
+| 37 | Web Crawler | Case Studies | 90 min | URL frontier, politeness |
+| 38 | Search Engine | Case Studies | 90 min | Inverted index, ranking pipeline |
+| 39 | Notification System | Case Studies | 90 min | Multi-channel fan-out |
+| 40 | Distributed Rate Limiter | Case Studies | 90 min | Redis-backed enforcement |
+| 41 | Distributed Cache | Case Studies | 90 min | Redis internals, eviction |
+| 42 | Payment System | Case Studies | 90 min | Idempotency, double-entry ledger |
 
-**Total estimated time:** ~37 hours of focused study across all topics.
+**Total estimated time:** ~41 hours of focused study across all topics.
 
 ---
 

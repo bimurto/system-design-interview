@@ -17,6 +17,14 @@ The right time to shard is when you have genuinely exhausted all other options. 
 
 ## How It Works
 
+**Query Routing to the Correct Shard (Hash-Based):**
+1. Client sends a query containing a shard key (e.g., `user_id = 42`)
+2. Application layer (or routing proxy) computes the target shard: `shard = hash(user_id) % N` where N is the number of shards
+3. Router consults its shard map to identify which database host owns that shard number
+4. Query is forwarded directly to the identified shard host — no other shards are involved
+5. Shard executes the query against its local data subset and returns the result
+6. **Cross-shard query (non-shard-key filter):** router sends the query to ALL N shards in parallel (scatter), waits for all responses, merges and sorts results in the application (gather) — expensive at scale
+
 **Hash-based sharding** applies a hash function to the shard key and takes it modulo N (the number of shards): `shard = hash(user_id) % N`. This distributes rows evenly across shards when user IDs are numerous and random. It has no concept of range: consecutive user IDs land on different shards based on their hash values, so a query like "find users with IDs 100-200" must query all N shards. Hash sharding is the default for most NoSQL systems (MongoDB's hashed sharding, Redis Cluster's CRC16 hash slot approach).
 
 **Range-based sharding** assigns contiguous key ranges to shards: shard-0 holds user_id 1–10M, shard-1 holds 10M–20M, etc. Range queries are efficient — they hit only the shards whose range overlaps the query. The danger is hotspots: if user IDs are assigned sequentially (auto-increment primary keys), all new writes go to the last shard. This shard becomes a hotspot while all earlier shards are idle. Solutions include salting the key (prepend a random prefix), using UUIDs, or pre-splitting ranges.

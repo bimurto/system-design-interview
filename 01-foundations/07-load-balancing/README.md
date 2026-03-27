@@ -19,6 +19,15 @@ Load balancers operate at different layers of the OSI model. **L4 (transport lay
 
 ## How It Works
 
+**End-to-End Request Flow Through an L7 Load Balancer:**
+1. Client initiates a TCP connection to the load balancer's public IP; TLS handshake occurs at the load balancer (TLS termination)
+2. Load balancer decrypts the request and parses the full HTTP request — URL path, headers, cookies, body
+3. Scheduling algorithm selects a healthy backend from the pool (round-robin, least-connections, IP hash, etc.)
+4. Load balancer forwards the request to the selected backend over plain HTTP on the internal private network
+5. Backend processes the request and returns the HTTP response to the load balancer
+6. Load balancer encrypts the response and forwards it to the client over the original TLS connection
+7. If a backend fails its health check, it is removed from the pool; all new requests route to the remaining healthy backends
+
 When a request arrives at a load balancer, the balancer selects a backend using a **scheduling algorithm**:
 
 **Round-robin** cycles through backends in order. Backend list: [A, B, C, D]. Request 1 → A, 2 → B, 3 → C, 4 → D, 5 → A. Equal distribution regardless of backend capacity or current load. Simple, stateless, and effective when all backends are identical and request durations are similar.

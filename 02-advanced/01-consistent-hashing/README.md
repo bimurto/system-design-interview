@@ -19,6 +19,15 @@ Consistent hashing appears throughout distributed systems under different names 
 
 ## How It Works
 
+**Key Lookup on the Hash Ring:**
+1. Hash each node identifier (including virtual node suffixes: `"node-A:0"` through `"node-A:149"`) to a position in the range 0 → 2^128 using a consistent hash function (e.g., MD5, MurmurHash)
+2. Store all virtual node positions in a sorted array (the "ring")
+3. When a key arrives, hash the key to a ring position using the same hash function
+4. Binary-search the sorted array for the first ring position ≥ the key's hash — that virtual node's owner serves this key
+5. If the key's hash is greater than all ring positions, wrap around to the first position (ring property)
+6. **Adding a node:** insert its virtual node positions; only keys between the new node and its predecessor (clockwise) are remapped — approximately 1/N of all keys
+7. **Removing a node:** delete its positions; affected keys advance clockwise to the next node — all other keys are undisturbed
+
 **Ring construction:** hash the node identifier (e.g., `"node-A:0"`, `"node-A:1"`, ..., `"node-A:149"`) to get a 128-bit integer. Place that integer as a point on a number line from 0 to 2¹²⁸. The line wraps around — the point after `2¹²⁸ - 1` is `0` — forming a ring. Keep the points in a sorted array.
 
 **Key lookup:** hash the key to a 128-bit integer. Binary-search the sorted array to find the first ring point ≥ that hash. The physical server owning that ring point serves the key. If no point is ≥ the hash (key falls past the last point), wrap around to the first point — hence the modulo in `idx % len(sorted_keys)`.

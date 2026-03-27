@@ -19,6 +19,15 @@ Cache warm-up is a related operational challenge. When a new cache cluster start
 
 ## How It Works
 
+**Redis Cluster Key Routing Flow:**
+1. Client issues a command (e.g., `SET user:profile:42 "data"`)
+2. Client library computes the hash slot: `slot = CRC16("user:profile:42") % 16384` (e.g., slot 8790)
+3. Client consults its locally cached slot-to-node map and identifies that slot 8790 belongs to Node 2
+4. Client sends the command directly to Node 2 — no proxy, no coordinator
+5. If the slot has been migrated (e.g., to Node 3), Node 2 responds with `MOVED 8790 localhost:7003`; client updates its slot map and retries on Node 3
+6. During in-progress slot migration, Node 2 responds with `ASK localhost:7003`; client tries Node 3 for this request only (does not update the slot map)
+7. Reads can be served by the primary or any replica of the slot's shard (use `READONLY` mode on replicas to enable replica reads)
+
 **Hash slot computation:**
 ```python
 def crc16(data: bytes) -> int:

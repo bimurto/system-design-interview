@@ -19,6 +19,18 @@ The confusion starts because "consistency" is overloaded. ACID consistency (in S
 
 ## How It Works
 
+**Linearizable (Strong Consistency) Read:**
+1. Client writes `key=X, value=5` to the primary
+2. Primary replicates the write to all replicas synchronously (or via Raft/Paxos consensus) before acknowledging
+3. Write is acknowledged to the client only after quorum confirms the value is durable
+4. Any subsequent read — from any node — is guaranteed to return `value=5` or a newer value; stale reads are impossible
+
+**Eventually Consistent Read:**
+1. Client writes `key=X, value=5` to the primary
+2. Primary acknowledges the write immediately; replication to other nodes happens asynchronously in the background
+3. Client (or another client) reads `key=X` from a replica that has not yet received the update — returns stale value (e.g., `value=3`)
+4. After replication catches up, all replicas converge to `value=5`; the window of staleness depends on replication lag
+
 Between the extremes lie several important client-side consistency guarantees that are composable with any of the above:
 
 **Read-your-writes** (also called read-your-own-writes): after a client writes a value, all subsequent reads by that same client return that value or a newer one. This is violated when the client writes to a primary and then reads from a replica that hasn't caught up. Solutions: always read from primary after a write, use sticky routing (always route a user to the same replica), or use WAIT (Redis) / synchronous replication.

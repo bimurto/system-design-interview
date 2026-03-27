@@ -19,6 +19,19 @@ The choice between relational and non-relational databases is one of the most co
 
 ## How It Works
 
+**SQL Read Path — JOIN Query:**
+1. Client issues `SELECT u.name, p.title FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id = 42`
+2. Query planner analyses table statistics and chooses a join strategy (nested loop, hash join, or merge join)
+3. B-tree index scan on `users.id = 42` retrieves the single user row in O(log n)
+4. Index scan on `posts.user_id = 42` retrieves all matching post rows
+5. Database assembles the joined result set, applies any ORDER BY / LIMIT, and returns it
+
+**Document (NoSQL) Read Path:**
+1. Client issues `db.users.findOne({_id: 42})`
+2. Database fetches the single document by ID — a direct key lookup
+3. The entire user record including embedded posts is returned in one round trip: `{id: 42, name: "Alice", posts: [{...}, {...}]}`
+4. No JOIN needed; trade-off: updating a single nested post requires fetching, modifying, and rewriting the full document
+
 ### The Relational Model
 
 A relational schema normalizes data to eliminate redundancy. A "user with posts" becomes two tables: `users` and `posts`, connected by a foreign key. This means each user's name and email is stored exactly once. A JOIN query at read time reconstructs the relationship. The query planner uses indexes, statistics, and cost estimation to find the optimal execution plan. For complex queries touching millions of rows, the query planner's ability to choose between nested loop, hash join, and merge join can be the difference between a 50ms query and a 50-second query.

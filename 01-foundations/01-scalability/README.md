@@ -19,6 +19,15 @@ Scalability is a system's ability to handle growing load — more users, more da
 
 ## How It Works
 
+**Request Flow Through a Horizontally Scaled System:**
+1. Client sends an HTTP request to the load balancer's public IP (or DNS name)
+2. Load balancer selects a healthy backend using its scheduling algorithm (round-robin, least-connections, etc.)
+3. Stateless app server receives the request; session/user state is fetched from an external store (Redis, DB) — not local memory
+4. App server queries the database: reads route to a read replica, writes route to the primary
+5. Response travels back through the load balancer to the client
+6. If CPU or queue-depth exceeds a threshold, the auto-scaler launches additional app server instances (1–5 min warm-up for VMs, 30–60s for containers)
+7. New instances register with the load balancer and begin receiving traffic after passing health checks
+
 A load balancer sits in front of your app servers and distributes incoming requests. Nginx's `upstream` block defines the backend pool; the default algorithm is **round-robin**: request 1 → server A, request 2 → server B, request 3 → server C, request 4 → server A, and so on. Other algorithms include:
 
 - **Least connections:** send to whichever backend has fewest active connections (better for long-lived requests)

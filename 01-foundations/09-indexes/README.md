@@ -17,6 +17,15 @@ The **left-most prefix rule** governs composite indexes. A composite index on (c
 
 ## How It Works
 
+**B-Tree Index Lookup Path:**
+1. Query arrives: `SELECT * FROM users WHERE email = 'alice@example.com'`
+2. Query planner checks available indexes and table statistics; selects the B-tree index on `email` (O(log n) vs O(n) sequential scan)
+3. Index scan starts at the **root node** — one 8KB page read, binary search finds the correct child pointer
+4. Follow the pointer to an **interior node** and repeat — typically 3–4 levels for a 500K-row table (3–4 page reads total)
+5. Reach the **leaf node** containing the matching index entry: `(email value, ctid pointer to heap tuple)`
+6. Fetch the full row from the **heap** using the ctid — one additional page read
+7. **Covering index shortcut:** if the index includes all columns the query needs (`INCLUDE (name, email)`), step 6 is skipped — the result is returned directly from the index (Index Only Scan)
+
 ### B-tree Structure
 
 A B-tree (Balanced Tree) is a self-balancing tree where every leaf node is at the same depth. Each node holds multiple keys — in PostgreSQL, each node is one 8KB page. Interior nodes hold separator keys and pointers to child nodes. Leaf nodes hold the actual index entries (key value + pointer to heap tuple). A lookup traverses from root to leaf, reading one page at each level. For a 500,000-row table, the B-tree is roughly 3-4 levels deep — meaning an indexed lookup reads 3-4 pages versus potentially thousands of pages in a sequential scan.

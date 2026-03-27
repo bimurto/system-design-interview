@@ -1,0 +1,65 @@
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  downstream:
+    image: python:3.11-slim
+    ports:
+      - "9001:9001"
+    command: >
+      python -c "
+      import http.server, json, time, random, os
+      from http.server import BaseHTTPRequestHandler
+
+      class H(BaseHTTPRequestHandler):
+          fail_until = 0
+          slow_until  = 0
+
+          def log_message(self, *a): pass
+
+          def do_GET(self):
+              now = time.time()
+              if self.path == '/fail':
+                  H.fail_until = now + 10
+                  self._json({'mode': 'failing', 'duration_s': 10})
+              elif self.path == '/slow':
+                  H.slow_until = now + 10
+                  self._json({'mode': 'slow', 'duration_s': 10})
+              elif self.path == '/recover':
+                  H.fail_until = 0
+                  H.slow_until = 0
+                  self._json({'mode': 'healthy'})
+              elif self.path == '/health':
+                  self._json({'status': 'ok'})
+              else:
+                  if now < H.fail_until:
+                      self.send_response(500)
+                      self.end_headers()
+                      self.wfile.write(b'internal error')
+                      return
+                  if now < H.slow_until:
+                      time.sleep(5)
+                  self._json({'result': 'ok', 'latency_mode': 'slow' if now < H.slow_until else 'normal'})
+
+          def _json(self, d):
+              body = json.dumps(d).encode()
+              self.send_response(200)
+              self.send_header('Content-Type', 'application/json')
+              self.send_header('Content-Length', len(body))
+              self.end_headers()
+              self.wfile.write(body)
+
+      http.server.HTTPServer(('0.0.0.0', 9001), H).serve_forever()
+      "
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

@@ -1,0 +1,133 @@
+# Message Queues — Fundamentals
+
+**Prerequisites:** `../../01-foundations/14-failure-modes-reliability/`
+**Next:** `../06-message-queues-kafka/`
+
+---
+
+## Concept
+
+A message queue is a durable buffer that decouples producers from consumers in time and failure. A producer sends a message and moves on — it does not wait for the consumer to process it. The consumer reads from the queue at its own pace, even if it was unavailable when the message was sent. This **temporal decoupling** is the central value of a message queue.
+
+Compare this to a direct synchronous call: if the payment service calls the email service directly to send a receipt, and the email service is down, the payment fails. With a queue between them, the payment service puts "send receipt" into the queue and returns success. The email service picks it up when it recovers. Two systems with different availability profiles are insulated from each other.
+
+### Why Not Just Use a Database?
+
+A relational table can store pending work rows, and a worker can poll for new rows. This pattern is called "transactional outbox" or "job queue on Postgres," and it works at modest scale. The limitations appear at high throughput: polling adds latency (work sits in the table until the next poll); concurrent workers cause row-level lock contention; the table grows until workers clean it up; and the database takes on workloads it wasn't designed for. A purpose-built queue handles millions of messages per second with push delivery (no polling), horizontal consumer scaling, and built-in retention and dead-letter handling.
+
+### Core Guarantees
+
+Message queues offer three delivery guarantee levels:
+
+**At-most-once:** the broker delivers a message at most once. If the consumer crashes before acknowledging, the message is lost. Used for high-volume telemetry and metrics where occasional loss is acceptable and redelivery overhead is not worth it.
+
+**At-least-once:** the broker delivers a message until it receives an acknowledgement. If the consumer crashes before acking, the message is redelivered (possibly multiple times). The consumer must handle duplicates — either by being idempotent (processing the same message twice has the same effect as once) or by deduplicating using the message ID. This is the most common default in production queues.
+
+**Exactly-once:** the message is processed exactly once, even across crashes and retries. This requires coordination between the broker and consumer storage (e.g., Kafka transactions + consumer state in a Kafka Streams store, or two-phase commit). Expensive and complex; use only when duplicates are genuinely unacceptable (financial transactions, inventory decrements).
+
+### Queue Models
+
+**Point-to-point (competing consumers):** one producer, multiple consumers sharing a single queue. Each message is delivered to exactly one consumer. Consumers compete for messages — this is natural work distribution. Adding consumers scales throughput linearly. Used for background job processing, task queues, email sending. Examples: RabbitMQ queues, SQS standard queues, Celery workers.
+
+**Publish-subscribe (fan-out):** one producer publishes to a topic; multiple subscribers each receive a copy of every message independently. Used for event broadcasting — "order placed" event goes to the inventory service, the analytics service, and the notification service simultaneously. Each subscriber gets its own copy. Examples: RabbitMQ exchanges with bindings, SNS topics, Redis Pub/Sub.
+
+**Hybrid (durable pub/sub):** Kafka and similar log-based queues combine both models. Multiple consumer groups can subscribe to the same topic (pub/sub fan-out), but within each consumer group consumers share partitions (point-to-point work distribution). This makes Kafka both a broadcast bus and a work queue simultaneously.
+
+### Dead-Letter Queues
+
+When a consumer consistently fails to process a message (e.g., malformed payload, downstream dependency unavailable, bug in consumer code), the message is redelivered repeatedly, blocking the queue or wasting resources. A dead-letter queue (DLQ) receives messages after a configurable number of failed delivery attempts. This prevents one bad message from blocking the queue indefinitely. Engineers monitor the DLQ and investigate messages there — they represent bugs or data issues that need manual intervention.
+
+Always configure a DLQ for production queues. A queue without a DLQ allows a single poison pill message to infinite-loop and block all consumer throughput.
+
+### Acknowledgement and Visibility Timeout
+
+In most queues (SQS, RabbitMQ), when a consumer receives a message, the message becomes invisible to other consumers for a **visibility timeout** period. If the consumer acknowledges (deletes) the message within the timeout, it's gone. If the consumer crashes or the timeout expires without an ack, the message reappears in the queue for another consumer to retry. This is the mechanism behind at-least-once delivery.
+
+The visibility timeout must be longer than the expected processing time. If processing takes 30 seconds and the visibility timeout is 10 seconds, messages are redelivered while still being processed, causing duplicates. A rule of thumb: set visibility timeout to 6× the average processing time.
+
+### Ordering
+
+Most queues provide best-effort ordering — messages are generally delivered in the order they were sent, but delivery order is not guaranteed under failure conditions (retries, node failures). For strict ordering, you need either a single-consumer queue (no parallelism) or a log-based queue like Kafka where ordering is guaranteed within a partition. Partition your messages by a key so that related messages (e.g., all events for the same user) land in the same partition and are processed in order.
+
+### Backpressure
+
+If producers send faster than consumers process, the queue grows unboundedly. Left unchecked, this consumes all broker disk/memory and crashes the system. Solutions: (1) **scale consumers** — add more consumer instances to increase throughput; (2) **producer rate limiting** — slow or reject producers when the queue depth exceeds a threshold; (3) **message TTL** — expire messages after a time limit so stale work doesn't accumulate; (4) **queue depth alerts** — page on-call when depth exceeds normal operating range. A growing queue is an early warning signal of consumer performance degradation.
+
+### Trade-offs
+
+| Concern | Message Queue | Direct RPC |
+|---------|--------------|-----------|
+| Temporal coupling | None — sender doesn't wait | Tight — sender waits for response |
+| Throughput | Buffered — handles bursts | Unbuffered — consumer must keep up |
+| Latency | Higher (queue hop) | Lower (direct call) |
+| Delivery guarantee | Configurable (at-least-once) | At-most-once (no retry by default) |
+| Ordering | Approximate (exact with partitioning) | Request order preserved |
+| Observability | Queue depth, age, DLQ depth | Latency, error rate |
+| Complexity | Broker to operate; DLQ to monitor | Simpler dependency graph |
+
+### When to Use a Message Queue
+
+Use a queue when:
+- Producer and consumer have different scaling needs (spike in orders shouldn't spike the email service)
+- Processing can be async — the user doesn't need to wait for the result
+- Multiple downstream systems need to react to the same event
+- Work must survive consumer crashes without data loss
+- You need to rate-limit work into a slow downstream
+
+Don't use a queue when:
+- You need a synchronous response (user is waiting for a search result)
+- The system is simple enough that direct calls are more readable
+- You need strict global ordering across all messages (queues make this hard)
+- The consumer must process in real time with no queuing latency
+
+## Interview Talking Points
+
+- "A message queue decouples producers from consumers in time and failure — the producer doesn't wait; the consumer processes at its own pace"
+- "At-least-once is the safe default — messages are redelivered until acked. Consumers must be idempotent or deduplicate by message ID"
+- "Always configure a dead-letter queue — without it, one poison pill message loops forever and blocks the entire consumer group"
+- "The visibility timeout must exceed expected processing time — if it's too short, messages are redelivered while still being processed, causing duplicates"
+- "A growing queue depth is a canary — it means consumers can't keep up. Either scale consumers or rate-limit producers"
+- "Point-to-point distributes work; pub/sub broadcasts events. Kafka combines both via consumer groups"
+
+## Hands-on Lab
+
+**Time:** ~25 minutes
+**Services:** RabbitMQ (with management UI on port 15672)
+
+### Setup
+
+```bash
+cd system-design-interview/02-advanced/05-message-queues-fundamentals/
+docker compose up -d
+# Wait ~15 seconds for RabbitMQ to be ready
+```
+
+### Experiment
+
+```bash
+python experiment.py
+```
+
+The script demonstrates: (1) basic produce/consume with acknowledgement; (2) at-least-once delivery — a consumer crashes mid-processing, and the message is redelivered to another consumer; (3) dead-letter queue — a message rejected N times goes to the DLQ; (4) competing consumers — 3 consumers share a queue, showing work distribution across instances; (5) pub/sub fan-out — one message published to an exchange, received by two independent subscriber queues.
+
+You can also open the RabbitMQ management UI at `http://localhost:15672` (guest/guest) to watch queue depths in real time.
+
+### Teardown
+
+```bash
+docker compose down -v
+```
+
+## Real-World Examples
+
+- **Amazon SQS at scale:** SQS processes trillions of messages per month. Amazon's own internal services use SQS to decouple order processing from fulfillment — the order service publishes to SQS; fulfillment, inventory, and notification services each have their own consumers. SQS's visibility timeout + DLQ pattern handles consumer failures transparently — source: AWS re:Invent, "Amazon SQS Deep Dive" (2019).
+- **WhatsApp message queuing:** WhatsApp stores undelivered messages in a per-user queue on their servers. When the recipient's device comes online, it receives all queued messages in order and acknowledges them. The server deletes acknowledged messages. This is at-least-once delivery with client-side deduplication by message ID — source: WhatsApp Engineering Blog, "WhatsApp's Architecture" (2012).
+- **Shopify's job queue (Resque/Sidekiq):** Shopify processes millions of background jobs per day — email sending, webhook delivery, report generation — using Redis-backed Sidekiq queues. During Black Friday traffic spikes, their queue depth grows as consumers can't keep up with producers. They scale consumer worker count dynamically based on queue depth — source: Shopify Engineering Blog, "Surviving Black Friday: The Shopify Approach" (2018).
+
+## Common Mistakes
+
+- **No dead-letter queue.** A single malformed message that fails processing loops forever, consuming consumer resources and blocking other messages in the same partition or queue. Always configure a DLQ with a max-delivery-attempts threshold.
+- **Visibility timeout shorter than processing time.** The message reappears while still being processed, causing another consumer to pick it up simultaneously. Both consumers process the same message — phantom duplicate work. Set timeout to 6× average processing time.
+- **Not handling duplicates.** At-least-once delivery means your consumer will receive duplicates under failure conditions. If you charge a credit card or send an email on every delivery without deduplication, users get double-charged or spammed. Design consumer logic to be idempotent.
+- **Synchronous consumer design.** A consumer that processes one message at a time, waits for each to complete, then fetches the next is leaving throughput on the table. Use prefetch/batch size settings and process messages concurrently within each consumer instance.
+- **Ignoring queue depth metrics.** Queue depth is the most important operational metric for a message queue. A sustained increase means consumers are falling behind. Without an alert, this goes unnoticed until the broker runs out of disk and crashes.

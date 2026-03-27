@@ -19,6 +19,15 @@ The simplest replication model is **leader-follower** (also called primary-repli
 
 ## How It Works
 
+**WAL Streaming Replication Write Path (PostgreSQL):**
+1. Client sends a write (INSERT/UPDATE/DELETE) to the primary
+2. Primary writes the change to the Write-Ahead Log (WAL) on disk — a sequential append, durable before the write is complete
+3. In **async** mode: primary acknowledges the write to the client immediately; WAL streams to replicas in the background
+4. In **sync** mode: primary waits until at least one replica confirms it has received and flushed the WAL entry, then acknowledges the client
+5. Each replica receives the WAL stream over a persistent TCP connection and appends it to its local WAL
+6. Replica replays the WAL entries against its local data copy, advancing its Log Sequence Number (LSN)
+7. The gap between the primary's current LSN and the replica's replayed LSN is the **replication lag** — the key health metric to monitor
+
 **PostgreSQL streaming replication** works via the Write-Ahead Log (WAL). Every write operation is first durably written to the WAL (a sequential log on disk). The WAL is then streamed to replicas via a persistent TCP connection. Replicas apply WAL entries in order, keeping their state exactly synchronized with the primary. Because the WAL contains every state transition, replicas are byte-for-byte identical to the primary at a given LSN (Log Sequence Number). The `pg_replication_slots` mechanism ensures replicas don't fall too far behind by blocking WAL cleanup on the primary.
 
 **Replication lag** is the gap between the primary's current LSN and the replica's applied LSN, expressed as bytes or time. Monitoring this is critical: a replica with 10 minutes of lag cannot be promoted without data loss during a primary failure. pg's `pg_stat_replication` view exposes `write_lag`, `flush_lag`, and `replay_lag` for each replica.

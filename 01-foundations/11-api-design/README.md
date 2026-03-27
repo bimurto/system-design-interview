@@ -19,6 +19,15 @@ gRPC is the dominant choice for internal service-to-service communication. It us
 
 ## How It Works
 
+**REST API Request Lifecycle:**
+1. Client constructs the request: HTTP verb (GET / POST / PUT / DELETE) + URL path + headers (`Authorization`, `Content-Type`) + request body (for POST/PUT)
+2. Request reaches the API gateway or load balancer, which validates the authentication credential (API key, JWT token, OAuth bearer token)
+3. Gateway routes the request to the correct backend service based on the URL path prefix (e.g., `/users/*` → user-service)
+4. Service validates the request body against its schema (required fields, types, constraints); returns HTTP 400 with error details if invalid
+5. Service executes business logic — database query, cache lookup, downstream service call, etc.
+6. Service returns an HTTP response with the appropriate status code (200 OK, 201 Created, 400 Bad Request, 404 Not Found, 500 Internal Server Error) and a JSON response body
+7. For GET responses with `Cache-Control: public, max-age=3600`, CDN edge nodes and browsers cache the response — subsequent identical requests never reach the origin
+
 ### REST — Richardson Maturity Model
 
 | Level | Name                  | Description                                               | Example                                                        |

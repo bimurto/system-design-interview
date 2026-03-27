@@ -19,6 +19,15 @@ Secrets management is the unglamorous foundation of security at scale. Environme
 
 ## How It Works
 
+**JWT Authentication Request Flow:**
+1. Client sends credentials (`POST /token` with username + password) to the authentication server
+2. Auth server validates the credentials, creates a JWT payload (`sub`, `role`, `exp`, `iat`), and signs it with a secret (HS256) or private key (RS256)
+3. Auth server returns a short-lived **access token** (5–15 min TTL) and a long-lived **refresh token** (e.g., 30 days); client stores both
+4. Client attaches the access token to every API request: `Authorization: Bearer <token>`
+5. API server decodes the JWT header and payload (base64url), then **verifies the signature** using the shared secret or public key — no database lookup required
+6. If the signature is valid and `exp` has not passed, the request proceeds; the token's claims (`role`, `scopes`) drive authorisation decisions
+7. When the access token expires, client sends the refresh token to `POST /refresh`; auth server validates it and issues a new access token without requiring re-login
+
 **JWT structure:**
 
 ```

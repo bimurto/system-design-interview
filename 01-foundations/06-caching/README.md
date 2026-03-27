@@ -24,9 +24,22 @@ Caches are not just for reads. Write patterns also determine cache utility: a wr
 
 The cache is populated lazily — only when data is first requested. This means cold starts have poor hit rates. The cache fills naturally as requests arrive. The application must handle cache misses gracefully (they result in DB reads, which are slower but always correct).
 
-**Write-through** writes data to both the cache and the database synchronously on every write. The cache is always current with the database. Reads are always fast (no misses for recently written data). The cost is that writes are slower (must write to two places) and the cache fills with data that may never be read again.
+**Write-through** writes to both cache and database synchronously on every write:
+1. Client sends a write request
+2. Application writes the new value to the cache
+3. Application writes the same value to the database (synchronously — both must succeed)
+4. Client is acknowledged only after both writes complete
+5. Subsequent reads always hit the cache and see the latest value
 
-**Write-behind (write-back)** writes data to the cache and acknowledges to the client immediately. The write to the database happens asynchronously in the background. This is extremely fast for writes but introduces a durability risk: if the cache crashes before flushing to the database, the write is lost. Used in CPU L1/L2 caches (hence "write-back"), and in some application-level caches for non-critical data.
+The cache is always current with the database. Writes are slower (two round trips), and the cache fills with data that may never be read again.
+
+**Write-behind (write-back)** prioritizes write speed at the cost of durability:
+1. Client sends a write request
+2. Application writes the new value to the cache and immediately acknowledges the client
+3. A background process asynchronously flushes cached writes to the database in batches
+4. If the cache crashes before flushing, the unacknowledged writes are lost (durability risk)
+
+Used in CPU L1/L2 caches and for non-critical high-write workloads where occasional data loss is acceptable.
 
 **Eviction policies** determine which keys are removed when the cache is full. LRU (Least Recently Used) evicts the key that was accessed least recently — the assumption is that recently accessed data will be accessed again soon. LFU (Least Frequently Used) evicts the key accessed fewest times — better for skewed access where a small number of keys are extremely hot. TTL eviction simply expires keys after a fixed time regardless of access frequency.
 

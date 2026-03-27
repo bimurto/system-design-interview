@@ -19,6 +19,14 @@ Count-Min Sketch estimates item frequencies in a data stream. It uses a w×d mat
 
 ## How It Works
 
+**Bloom Filter — Add and Membership Check:**
+1. Initialise a bit array of `m` bits (all zeros) and choose `k` independent hash functions
+2. **To add an item:** compute `k` hash positions (`hash_i(item) % m` for i = 1..k) and set those `k` bits to 1
+3. **To check membership:** compute the same `k` hash positions for the query item
+4. If **any** of the `k` bits is 0: the item is **definitely not** in the set — return false (no false negatives)
+5. If **all** `k` bits are 1: the item is **probably** in the set — return true (may be a false positive if those bits were set by other items)
+6. False positive rate is bounded by: `FPR ≈ (1 − e^(−kn/m))^k` where `n` = items inserted; tune `m` (bits) and `k` (hash functions) to hit a target FPR (e.g., 1% FPR for 100M items requires ~960MB of bits)
+
 **Bloom filter bit operations:**
 
 ```

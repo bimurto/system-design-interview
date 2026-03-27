@@ -19,6 +19,15 @@ SLO (Service Level Objective) is a target for a measurable SLI (Service Level In
 
 ## How It Works
 
+**Prometheus Metrics Pipeline (Instrument → Alert → Dashboard):**
+1. Application code instruments key events using the `prometheus_client` library — incrementing counters, recording histogram observations, updating gauges on every request
+2. Application exposes a `/metrics` HTTP endpoint returning all current metric values in Prometheus text exposition format
+3. Prometheus server scrapes each registered target's `/metrics` endpoint on a configurable interval (default 15 seconds)
+4. Scraped time-series samples are stored in Prometheus's local TSDB (time-series database) on disk
+5. Alerting rules evaluate continuously against stored data using PromQL (e.g., `rate(http_errors_total[5m]) > 0.01`); when a rule fires, Prometheus sends the alert to Alertmanager
+6. Alertmanager deduplicates, groups, and routes the alert to the appropriate receiver (PagerDuty, Slack, email) with configurable silencing and inhibition
+7. Grafana queries Prometheus via PromQL to render real-time dashboards; dashboards visualise the same time-series data used for alerting
+
 **Prometheus data model:** Every metric is identified by a name and a set of key-value labels. `http_requests_total{endpoint="/api/users", status_code="200"}` is a distinct time series from `http_requests_total{endpoint="/api/users", status_code="500"}`. This high-cardinality labelling enables powerful aggregations but also risks label explosion — never use unbounded values (user IDs, request IDs) as label values.
 
 **Histogram percentiles:**

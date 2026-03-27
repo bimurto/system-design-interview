@@ -19,6 +19,18 @@ The coupling implications of EDA are profound. In a synchronous system, Service 
 
 ## How It Works
 
+**Event Sourcing — Write Path:**
+1. Client sends a command (e.g., "place order #123") to the command handler
+2. Command handler loads current aggregate state by replaying past events from the event store (or from a snapshot + recent events)
+3. Handler validates the command against current state; if invalid, returns an error without writing anything
+4. Handler creates a new immutable event (e.g., `order.placed {order_id, items, timestamp}`) and appends it to the event store
+5. Projection consumers (subscribed to the event store) read the new event and update their read-model databases (Postgres for reports, Redis for leaderboards, Elasticsearch for search)
+
+**Event Sourcing — Read Path:**
+1. Client sends a query to the query handler (CQRS read side)
+2. Query handler reads from the projection database — not the event store — returning a pre-computed, denormalized view
+3. Result is eventually consistent with the event store (lag = time for projections to consume and apply the latest events)
+
 **Event structure:** an event should be self-describing and include all the information needed by consumers without requiring a follow-up query. A minimal event contains: event type, event ID (for deduplication), aggregate ID (the entity it relates to), timestamp, and a payload with event-specific data.
 
 **Event sourcing state machine:**

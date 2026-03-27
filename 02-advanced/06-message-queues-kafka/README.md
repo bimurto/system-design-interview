@@ -1,7 +1,7 @@
 # Message Queues & Kafka
 
-**Prerequisites:** `../04-event-driven-architecture/`
-**Next:** `../06-stream-processing/`
+**Prerequisites:** `../05-message-queues-fundamentals/`
+**Next:** `../07-stream-processing/`
 
 ---
 
@@ -18,6 +18,15 @@ The partition is Kafka's unit of parallelism. Each topic has N partitions, and e
 Consumer groups provide horizontal scalability for consumption. Each consumer in a group is assigned a subset of partitions — typically one partition per consumer for maximum parallelism. Adding more consumers scales consumption throughput up to the number of partitions. If you have 12 partitions and start with 3 consumers, each handles 4 partitions. Scale to 12 consumers and each handles 1. Add a 13th and it sits idle — you can't have more active consumers than partitions.
 
 ## How It Works
+
+**Kafka Produce-to-Consume Pipeline:**
+1. Producer serializes the message and computes the target partition: `hash(message_key) % num_partitions` (or round-robin if no key is set)
+2. Producer batches messages in memory (for throughput) and sends the batch to the partition's **leader broker**
+3. Leader broker appends the batch to the partition's commit log on disk — a sequential write to the end of a segment file
+4. Follower replicas in the ISR (In-Sync Replicas) set pull the new messages from the leader and append to their own logs
+5. Once all ISR replicas acknowledge receipt, the messages are **committed** (visible to consumers); the leader updates the high-water mark
+6. Consumer polls the partition leader for new messages, receiving a batch starting from its last committed offset
+7. Consumer processes each message and commits its new offset — either automatically (at-least-once risk) or manually after processing (preferred for exactly-once guarantee)
 
 **Topic anatomy:**
 ```

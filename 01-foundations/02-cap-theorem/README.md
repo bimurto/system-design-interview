@@ -19,6 +19,21 @@ Since partitions will happen, the real choice is between **CP** (sacrifice avail
 
 ## How It Works
 
+**During a Network Partition — CP System Behaviour:**
+1. Network partition splits the cluster: Node A (majority side) and Node B (minority side) can no longer communicate
+2. Client writes `balance = $800` to Node A; Node A reaches quorum among reachable nodes and accepts the write
+3. Client attempts a read from Node B (the minority side)
+4. Node B detects it cannot reach quorum — it **refuses the request** and returns an error (sacrifices availability for consistency)
+5. Partition heals; Node B receives the missed write from Node A and converges to the correct state
+6. After recovery, all nodes agree: `balance = $800`
+
+**During a Network Partition — AP System Behaviour:**
+1. Network partition splits the cluster: Node A and Node B cannot communicate
+2. Client writes `balance = $800` to Node A; Node A accepts and acknowledges (no quorum required)
+3. Client reads from Node B — Node B returns its local stale value (`$1,000`) rather than returning an error (sacrifices consistency for availability)
+4. Both nodes continue accepting reads and writes independently during the partition
+5. Partition heals; conflict resolution runs (last-write-wins, vector clocks, or CRDTs) to reconcile diverged state
+
 During a network partition, nodes on each side of the split continue operating, but they cannot coordinate. Suppose node A accepts a write (balance = $800) but node B, isolated by the partition, still has the old value ($1000). What does a read to node B return?
 
 - **CP choice:** Node B recognizes it cannot confirm it has the latest value (quorum unreachable), so it refuses the read. The client gets an error. The system is unavailable for reads during the partition but will never return stale data.

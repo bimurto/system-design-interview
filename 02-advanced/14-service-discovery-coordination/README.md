@@ -19,6 +19,15 @@ Configuration management is a natural extension of service registries. etcd and 
 
 ## How It Works
 
+**Service Registration and Discovery via etcd:**
+1. Service instance starts and creates an **etcd lease** with a TTL (e.g., 10 seconds) — the lease is a time-bounded handle that will auto-expire if not renewed
+2. Service registers itself by writing a key tied to the lease (e.g., `/services/api/instance-1 = "10.0.0.1:8080"`); the key disappears automatically when the lease expires
+3. Service starts a background heartbeat thread that calls `lease.keepalive()` every ~3 seconds, preventing the lease from expiring while the service is healthy
+4. Clients (or the load balancer) query etcd for all keys under the `/services/api/` prefix to discover the current set of live instances
+5. Clients set up a **watch** on the prefix; etcd streams real-time notifications (PUT = new instance, DELETE = removed instance) so the client's routing table stays current
+6. If a service crashes, heartbeats stop; after the TTL expires, etcd automatically deletes the registration key
+7. Watchers receive the DELETE event and remove the dead instance from their local routing table — no manual deregistration required
+
 **Client-side vs server-side discovery:**
 
 ```
