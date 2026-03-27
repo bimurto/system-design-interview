@@ -7,6 +7,10 @@ services:
       POSTGRES_USER: postgres
     ports:
       - "5432:5432"
+    # max_connections=50 simulates a connection-starved prod instance;
+    # in real deployments you front Postgres with PgBouncer to pool connections.
+    command: ["postgres", "-c", "max_connections=50", "-c", "shared_buffers=128MB"]
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -17,6 +21,11 @@ services:
     image: redis:7
     ports:
       - "6379:6379"
+    # maxmemory 64mb mirrors a typical cache sidecar; allkeys-lru evicts
+    # the least-recently-used key when the limit is reached — important to
+    # understand when Redis is used as a cache vs a primary store.
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "no"]
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -27,8 +36,10 @@ services:
     image: mongo:6
     ports:
       - "27017:27017"
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      # mongosh is available in mongo:6; fall back to mongo shell syntax if needed
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" || mongo --quiet --eval \"db.adminCommand('ping').ok\""]
       interval: 5s
       timeout: 5s
       retries: 10

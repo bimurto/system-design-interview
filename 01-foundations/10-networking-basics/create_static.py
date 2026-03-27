@@ -11,6 +11,7 @@ sizes = {
     "1kb.bin": 1024,
     "100kb.bin": 100 * 1024,
     "1mb.bin": 1024 * 1024,
+    "10mb.bin": 10 * 1024 * 1024,
 }
 
 for filename, size in sizes.items():

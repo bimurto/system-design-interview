@@ -12,48 +12,71 @@ services:
         condition: service_healthy
       app3:
         condition: service_healthy
+    # Nginx itself is lightweight; 64 MB is generous for this lab.
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
 
   app1:
     image: python:3.11-slim
     environment:
       - HOSTNAME=app1
+      # Optionally set SIMULATE_LATENCY_MS=200 to make this backend "slow"
+      # and observe how round-robin mishandles uneven backend speeds.
+      - SIMULATE_LATENCY_MS=0
     volumes:
       - ./app.py:/app/app.py:ro
     working_dir: /app
     command: python app.py
+    mem_limit: 128m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
 
   app2:
     image: python:3.11-slim
     environment:
       - HOSTNAME=app2
+      - SIMULATE_LATENCY_MS=0
     volumes:
       - ./app.py:/app/app.py:ro
     working_dir: /app
     command: python app.py
+    mem_limit: 128m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 10s
+    restart: unless-stopped
 
   app3:
     image: python:3.11-slim
     environment:
       - HOSTNAME=app3
+      - SIMULATE_LATENCY_MS=0
     volumes:
       - ./app.py:/app/app.py:ro
     working_dir: /app
     command: python app.py
+    mem_limit: 128m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 10s
+    restart: unless-stopped

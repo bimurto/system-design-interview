@@ -33,11 +33,16 @@ REVENUE_ACCOUNT = "revenue-001"
 ESCROW_ACCOUNT = "escrow-001"
 
 # Connect to Redis for idempotency key cache
+# Redis is a performance optimization only — Postgres UNIQUE constraint is the
+# correctness guarantee. If Redis is unavailable, all requests fall through to
+# Postgres (slower, but correct).
 try:
     rcache = redis.from_url(REDIS_URL, decode_responses=True)
     rcache.ping()
-except Exception:
+    print("[startup] Redis cache: connected", flush=True)
+except Exception as e:
     rcache = None
+    print(f"[startup] Redis cache: UNAVAILABLE ({e}) — falling back to Postgres-only idempotency", flush=True)
 
 
 def get_db():
@@ -78,6 +83,27 @@ def init_db():
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_ledger_account
             ON ledger_entries(account_id)
+        """)
+        # Idempotency key is scoped to (api_key, idempotency_key) in production.
+        # In this lab we scope by (customer_id, idempotency_key) for simplicity.
+        # The UNIQUE constraint on idempotency_key is the atomicity guarantee —
+        # not the pre-check SELECT. See TOCTOU note in README.
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION update_updated_at()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = NOW();
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        cur.execute("""
+            DROP TRIGGER IF EXISTS set_updated_at ON transactions
+        """)
+        cur.execute("""
+            CREATE TRIGGER set_updated_at
+            BEFORE UPDATE ON transactions
+            FOR EACH ROW EXECUTE FUNCTION update_updated_at()
         """)
     conn.commit()
     conn.close()
@@ -333,6 +359,14 @@ def refund():
             if not original:
                 return jsonify({"error": "transaction_not_found"}), 404
 
+            # Only refund completed charges — prevent double-refund and refunding failed charges.
+            # In production, also check for partial-refund tracking (refund_amount_remaining).
+            if original["status"] != "completed":
+                return jsonify({
+                    "error": "not_refundable",
+                    "detail": f"Transaction status is '{original['status']}', must be 'completed'",
+                }), 422
+
             amount = original["amount"]
             customer_id = original["customer_id"]
             refund_id = str(uuid.uuid4())
@@ -345,7 +379,9 @@ def refund():
             """, (refund_id, f"refund-{idem_key}", customer_id, amount,
                   original["currency"], f"Refund for {txn_id}"))
 
-            # Reverse the entries: credit customer, debit merchant
+            # Reverse the entries: credit customer, debit merchant.
+            # The original entries are never modified (immutable ledger).
+            # Correction is always a new pair of entries that reverse the original.
             cur.execute("""
                 INSERT INTO ledger_entries (transaction_id, account_id, amount, entry_type, description)
                 VALUES
@@ -355,6 +391,13 @@ def refund():
                 refund_id, customer_id, amount, f"Refund of {txn_id}",
                 refund_id, MERCHANT_ACCOUNT, amount, f"Refund of {txn_id}",
             ))
+
+            # Mark original transaction as refunded so it cannot be refunded again.
+            # The trigger updates updated_at automatically.
+            cur.execute(
+                "UPDATE transactions SET status = 'refunded' WHERE id = %s",
+                (txn_id,)
+            )
 
         conn.commit()
         return jsonify({

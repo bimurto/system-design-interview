@@ -5,10 +5,11 @@ Event-Driven Architecture Lab — Event Sourcing with Kafka
 Prerequisites: docker compose up -d (wait ~30s for Kafka to be ready)
 
 What this demonstrates:
-  1. Produce order lifecycle events (event sourcing)
-  2. Rebuild current state by replaying the event log
-  3. Consumer group lag — events accumulate while consumer is stopped
-  4. Replay from offset 0 — full state rebuild from scratch
+  1. Produce order lifecycle events (event sourcing write path)
+  2. Rebuild current state by replaying the event log (CQRS projection)
+  3. Consumer group lag — what it means and how to measure it correctly
+  4. Idempotent consumers — processing duplicate events safely
+  5. Replay from offset 0 — full state rebuild (the event sourcing superpower)
 """
 
 import json
@@ -16,7 +17,6 @@ import time
 import uuid
 import subprocess
 from datetime import datetime, timezone
-from collections import defaultdict
 
 try:
     from kafka import KafkaProducer, KafkaConsumer, TopicPartition
@@ -39,9 +39,9 @@ def section(title):
     print("=" * 60)
 
 
-def make_event(event_type, order_id, payload):
+def make_event(event_type, order_id, payload, event_id=None):
     return {
-        "event_id":   str(uuid.uuid4()),
+        "event_id":   event_id or str(uuid.uuid4()),
         "event_type": event_type,
         "order_id":   order_id,
         "timestamp":  datetime.now(timezone.utc).isoformat(),
@@ -54,7 +54,13 @@ def get_producer():
         bootstrap_servers=BOOTSTRAP,
         value_serializer=lambda v: json.dumps(v).encode(),
         key_serializer=lambda k: k.encode() if k else None,
+        # acks="all" waits for all in-sync replicas to acknowledge.
+        # Combined with enable.idempotence=true on the broker this gives
+        # exactly-once producer semantics (no duplicates from retries).
         acks="all",
+        # Idempotent producer: Kafka assigns each producer a PID and tracks
+        # sequence numbers so retried sends don't produce duplicates.
+        enable_idempotence=True,
     )
 
 
@@ -62,19 +68,34 @@ def create_topic():
     admin = KafkaAdminClient(bootstrap_servers=BOOTSTRAP)
     try:
         admin.create_topics([NewTopic(name=TOPIC, num_partitions=1, replication_factor=1)])
-        print(f"  Topic '{TOPIC}' created.")
+        print(f"  Topic '{TOPIC}' created (1 partition, replication_factor=1).")
     except TopicAlreadyExistsError:
         print(f"  Topic '{TOPIC}' already exists.")
     finally:
         admin.close()
 
 
-def rebuild_state(events):
-    """Rebuild order state from an ordered list of events."""
+def rebuild_state(events, seen_event_ids=None):
+    """
+    Rebuild order state from an ordered list of events.
+
+    seen_event_ids: optional set for idempotent processing.
+      Pass the same set across multiple calls to skip duplicates.
+    """
     orders = {}
+    duplicates_skipped = 0
     for ev in events:
+        eid  = ev["event_id"]
         oid  = ev["order_id"]
         etype = ev["event_type"]
+
+        # Idempotency check — skip events already processed
+        if seen_event_ids is not None:
+            if eid in seen_event_ids:
+                duplicates_skipped += 1
+                continue
+            seen_event_ids.add(eid)
+
         if etype == "order.created":
             orders[oid] = {
                 "order_id": oid,
@@ -96,7 +117,8 @@ def rebuild_state(events):
             elif etype == "order.cancelled":
                 orders[oid]["status"] = "cancelled"
                 orders[oid]["reason"] = ev["payload"].get("reason")
-    return orders
+
+    return orders, duplicates_skipped
 
 
 def consume_all_events(group_id, from_beginning=False, timeout_ms=5000):
@@ -118,17 +140,22 @@ def consume_all_events(group_id, from_beginning=False, timeout_ms=5000):
 
 
 def get_consumer_lag(group_id):
-    """Return the consumer lag for the group."""
-    consumer = KafkaConsumer(
-        bootstrap_servers=BOOTSTRAP,
-        group_id=f"{group_id}-lag-check",
-    )
-    tp = TopicPartition(TOPIC, 0)
-    consumer.assign([tp])
-    consumer.seek_to_end(tp)
-    end_offset = consumer.position(tp)
+    """
+    Return (end_offset, committed_offset, lag) for group_id on partition 0.
 
-    # Get committed offset for the actual group
+    Uses a separate admin client to read the committed offset; avoids
+    polluting Kafka's group metadata with a spurious consumer group.
+    """
+    tp = TopicPartition(TOPIC, 0)
+
+    # Get the high-watermark (log end offset) via a temporary consumer
+    probe = KafkaConsumer(bootstrap_servers=BOOTSTRAP)
+    probe.assign([tp])
+    probe.seek_to_end(tp)
+    end_offset = probe.position(tp)
+    probe.close()
+
+    # Get the committed offset for the actual consumer group
     admin = KafkaAdminClient(bootstrap_servers=BOOTSTRAP)
     try:
         offsets = admin.list_consumer_group_offsets(group_id)
@@ -138,9 +165,9 @@ def get_consumer_lag(group_id):
         committed_offset = 0
     finally:
         admin.close()
-        consumer.close()
 
-    return end_offset, committed_offset, end_offset - committed_offset
+    lag = end_offset - committed_offset
+    return end_offset, committed_offset, lag
 
 
 def main():
@@ -167,7 +194,6 @@ def main():
 
     # Verify connectivity
     try:
-        from kafka import KafkaAdminClient
         admin = KafkaAdminClient(bootstrap_servers=BOOTSTRAP)
         admin.list_topics()
         admin.close()
@@ -213,7 +239,7 @@ def main():
         producer.send(TOPIC, key=oid, value=ev)
         all_events.append(ev)
 
-        # order.delivered (all except last one)
+        # order.delivered (all except ORD-0005 which stays in transit)
         if oid != "ORD-0005":
             ev = make_event("order.delivered", oid, {})
             producer.send(TOPIC, key=oid, value=ev)
@@ -221,11 +247,11 @@ def main():
 
         print(f"    {oid}: created → paid → shipped" + (" → delivered" if oid != "ORD-0005" else " (in transit)"))
 
-    # Cancel order 3
+    # Cancel order 3 after delivery — last event wins in the projection
     ev = make_event("order.cancelled", "ORD-0003", {"reason": "customer request"})
     producer.send(TOPIC, key="ORD-0003", value=ev)
     all_events.append(ev)
-    print(f"    ORD-0003: also cancelled (customer request)")
+    print(f"    ORD-0003: also received order.cancelled (customer request)")
 
     producer.flush()
     producer.close()
@@ -234,9 +260,9 @@ def main():
     print(f"""
   Event schema:
   {{
-    "event_id":   "uuid",
-    "event_type": "order.created | order.paid | order.shipped | ...",
-    "order_id":   "ORD-0001",
+    "event_id":   "uuid",            ← deduplication key (idempotency)
+    "event_type": "order.created",   ← past-tense; entity.action
+    "order_id":   "ORD-0001",        ← partition key (ordering guarantee)
     "timestamp":  "2025-01-01T14:32:01Z",
     "payload":    {{ ... event-specific data ... }}
   }}
@@ -244,100 +270,187 @@ def main():
   Key design decisions:
     • event_type uses dot notation: entity.action (order.created)
     • All events include a timestamp in UTC ISO 8601
-    • The event_id is a UUID for deduplication
-    • The order_id is the partition key — all events for one order
-      go to the same partition and are ordered there
+    • The event_id is a UUID — consumers use it as a deduplication key
+    • The order_id is the Kafka partition key — all events for one order
+      go to the same partition and are strictly ordered there
+    • Events are self-describing — consumers need no follow-up query
 """)
 
     # ── Phase 2: Consume events, rebuild state ─────────────────────
-    section("Phase 2: Consuming Events — Rebuild State from Log")
+    section("Phase 2: Consuming Events — Rebuild State from Log (CQRS Projection)")
 
     print(f"  Consuming all events from topic '{TOPIC}'...")
     time.sleep(1)
     consumed = consume_all_events("group-state-builder", from_beginning=True)
     print(f"  Consumed {len(consumed)} events.")
 
-    state = rebuild_state(consumed)
+    state, _ = rebuild_state(consumed)
 
     print(f"\n  Current order state (projected from {len(consumed)} events):\n")
-    print(f"  {'Order':<12} {'Status':<12} {'Items':<20} {'Events'}")
-    print(f"  {'-'*12} {'-'*12} {'-'*20} {'-'*30}")
+    print(f"  {'Order':<12} {'Status':<12} {'Items':<20} {'Event chain'}")
+    print(f"  {'-'*12} {'-'*12} {'-'*20} {'-'*35}")
     for oid, order in sorted(state.items()):
         items_str = f"{len(order['items'])} items"
         events_str = " → ".join(e.split(".")[1] for e in order["events"])
         print(f"  {oid:<12} {order['status']:<12} {items_str:<20} {events_str}")
 
     print(f"""
+  Notice: ORD-0003 ends up as 'cancelled' even though it was previously
+  'delivered'. The projection applies events in order — the last state
+  transition wins. This is correct: the event log preserves the full
+  history but the projection shows current state.
+
   This is the CQRS read model:
     Write side: append events to Kafka (append-only log)
     Read side:  a consumer builds a queryable projection
-                (could be a database, cache, or in-memory dict)
+                (could be Postgres, Redis, Elasticsearch, etc.)
 
   The read model can be rebuilt at any time from the event log.
-  Multiple read models with different shapes can co-exist,
-  each consuming the same event stream.
+  Multiple read models can co-exist, consuming the same event stream.
 """)
 
     # ── Phase 3: Consumer group lag ────────────────────────────────
     section("Phase 3: Consumer Lag — Events Accumulate While Consumer is Stopped")
 
-    print(f"  Consumer 'group-stopped-consumer' has never consumed anything.")
-    print(f"  Producing 5 more events while it's 'stopped'...")
+    print(f"  'group-state-builder' has consumed all {len(consumed)} events so far.")
+    print(f"  Now producing 5 more events while that consumer is 'offline'...")
+    print()
 
     producer = get_producer()
-    for i in range(5):
-        ev = make_event("order.created", f"ORD-NEW-{i}", {"items": ["item-x"], "total": 9.99})
-        producer.send(TOPIC, key=f"ORD-NEW-{i}", value=ev)
+    new_event_count = 5
+    for i in range(new_event_count):
+        ev = make_event("order.created", f"ORD-NEW-{i:04d}", {"items": ["item-x"], "total": 9.99})
+        producer.send(TOPIC, key=f"ORD-NEW-{i:04d}", value=ev)
+        print(f"    Produced: order.created for ORD-NEW-{i:04d}")
     producer.flush()
     producer.close()
     time.sleep(1)
 
-    end_offset, committed, lag = get_consumer_lag("group-stopped-consumer")
-    print(f"\n  Consumer group 'group-stopped-consumer':")
-    print(f"    Latest offset (end of topic): {end_offset}")
-    print(f"    Committed offset:             {committed}")
-    print(f"    Lag:                          {lag} messages behind")
-
+    end_offset, committed, lag = get_consumer_lag("group-state-builder")
     print(f"""
-  Consumer lag = (end offset) - (committed offset)
-    • Lag=0: consumer is caught up
-    • Lag>0: consumer is behind — check for slow consumer or high produce rate
-    • Kafka retains messages per retention policy (default: 7 days)
-      regardless of whether consumers have read them
-    • This is unlike traditional MQ (RabbitMQ): in Kafka, consuming
-      an event does NOT delete it from the log
+  Consumer group 'group-state-builder':
+    Log end offset (total messages in partition): {end_offset}
+    Committed offset (last processed by group):   {committed}
+    Lag (messages not yet consumed):              {lag}
+
+  Consumer lag = (log end offset) - (committed offset)
+    • Lag = 0  → consumer is caught up
+    • Lag > 0  → consumer is behind; {new_event_count} new events published while it was offline
+    • Kafka retains ALL events regardless of consumption, up to the
+      configured retention period (default: 7 days / KAFKA_LOG_RETENTION_MS)
+    • This is unlike traditional MQ (RabbitMQ/SQS): consuming an event
+      does NOT delete it from the Kafka log
+
+  Production alert rule: alarm when lag > threshold AND is growing.
+  A steady non-zero lag (processing at produce rate) is fine; a growing
+  lag means the consumer can't keep up and will eventually miss events if
+  retention expires before it catches up.
 """)
 
-    # ── Phase 4: Replay from offset 0 ─────────────────────────────
-    section("Phase 4: Replay from Offset 0 — Full State Rebuild")
+    # ── Phase 4: Idempotent consumers ──────────────────────────────
+    section("Phase 4: Idempotent Consumers — Handling Duplicate Events")
 
-    print(f"  Consumer 'group-replayer' will read ALL events from the beginning...")
-    print(f"  (This is a fresh consumer with auto_offset_reset='earliest')")
+    print("""  At-least-once delivery is the Kafka default.
+  A consumer crash after processing but before committing its offset
+  causes it to re-read and re-process the same event on restart.
+  Consumers MUST be idempotent — processing the same event twice must
+  produce exactly the same result as processing it once.
+""")
+
+    # Use ORD-0001's full lifecycle (4 events: created, paid, shipped, delivered).
+    # Inject a duplicate of the order.paid event to simulate a consumer crash
+    # after processing but before committing the Kafka offset.
+    # real-world risk: double-charge, double-email, double-inventory-deduction.
+    ord1_events = all_events[:4]  # created, paid, shipped, delivered for ORD-0001
+    pay_event   = all_events[1]   # the order.paid event specifically
+    # Insert the duplicate paid event after the original paid (offset 1→dup at pos 2)
+    duplicated = [ord1_events[0], ord1_events[1], pay_event,
+                  ord1_events[2], ord1_events[3]]
+
+    print(f"  Simulating at-least-once delivery for ORD-0001:")
+    print(f"    Stream: created → paid → [DUPLICATE paid] → shipped → delivered")
+    print(f"    This happens when consumer crashes after processing 'paid' but before")
+    print(f"    committing the Kafka offset — Kafka redelivers 'paid' on restart.")
+    print()
+
+    # WITHOUT idempotency
+    state_no_idem, _ = rebuild_state(duplicated, seen_event_ids=None)
+    print(f"  Without idempotency check:")
+    for oid, order in sorted(state_no_idem.items()):
+        chain = " → ".join(e.split(".")[1] for e in order["events"])
+        print(f"    {oid}: status={order['status']!r:12s}  event chain: {chain}")
+    print(f"  ^^^ BUG: 'paid' appears twice in the event chain.")
+    print(f"      In a payment system this means a double-charge.")
+    print(f"      In email: duplicate confirmation sent. In inventory: double-deduction.")
+
+    print()
+
+    # WITH idempotency — pass a set to track seen event_ids
+    seen = set()
+    state_idem, dupes_skipped = rebuild_state(duplicated, seen_event_ids=seen)
+    print(f"  With idempotency check:    {dupes_skipped} duplicate(s) skipped")
+    for oid, order in sorted(state_idem.items()):
+        chain = " → ".join(e.split(".")[1] for e in order["events"])
+        print(f"    {oid}: status={order['status']!r:12s}  event chain: {chain}")
+    print(f"  ^^^ CORRECT: event chain is clean, duplicate 'paid' discarded via event_id.")
+
+    print(f"""
+  The idempotent version produces the same state regardless of how many
+  times each event is delivered — duplicates are discarded via event_id.
+
+  Implementation options:
+    1. In-memory set (lost on restart — only works for session dedup)
+    2. Redis SET with TTL (fast, distributed, survives restarts)
+    3. Database UNIQUE constraint on (event_id) in your projection table
+       → INSERT INTO processed_events (event_id) ON CONFLICT DO NOTHING
+       → If the insert succeeds, process the event; if it fails, skip it
+
+  Exactly-once semantics (Kafka transactions):
+    With enable.idempotence=true (producer) + transactional consumer,
+    Kafka can guarantee exactly-once end-to-end within the Kafka
+    ecosystem. Outside Kafka (e.g., writing to Postgres), you still
+    need application-level idempotency as shown above.
+""")
+
+    # ── Phase 5: Replay from offset 0 ─────────────────────────────
+    section("Phase 5: Replay from Offset 0 — Full State Rebuild")
+
+    print(f"  Consumer 'group-replayer' reads ALL events from offset 0...")
+    print(f"  (auto_offset_reset='earliest', fresh consumer group)\n")
     time.sleep(1)
 
     all_consumed = consume_all_events("group-replayer", from_beginning=True, timeout_ms=8000)
-    rebuilt = rebuild_state(all_consumed)
+    seen_replay = set()
+    rebuilt, _ = rebuild_state(all_consumed, seen_event_ids=seen_replay)
 
-    print(f"\n  Replayed {len(all_consumed)} total events.")
-    print(f"  Rebuilt state for {len(rebuilt)} orders:")
-
+    print(f"  Replayed {len(all_consumed)} total events.")
+    print(f"  Rebuilt state for {len(rebuilt)} orders:\n")
+    print(f"  {'Order':<14} {'Status':<12} {'Distinct events seen'}")
+    print(f"  {'-'*14} {'-'*12} {'-'*30}")
     for oid, order in sorted(rebuilt.items()):
-        print(f"    {oid}: status={order['status']}")
+        events_str = " → ".join(e.split(".")[1] for e in order["events"])
+        print(f"  {oid:<14} {order['status']:<12} {events_str}")
 
     print(f"""
+  The replay produced the exact same final state as Phase 2.
+  This is the core guarantee of event sourcing.
+
   Why replay is powerful:
-    • Bug fix: if your projection had a bug, fix the code and
-      replay all events — the state is rebuilt correctly
-    • New feature: add a new read model (e.g., "sales by category")
+    • Bug fix: projection had a bug? Fix the code and replay —
+      state is rebuilt correctly from the immutable source of truth
+    • New feature: add a new read model (e.g. "revenue by day")
       without touching existing data — just replay the event log
     • Audit trail: the event log is a complete, immutable history
-    • Time travel: replay events up to timestamp T to see past state
+    • Time travel: replay events up to timestamp T to recover past state
+    • Snapshot optimisation: for very long-lived aggregates, store a
+      snapshot every N events and replay only from the last snapshot
 
   Event schema evolution:
     • Backward compatible: add optional fields (consumers ignore them)
-    • Forward compatible: remove fields (producers still send them)
-    • Breaking change: requires a new event type or a migration
+    • Breaking change: requires a new event type (e.g. order.created.v2)
+      or an upcaster that transforms old events on read
     • Use Avro/Protobuf schemas + a Schema Registry for strict contracts
+      and automated compatibility enforcement
 """)
 
     # ── Summary ───────────────────────────────────────────────────
@@ -350,30 +463,36 @@ def main():
     Store events as the source of truth (not current state)
     + Complete audit trail
     + Temporal queries (state at any point in time)
-    + Rebuild projections freely
-    - Eventual consistency for reads
-    - Event schema evolution is tricky
-    - High event volume can make replay slow (use snapshots)
+    + Rebuild projections freely (fix bugs, add read models)
+    - Eventual consistency for reads (projection lag)
+    - Event schema evolution requires care
+    - Long-lived aggregates need snapshots to avoid slow replay
 
   CQRS (Command Query Responsibility Segregation)
     Separate write model (commands/events) from read model (queries)
     + Optimise reads and writes independently
     + Multiple read models for different query patterns
-    - Two models to keep in sync
+    - Two models to maintain
     - More complex infrastructure
 
-  Choreography vs Orchestration:
-    Choreography: services react to events independently (no coordinator)
+  Choreography vs Orchestration (Sagas):
+    Choreography: services react to events independently
       + Loose coupling; each service only knows about events
-      - Hard to see overall flow; debugging is harder
-    Orchestration: one service directs others via commands
-      + Easy to see flow; central place to handle errors
-      - Central coordinator is a coupling point and SPOF
+      - Hard to trace overall flow; debugging requires distributed tracing
+    Orchestration: one saga service directs others via commands
+      + Easy to observe flow; central error handling
+      - Central coordinator is a coupling point and potential SPOF
 
   Delivery guarantees:
     At-most-once:   messages may be lost (fire-and-forget)
-    At-least-once:  messages may be duplicated (most systems default)
-    Exactly-once:   Kafka with idempotent producer + transactions
+    At-least-once:  messages may be duplicated → consumers must be idempotent
+    Exactly-once:   Kafka idempotent producer + transactions (Kafka-internal)
+
+  Critical failure modes:
+    Poison pill:    malformed event crashes consumer → dead-letter topic
+    Consumer lag:   slow consumer misses events when retention expires
+    Dual-write:     writing to DB and publishing event non-atomically →
+                    use the Transactional Outbox pattern instead
 
   Next: ../05-message-queues-kafka/
 """)

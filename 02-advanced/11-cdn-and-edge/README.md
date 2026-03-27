@@ -1,7 +1,7 @@
 # CDN & Edge
 
 **Prerequisites:** `../09-rate-limiting-algorithms/`
-**Next:** `../11-observability/`
+**Next:** `../12-observability/`
 
 ---
 
@@ -78,7 +78,11 @@ Edge computing extends CDNs beyond caching to execute application logic at PoPs.
 
 **Privacy leakage via CDN caching personalised content:** If a response containing user-specific data (e.g., `Authorization: Bearer` response) is accidentally cached at the CDN, the next user's request may receive another user's data. Mitigation: always set `Cache-Control: private, no-store` on authenticated responses; test with `Surrogate-Control` headers to separate CDN from browser cache policy.
 
-**Thundering herd on popular item cache miss (cache stampede):** When a cached item expires, many concurrent requests may all simultaneously attempt to fetch from the origin. With 10,000 concurrent users, this can send 10,000 requests to the origin in one second. Mitigation: CDN request coalescing (Nginx `proxy_cache_lock on`), stale-while-revalidate, or probabilistic early expiry.
+**Thundering herd on popular item cache miss (cache stampede):** When a cached item expires, many concurrent requests may all simultaneously attempt to fetch from the origin. With 10,000 concurrent users, this can send 10,000 requests to the origin in one second. Mitigation: CDN request coalescing (Nginx `proxy_cache_lock on`), stale-while-revalidate, or probabilistic early expiry (jitter on TTL).
+
+**Vary header cache fragmentation:** `Vary: Accept-Language` instructs the CDN to maintain a separate cache entry per language. With 20 languages, a single URL consumes 20 cache slots and the effective hit rate per slot drops by 20x. `Vary: Cookie` or `Vary: Authorization` is even worse — it creates per-user cache entries, consuming unbounded storage and effectively disabling CDN caching. Mitigation: use `Vary: Accept-Encoding` only (safe, bounded variants); serve language variants at distinct URLs (e.g., `/en/page`, `/fr/page`) instead of relying on `Vary`.
+
+**CDN misconfiguration exposes origin:** Misconfigured CDN rules (e.g., a wildcard passthrough route or a miscategorised path) can accidentally bypass caching and route all traffic to the origin. A CDN that is supposed to absorb 90% of traffic suddenly passes 100% through — origin overloads without the traffic ever appearing to increase from the CDN metrics. Mitigation: monitor origin request rate independently of CDN hit rate; alert on abnormal origin traffic increases.
 
 ## Interview Talking Points
 
@@ -88,6 +92,9 @@ Edge computing extends CDNs beyond caching to execute application logic at PoPs.
 - "CDN latency advantage comes from both proximity (shorter RTT) and persistent connections (no TLS handshake per request). Even cache misses are faster."
 - "Edge computing runs application logic at CDN PoPs — Cloudflare Workers, Fastly Compute@Edge. Zero cold start, global distribution, ~1ms execution for simple logic."
 - "Anycast routing: CDNs advertise the same IP from multiple PoPs using BGP. The internet routes your packet to the topologically nearest PoP automatically."
+- "stale-while-revalidate is the right default for most non-financial content. It eliminates the latency spike at TTL expiry boundaries by serving stale immediately and refreshing in the background. Without it, the first post-expiry request blocks for the full origin RTT — a predictable p99 problem under load."
+- "Vary header is a double-edged sword. `Vary: Accept-Encoding` is safe (2-3 variants). `Vary: Accept-Language` fragments the cache by language count. `Vary: Cookie` or `Vary: Authorization` effectively disables CDN caching and can leak personalised data between users. Never set Vary on auth-gated responses — use `Cache-Control: private` instead."
+- "Origin must be sized for full traffic, not just cache-miss traffic. If a CDN PoP fails or is bypassed, 100% of requests suddenly hit the origin. Sizing only for 10% traffic (the usual miss rate) guarantees a cascade failure on any CDN incident."
 
 ## Hands-on Lab
 
@@ -97,47 +104,71 @@ Edge computing extends CDNs beyond caching to execute application logic at PoPs.
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/10-cdn-and-edge/
+cd system-design-interview/02-advanced/11-cdn-and-edge/
 docker compose up
 ```
 
 ### Experiment
 
-The script runs five phases automatically:
+The script runs eight phases automatically:
 
-1. Requests `/content/image.jpg` twice — first is a MISS (~200ms), second is a HIT (<5ms). Shows the `X-Cache-Status` header.
-2. Requests `/nocache/data.json` three times — all are BYPASS because the origin sends `Cache-Control: no-store`.
-3. Requests `/short-ttl/report.pdf` (5s TTL), waits 6 seconds, shows the cache expires and re-fetches from origin.
-4. Requests `/content/bundle.js?v=1` then `?v=2` — different query strings produce separate cache keys, simulating URL versioning for deployments.
-5. Prints a performance summary comparing MISS vs HIT latency.
+1. **MISS → HIT:** Requests `/content/image.jpg` three times — first is a MISS (~200ms), subsequent are HITs (<5ms). The `X-Origin-Hit` counter confirms the origin is only contacted once.
+2. **no-store:** Requests `/nocache/data.json` three times — all BYPASS because the origin sends `Cache-Control: no-store`. The origin hit counter increments on every request.
+3. **TTL expiry:** Requests `/short-ttl/report.pdf` (5s TTL), waits 6 seconds, shows the cache expires and re-fetches from origin. Then HITs again on the next request.
+4. **URL versioning:** Requests `/content/bundle.js?v=1` then `?v=2` — different query strings are different cache keys, so `?v=2` always starts with a MISS.
+5. **stale-while-revalidate:** Requests `/swr/data.json` (max-age=5, swr=10), sleeps 6 seconds, then shows a STALE response served immediately while a background fetch refreshes the cache — no latency spike at TTL expiry.
+6. **Vary header fragmentation:** Requests `/vary/page.html` with `Accept-Language: en-US`, `fr-FR`, `de-DE`, then `en-US` again — each language is a separate cache entry (MISS) but the second `en-US` is a HIT.
+7. **Private content:** Requests `/private/profile.json` as different users — all BYPASS regardless of user; the origin is contacted every time, confirming auth responses never reach the CDN cache.
+8. **Performance summary:** Compares MISS vs HIT latency across 5 samples and prints total origin hit counts per endpoint to show how many requests actually escaped the CDN.
 
-### Break It
+### Break It: Cache Stampede
 
-Test cache stampede by disabling `proxy_cache_lock` in `nginx.conf` and sending concurrent requests when cache is cold:
+Test the thundering-herd / cache stampede failure mode by temporarily disabling `proxy_cache_lock` in `nginx.conf`:
+
+```nginx
+# In nginx.conf, comment out or remove from the /content/ location:
+# proxy_cache_lock on;
+```
+
+Then send 20 concurrent requests to a cold URL:
 
 ```bash
-# Remove: proxy_cache_lock on;
-# Then send 20 concurrent requests to a cold URL:
-docker compose exec experiment sh -c "
-pip install requests --quiet
-python -c \"
-import threading, requests, time
+# Run from your host machine while docker compose is up:
+python3 -c "
+import threading, requests, time, collections
+
 results = []
-def req():
+lock = threading.Lock()
+
+def req(i):
+    url = 'http://localhost:8080/content/stampede_test.jpg'
     t = time.time()
-    r = requests.get('http://nginx/content/stampede_test.jpg')
-    results.append((r.headers.get('X-Cache-Status'), (time.time()-t)*1000))
-threads = [threading.Thread(target=req) for _ in range(20)]
+    r = requests.get(url)
+    elapsed = (time.time() - t) * 1000
+    with lock:
+        results.append((r.headers.get('X-Cache-Status'), elapsed,
+                         r.headers.get('X-Origin-Hit', '?')))
+
+threads = [threading.Thread(target=req, args=(i,)) for i in range(20)]
 [t.start() for t in threads]
 [t.join() for t in threads]
-misses = sum(1 for s,_ in results if s == 'MISS')
-print(f'20 concurrent requests: {misses} origin hits (should be 1 with cache_lock)')
-\""
+
+status_counts = collections.Counter(s for s, _, _ in results)
+origin_hits = [h for _, _, h in results]
+print(f'Results: {dict(status_counts)}')
+print(f'Origin hit numbers seen: {sorted(set(origin_hits))}')
+print('With cache_lock ON:  only 1 MISS; 19 requests wait and get HIT')
+print('With cache_lock OFF: up to 20 MISSes; 20 concurrent origin requests')
+"
 ```
 
 ### Observe
 
-With `proxy_cache_lock on`, only one request fetches from origin; others wait and get the cached result. Without it, all 20 requests may simultaneously reach the origin — the cache stampede.
+With `proxy_cache_lock on` (the default in this lab), only one request fetches from the origin; the remaining 19 wait and are served from the just-populated cache entry. All `X-Origin-Hit` values will be `1`.
+
+Without `proxy_cache_lock`, all 20 requests arrive at the origin simultaneously. Under real load (10,000 RPS hitting a short-TTL endpoint) this can briefly send thousands of requests to an origin sized for only cache-miss traffic — a leading cause of origin overload cascades.
+
+`stale-while-revalidate` is complementary: it prevents the stampede at TTL expiry time by serving the stale entry while exactly one background request refreshes the cache.
 
 ### Teardown
 

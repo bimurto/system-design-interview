@@ -1,15 +1,34 @@
 #!/usr/bin/env python3
 """
 GraphQL API — Strawberry + Flask.
-User type with id, name, email and nested posts field.
+
+User type with id, name, email, age, city and nested posts field.
 Queries: users() and user(id: String)
+
+Intentional design for demo purposes:
+  - The `posts` resolver on User fires a separate data lookup per user.
+  - When fetching N users with posts, this triggers N resolver calls.
+  - This is the GraphQL-layer N+1 problem (HTTP layer is solved, DB layer is not).
+  - The fix is the DataLoader pattern — documented in the resolver comment.
+
+A resolver call counter is exposed at GET /resolver-stats so experiment.py
+can surface the N resolver calls that occurred during a users+posts query.
 """
 
-import strawberry
-from strawberry.flask import GraphQLView
-from flask import Flask
-from typing import List, Optional
 import os
+from typing import List, Optional
+
+import strawberry
+from flask import Flask, jsonify
+from strawberry.flask import GraphQLView
+
+# ── Resolver call counter (in-memory, reset per request via /resolver-stats) ───
+
+_resolver_stats = {"posts_resolver_calls": 0}
+
+
+def _reset_stats():
+    _resolver_stats["posts_resolver_calls"] = 0
 
 
 # ── In-memory data (same shape as REST API) ────────────────────────────────────
@@ -41,6 +60,24 @@ _POSTS_DATA = {
 }
 
 
+def _fetch_posts_for_user(user_id: str) -> list:
+    """
+    Simulates a per-user DB query.
+
+    In a real app this would be:
+        SELECT * FROM posts WHERE user_id = %s
+
+    When called inside a User resolver that iterates N users, this fires N
+    separate queries — the GraphQL N+1 problem at the database layer.
+
+    Fix: DataLoader batches all user_ids collected in the same event-loop tick
+    into a single:
+        SELECT * FROM posts WHERE user_id IN (1, 2, 3, ..., N)
+    """
+    _resolver_stats["posts_resolver_calls"] += 1
+    return _POSTS_DATA.get(user_id, [])
+
+
 # ── Strawberry types ───────────────────────────────────────────────────────────
 
 @strawberry.type
@@ -63,7 +100,12 @@ class User:
 
     @strawberry.field
     def posts(self) -> List[Post]:
-        return [Post(**p) for p in _POSTS_DATA.get(self.id, [])]
+        # Each call here is a separate "DB query" — N+1 at the resolver layer.
+        # With DataLoader this entire method body would be replaced by:
+        #   return await posts_loader.load(self.id)
+        # which batches all concurrent loads into one bulk fetch.
+        raw = _fetch_posts_for_user(self.id)
+        return [Post(**p) for p in raw]
 
 
 def _make_user(data: dict) -> User:
@@ -103,8 +145,15 @@ app.add_url_rule(
 
 @app.route("/health")
 def health():
-    from flask import jsonify
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/resolver-stats")
+def resolver_stats():
+    """Return and reset resolver call counters for experiment.py to inspect."""
+    stats = dict(_resolver_stats)
+    _reset_stats()
+    return jsonify(stats), 200
 
 
 if __name__ == "__main__":

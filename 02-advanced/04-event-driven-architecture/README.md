@@ -59,7 +59,36 @@ The coupling implications of EDA are profound. In a synchronous system, Service 
   Client ◄── Query Handler  ◄── Read DB   ◄── Projection Consumer ◄─┘
 ```
 
-**Event schema evolution:** events are immutable once published. Adding new optional fields is backward-compatible (old consumers ignore them). Removing required fields is a breaking change. Renaming fields requires a new event type. For strict schema contracts, use Apache Avro or Protobuf with a Schema Registry — the registry enforces compatibility rules and allows consumers to evolve independently.
+**Event schema evolution:** events are immutable once published. Adding new optional fields is backward-compatible (old consumers ignore them). Removing required fields is a breaking change. Renaming fields requires a new event type (e.g., `order.created.v2`) or an **upcaster** — a function that transforms old event payloads to the new shape on read, so the projection code doesn't need to handle both versions. For strict schema contracts across teams, use Apache Avro or Protobuf with a Schema Registry — the registry enforces compatibility rules (`BACKWARD`, `FORWARD`, `FULL`) and prevents a producer from deploying a breaking schema change without all consumers being ready.
+
+**The dual-write problem:** the most insidious failure mode in EDA. A service that writes to a database AND publishes an event in two separate operations has no atomicity guarantee. If the process crashes after the DB write but before the Kafka publish, the state is updated but the event is never emitted — downstream services never learn of the change. Conversely, if Kafka is flushed before the DB commit rolls back, you've emitted an event for a state that doesn't exist.
+
+**Transactional Outbox pattern** solves this atomically: instead of publishing to Kafka directly, the service writes both its business entity update AND a new row in an `outbox` table in the same local database transaction. A separate relay process (e.g., Debezium using Change Data Capture) tails the `outbox` table and publishes events to Kafka. If the relay crashes, it retries — the outbox row persists until the event is confirmed published. This gives you atomicity between the DB write and the event publish without distributed transactions.
+
+```
+  Without outbox (dual-write risk):
+    Service ──► DB commit ──► [crash here] ──► Kafka publish (never happens)
+
+  With Transactional Outbox:
+    Service ──► BEGIN TX ──► UPDATE orders SET ... ──► INSERT INTO outbox ──► COMMIT
+                                                              │
+    Debezium (CDC) ──────────────────────────────────────────►│ tails outbox table
+                                                              ▼
+                                                         Kafka publish
+                                                         (at-least-once; outbox row deleted)
+```
+
+**Saga pattern:** long-running business transactions that span multiple services cannot use a single database transaction. A saga is a sequence of local transactions, each publishing an event that triggers the next step. If a step fails, the saga executes **compensating transactions** — each step has a defined undo operation.
+
+```
+  Order saga (choreography):
+    1. OrderService       → order.created        → InventoryService reserves stock
+    2. InventoryService   → inventory.reserved   → PaymentService charges card
+    3. PaymentService     → payment.failed       → InventoryService releases stock (compensate)
+                                                  → OrderService cancels order (compensate)
+```
+
+If payment fails, compensating events flow backwards to undo the inventory reservation and cancel the order. No distributed lock needed — each service handles its own local rollback.
 
 **Choreography:**
 ```
@@ -85,26 +114,32 @@ The coupling implications of EDA are profound. In a synchronous system, Service 
 | Availability | High (producer doesn't wait for consumer) | Lower (call fails if downstream is down) |
 | Consistency | Eventual | Can be synchronous/strong |
 | Debuggability | Hard (distributed trace across many services) | Easy (request → response, simple trace) |
-| Ordering | Guaranteed within partition | N/A |
+| Ordering | Guaranteed **within a partition** only; no global ordering across partitions | N/A |
 | Latency | Higher (async) | Lower for simple request-response |
 | Replay | Yes (reprocess historical events) | No |
 
 ### Failure Modes
 
-**Poison pill events:** a malformed event that causes the consumer to crash repeatedly, blocking the consumption of all subsequent events in the partition. Mitigation: implement a dead-letter topic (DLT) where events that fail processing N times are routed, with alerting, so the bad event doesn't block the queue indefinitely.
+**Poison pill events:** a malformed event that causes the consumer to crash repeatedly, blocking the consumption of all subsequent events in the partition. Mitigation: implement a dead-letter topic (DLT) where events that fail processing N times are routed, with alerting, so the bad event doesn't block the queue indefinitely. Critically, the consumer must commit the offset of the bad event before routing to DLT — otherwise it will loop forever.
 
-**Consumer falling behind (lag buildup):** a slow consumer accumulates lag, and if Kafka's retention period is shorter than the time needed to catch up, the consumer will miss events. Mitigation: monitor consumer lag continuously; scale out consumer instances; increase retention period; use Kafka's log compaction for state-based topics.
+**Consumer falling behind (lag buildup):** a slow consumer accumulates lag, and if Kafka's retention period is shorter than the time needed to catch up, the consumer will miss events permanently. Mitigation: monitor consumer lag continuously (lag AND lag growth rate); scale out consumer instances (up to the partition count limit); increase retention period; use Kafka's log compaction for state-based topics to keep the log bounded.
 
-**Event schema mismatch:** a producer publishes events in a new format that old consumers can't deserialize, causing crashes. Mitigation: use a Schema Registry with compatibility checks (e.g., `BACKWARD` mode, which ensures new schemas can read old messages). Never deploy a schema-breaking change without coordinating with all consumers.
+**Event schema mismatch:** a producer publishes events in a new format that old consumers can't deserialize, causing crashes. Mitigation: use a Schema Registry with compatibility checks (e.g., `BACKWARD` mode ensures new schemas can read old messages). Never deploy a schema-breaking change without coordinating with all consumers.
+
+**The dual-write problem:** a service writes to its database and publishes an event in two separate, non-atomic operations. A crash between the two leaves the system inconsistent — state changed but no event emitted, or event emitted for a state that was never persisted. Mitigation: use the Transactional Outbox pattern (write to DB and outbox table in one transaction; a separate relay publishes from outbox to Kafka).
+
+**Projection drift:** a bug in the projection consumer produces incorrect read model state for months before being discovered. Because the event log is immutable and the bug is in the consumer code, you cannot "undo" the bad projections. Mitigation: fix the consumer code and replay the entire event log from offset 0 to rebuild the projection from scratch. This is the event sourcing superpower — the event log is the ground truth, not the derived projection.
 
 ## Interview Talking Points
 
 - "In event-driven architecture, services communicate via events — immutable facts about the past. A service publishes events and doesn't know who consumes them. This decouples producers from consumers in time, space, and failure."
-- "Event sourcing stores the history of events as the source of truth, not the current state. Current state is derived by replaying events. This gives you a complete audit log, time-travel queries, and the ability to rebuild projections."
-- "CQRS separates the write model (commands/events) from the read model (projections). Each read model can be in a different database, optimized for its query pattern. Elasticsearch for search, Redis for leaderboards, Postgres for reports."
-- "Choreography vs orchestration: choreography has services react to events independently — loose coupling, hard to observe. Orchestration has a central saga that directs each step — easier to observe, but introduces a central coupling point."
-- "At-least-once delivery means events may be delivered more than once. Consumers must be idempotent — processing the same event twice must produce the same result. Use the event_id as a deduplication key."
-- "The hardest part of EDA is schema evolution. Events are immutable once published — you can't change historical events. All schema changes must be backward-compatible, or you need a schema migration strategy."
+- "Event sourcing stores the history of events as the source of truth, not the current state. Current state is derived by replaying events. This gives you a complete audit log, time-travel queries, and the ability to rebuild projections from scratch."
+- "CQRS separates the write model (commands/events) from the read model (projections). Each read model can be in a different database, optimized for its query pattern. Elasticsearch for search, Redis for leaderboards, Postgres for reports. Rebuilding a broken projection is as simple as deleting it and replaying the event log."
+- "Choreography vs orchestration: choreography has services react to events independently — loose coupling, hard to observe. Orchestration has a central saga that directs each step — easier to observe, but introduces a central coupling point. I default to choreography for simple flows and orchestration when I need explicit failure handling and compensation logic."
+- "At-least-once delivery means events may be delivered more than once. Consumers must be idempotent — processing the same event twice must produce the same result. The practical implementation is a unique constraint on event_id in the projection's database — INSERT ... ON CONFLICT DO NOTHING."
+- "The dual-write problem is the most common production failure in EDA: if you write to your database and publish to Kafka in two separate operations, a crash between them leaves the system inconsistent. The fix is the Transactional Outbox pattern — write both to the same database transaction, then a CDC relay like Debezium publishes from the outbox to Kafka."
+- "Ordering in Kafka is guaranteed only within a single partition. For global ordering across partitions, you'd need a single partition — which kills throughput — or application-level sequencing. The typical solution is to use the aggregate ID (e.g., order_id) as the partition key, so all events for one aggregate are ordered, which is the only ordering that matters for state reconstruction."
+- "The hardest part of EDA is schema evolution. Events are immutable once published — you can never change historical events. Design events to be backward-compatible: add optional fields, never remove required ones. For breaking changes, introduce a new event type (order.created.v2) or use an upcaster in the consumer."
 
 ## Hands-on Lab
 
@@ -126,7 +161,12 @@ pip install kafka-python-ng
 python experiment.py
 ```
 
-The script publishes the full lifecycle of 5 orders (created → paid → shipped → delivered, with one cancellation), then consumes all events and rebuilds current state by replaying them. It then simulates a stopped consumer, produces 5 more events, and shows the consumer lag. Finally, it replays all events from offset 0 with a fresh consumer group to show full state reconstruction.
+The script runs five phases:
+1. Publishes the full lifecycle of 5 orders (created → paid → shipped → delivered, with one cancellation)
+2. Consumes all events and rebuilds current state via a CQRS projection
+3. Produces 5 more events while a consumer is "offline" and measures real consumer lag (committed offset vs. log end offset)
+4. Simulates at-least-once delivery by re-feeding events twice, then shows how an idempotency check using event_id eliminates duplicates
+5. Replays all events from offset 0 with a fresh consumer group to show full state reconstruction
 
 ### Break It
 
@@ -166,7 +206,7 @@ consumer.close()
 
 ### Observe
 
-The state rebuild in Phase 2 shows that ORD-0003 ends up in `cancelled` status even though it was previously `shipped` — the last event wins. The consumer lag section shows that Kafka retains all events regardless of whether they've been consumed. Phase 4 replay produces the exact same final state as Phase 2 — this is the core guarantee of event sourcing.
+The state rebuild in Phase 2 shows that ORD-0003 ends up in `cancelled` status even though it was previously `delivered` — the last event wins in the projection. Phase 3 consumer lag shows the difference between committed offset and log end offset; the lag is exactly the number of events produced while the consumer was offline. Phase 4 shows that without an idempotency check, duplicate events inflate the event chain; with the check, duplicates are silently discarded and the state is identical. Phase 5 replay produces the exact same final state as Phase 2 — this is the core guarantee of event sourcing.
 
 ### Teardown
 
@@ -182,7 +222,9 @@ docker compose down -v
 
 ## Common Mistakes
 
+- **The dual-write problem (most dangerous).** Writing to a database and publishing to Kafka in two separate operations has no atomicity. A crash or network error between the two leaves state and events inconsistent. This is not a theoretical edge case — in any system with decent traffic, processes crash, and eventually you will hit this. Use the Transactional Outbox pattern: write both to the same DB transaction, have a relay (Debezium/CDC) publish from the outbox to Kafka.
 - **Making events too coarse-grained.** An `order.updated` event with the full new order state is not an event — it's a snapshot. Events should describe what specifically changed: `order.item_added`, `order.shipping_address_changed`. Coarse events lose the semantic meaning of what happened and make it harder for consumers to react appropriately.
 - **Putting commands in the event log.** Publishing `create_order` as an event conflates commands (which may fail) with events (which represent completed facts). If you publish a command and it fails, you've polluted the event log with a non-event. Separate command processing from event publishing.
-- **Ignoring idempotency.** At-least-once delivery is the Kafka default. If your consumer doesn't handle duplicate events, you'll double-process: double-charges, double-emails, double-inventory-deductions. Use the event_id as a deduplication key in a database or Redis set.
+- **Ignoring idempotency.** At-least-once delivery is the Kafka default. If your consumer doesn't handle duplicate events, you'll double-process: double-charges, double-emails, double-inventory-deductions. Use the event_id as a deduplication key stored in a database unique constraint or Redis set.
 - **Using Kafka as a traditional message queue.** Kafka retains all messages for a configurable period, regardless of consumption. Deleting a message after consumption is not how Kafka works. If you need traditional queue semantics (process-once, auto-delete), use RabbitMQ or SQS instead.
+- **Forgetting snapshot strategy for long-lived aggregates.** An aggregate that has existed for years may have thousands of events. Replaying all of them on every command is O(n) and gets worse over time. In production, persist a snapshot of the aggregate state every N events and replay only from the last snapshot. Snapshots are an optimisation, not a source of truth — the event log remains the ground truth.

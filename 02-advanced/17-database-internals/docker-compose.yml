@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dbinternals
+      POSTGRES_USER: postgres
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_wal_senders=3
+        -c shared_buffers=128MB
+        -c work_mem=4MB
+        -c log_checkpoints=on
+        -c autovacuum=on
+        -c autovacuum_vacuum_scale_factor=0.01
+        -c autovacuum_analyze_scale_factor=0.005
+        -c log_autovacuum_min_duration=0
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M

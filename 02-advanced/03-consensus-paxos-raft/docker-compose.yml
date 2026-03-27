@@ -1,8 +1,17 @@
+networks:
+  raft-net:
+    driver: bridge
+
 services:
   etcd0:
     image: quay.io/etcd-io/etcd:v3.5.9
+    container_name: etcd0
+    networks:
+      - raft-net
     ports:
       - "2379:2379"
+    mem_limit: 256m
+    restart: on-failure
     command: >
       etcd
       --name etcd0
@@ -13,6 +22,8 @@ services:
       --initial-cluster-token etcd-cluster
       --initial-cluster etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       --initial-cluster-state new
+      --election-timeout 1000
+      --heartbeat-interval 100
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s
@@ -21,8 +32,13 @@ services:
 
   etcd1:
     image: quay.io/etcd-io/etcd:v3.5.9
+    container_name: etcd1
+    networks:
+      - raft-net
     ports:
       - "2479:2379"
+    mem_limit: 256m
+    restart: on-failure
     command: >
       etcd
       --name etcd1
@@ -33,6 +49,8 @@ services:
       --initial-cluster-token etcd-cluster
       --initial-cluster etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       --initial-cluster-state new
+      --election-timeout 1000
+      --heartbeat-interval 100
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s
@@ -41,8 +59,13 @@ services:
 
   etcd2:
     image: quay.io/etcd-io/etcd:v3.5.9
+    container_name: etcd2
+    networks:
+      - raft-net
     ports:
       - "2381:2379"
+    mem_limit: 256m
+    restart: on-failure
     command: >
       etcd
       --name etcd2
@@ -53,6 +76,8 @@ services:
       --initial-cluster-token etcd-cluster
       --initial-cluster etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       --initial-cluster-state new
+      --election-timeout 1000
+      --heartbeat-interval 100
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s

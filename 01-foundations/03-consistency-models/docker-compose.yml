@@ -3,6 +3,9 @@ services:
     image: redis:7
     ports:
       - "6379:6379"
+    command: redis-server --loglevel warning
+    mem_limit: 128m
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -13,16 +16,30 @@ services:
     image: redis:7
     ports:
       - "6380:6379"
-    command: redis-server --replicaof redis-master 6379
+    command: redis-server --replicaof redis-master 6379 --loglevel warning
+    mem_limit: 128m
+    restart: unless-stopped
     depends_on:
       redis-master:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   redis-replica2:
     image: redis:7
     ports:
       - "6381:6379"
-    command: redis-server --replicaof redis-master 6379
+    command: redis-server --replicaof redis-master 6379 --loglevel warning
+    mem_limit: 128m
+    restart: unless-stopped
     depends_on:
       redis-master:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

@@ -13,7 +13,11 @@ The fundamental trade-off is accuracy for space. A Python `set` that tracks 10 m
 
 The Bloom filter, invented by Burton Bloom in 1970, is the canonical probabilistic membership test. It uses a bit array of m bits and k hash functions. Adding an item sets k bits (one per hash function). Querying checks whether all k bits are set. A false positive occurs when all k bits happen to be set by other items. The probability is bounded by the formula `(1 - e^(-kn/m))^k` where n is the number of inserted items. This formula drives the parameter choices: given a desired false positive rate p and capacity n, you can compute the optimal m and k. Crucially, false negatives are impossible — if an item was added, all its bits are definitely set.
 
+A critical Bloom filter limitation for production systems: **deletion is impossible**. Clearing bits when removing an item would corrupt membership tests for other items that share those bits. This motivates the **Cuckoo filter** — a more recent alternative that supports deletion, uses less space for FPR < 3%, and is faster in practice. Cuckoo filters store fingerprints of items in a hash table using cuckoo hashing; deletion works by finding and removing the fingerprint. The trade-off: Cuckoo filters have a hard capacity limit (unlike scalable Bloom filters) and can fail to insert if the table becomes too full (~95%+ occupancy). For read-heavy workloads requiring deletion (e.g., cache invalidation lists, revoked token sets), prefer Cuckoo filters.
+
 HyperLogLog estimates the cardinality (number of distinct elements) of a multiset. The insight is elegant: if you hash items to a uniform random bit string, the maximum number of leading zeros in any hash is statistically related to the total number of distinct items. One leading zero means roughly 2^1 = 2 distinct items; three leading zeros means roughly 2^3 = 8 distinct items. A single max-leading-zeros register is noisy, but averaging over 16,384 registers (using sub-hash values to choose which register to update) produces a cardinality estimate with ±0.81% standard error, using only 12KB of memory regardless of whether you have 1,000 or 1,000,000,000 distinct items.
+
+A key operational capability: **HyperLogLog structures are mergeable**. Redis `PFMERGE dest src1 src2 ...` combines multiple HLL counters into one. This means you can maintain per-shard or per-hour HLLs and merge them to get a cross-shard or cross-time-window distinct count — something impossible with most exact approaches without centralizing raw data. HyperLogLog++ (Google's 2013 improvement, used in BigQuery) adds a sparse representation for low cardinalities and a bias correction lookup table, reducing error at cardinalities below ~11,500 from several percent to near-zero.
 
 Count-Min Sketch estimates item frequencies in a data stream. It uses a w×d matrix of counters and d hash functions. Incrementing an item updates d counters (one per row). Querying returns the minimum across d counters — the minimum is used because hash collisions can only increase a counter, never decrease it, so the minimum is the best estimate of the true count. The error bound is: estimated count ≤ true count + ε×N, where ε = e/w and δ = e^(-d) is the failure probability. By choosing appropriate w and d, you can trade memory for accuracy.
 
@@ -95,13 +99,14 @@ Count-Min Sketch estimates item frequencies in a data stream. It uses a w×d mat
 
 ### Trade-offs
 
-| Structure | Space | Answer Type | Error Guarantee | Use Case |
-|---|---|---|---|---|
-| Bloom Filter | O(n) sub-linear | "Definitely not" or "probably yes" | FP rate bounded by math | Membership test at scale |
-| HyperLogLog | O(1) ~12KB | Cardinality estimate | ±0.81% std error | Unique visitor count |
-| Count-Min Sketch | O(w×d) | Frequency estimate | Always ≥ true count | Heavy hitter detection |
-| Top-K | O(K) | Most frequent K items | Approximate ranks | Trending items |
-| MinHash | O(bands) | Similarity score | Tunable by band count | Near-duplicate detection |
+| Structure | Space | Answer Type | Error Guarantee | Supports Deletion | Use Case |
+|---|---|---|---|---|---|
+| Bloom Filter | O(n) sub-linear | "Definitely not" or "probably yes" | FP rate bounded by math | No | Membership test at scale |
+| Cuckoo Filter | O(n) sub-linear | Same as Bloom | FP rate bounded by math (lower space at FPR<3%) | Yes | Membership with deletions (revoked tokens, cache invalidation) |
+| HyperLogLog | O(1) ~12KB | Cardinality estimate | ±0.81% std error | No | Unique visitor count |
+| Count-Min Sketch | O(w×d) | Frequency estimate | Always ≥ true count | No (only increment) | Heavy hitter detection |
+| Top-K | O(K) | Most frequent K items | Approximate ranks | No | Trending items |
+| MinHash | O(bands) | Similarity score | Tunable by band count | No | Near-duplicate detection |
 
 ### Failure Modes
 
@@ -111,16 +116,22 @@ Count-Min Sketch estimates item frequencies in a data stream. It uses a w×d mat
 
 **Count-Min Sketch width too small — high collision rate:** With a width of 100 and 1 million distinct items, every counter has ~10,000 items hashing to it on average. The estimate for any item will be hugely inflated. Rule of thumb: width should be at least 2× the maximum expected single-item count / total event count ratio, multiplied by the stream size. For typical heavy-hitter detection, width=1000-10000 with depth=5 covers most cases.
 
+**Cuckoo filter insertion failure near capacity:** Unlike Bloom filters (which degrade gracefully but predictably), Cuckoo filters can fail hard — `insert()` returns false when the table is too full (~95%+ load factor) and the cuckoo eviction cycle cannot terminate. This failure is silent if not checked. Production Cuckoo filters must handle insert failures explicitly (fall back to an exact store, or refuse insertion and alert). Never use a Cuckoo filter without checking the return value of insert.
+
+**HyperLogLog PFMERGE not commutative with sparse mode:** In Redis, HLLs in sparse representation can be merged, but a merge always produces a dense representation. If you frequently merge many small HLLs and then re-split them, you waste the sparse encoding's space benefit. Design merge strategies to be terminal operations (daily rollup, cross-shard aggregate) rather than intermediate steps.
+
 **Using probabilistic structures where exact counts are required:** Using HyperLogLog for billing (billing a customer for approximate API calls) or using a Bloom filter as the only security check (an attacker who knows the hash functions can craft false positives) are category errors. Probabilistic structures are for analytics and optimization, not for correctness-critical operations.
 
 ## Interview Talking Points
 
-- "Bloom filters are used in Cassandra for SSTable lookup — before reading from disk, check the Bloom filter to see if the key might be in this SSTable. A false positive means an unnecessary disk read; a false negative is impossible. This dramatically reduces disk I/O for missing keys."
-- "HyperLogLog uses 12KB to count distinct items with ±0.81% accuracy, regardless of whether there are 1,000 or 1 billion distinct items. Redis uses it for `PFCOUNT` — unique visitor counting without storing individual user IDs."
-- "The Bloom filter false positive formula is `(1 - e^(-kn/m))^k`. To hit 1% FPR with 100M items, you need ~960MB of bits — still much less than storing the items themselves."
-- "Count-Min Sketch is like a compressed frequency table. It trades exact counts for a sketch that always over-estimates (never under-estimates). Perfect for finding 'heavy hitters' in network traffic or event streams."
-- "MinHash estimates Jaccard similarity between two sets in O(k) space rather than O(|A| + |B|). LinkedIn uses it to find users with similar profiles for recommendations without comparing every pair."
-- "The key question before using a probabilistic structure: can your application tolerate false positives? Chrome's safe browsing blocklist uses a Bloom filter — a false positive just means an extra server check, not a security failure."
+- "Bloom filters are used in Cassandra for SSTable lookup — before reading from disk, check the Bloom filter to see if the key might be in this SSTable. A false positive means an unnecessary disk read; a false negative is impossible. This dramatically reduces disk I/O for missing keys. Cassandra tunes the FPR per table — a 1% FPR means at most 1 extra disk read per 100 'key not found' lookups."
+- "HyperLogLog uses 12KB to count distinct items with ±0.81% accuracy, regardless of whether there are 1,000 or 1 billion distinct items. Redis uses it for `PFCOUNT`. Critically, HLLs are mergeable via `PFMERGE` — you can keep one HLL per hour or per shard and merge them for multi-day or cross-region distinct counts. That's impossible with exact approaches without centralizing raw IDs."
+- "The Bloom filter false positive formula is `(1 - e^(-kn/m))^k`. To hit 1% FPR with 100M items, you need ~958MB of bits and ~7 hash functions — still far less than storing 100M 8-byte IDs (800MB), and with no random-access read cost."
+- "If you need membership testing with deletions — like a revoked JWT token list or a CDN cache invalidation set — use a Cuckoo filter instead of a Bloom filter. Cuckoo filters support deletion and use ~25% less space than Bloom for the same FPR below 3%, but they can fail hard on insert near full capacity, so you must handle that case explicitly."
+- "Count-Min Sketch is like a compressed frequency table. It trades exact counts for a sketch that always over-estimates (never under-estimates) by at most `ε * N` with probability `1 - δ`, where you tune `ε` and `δ` by choosing width and depth. Perfect for 'heavy hitter' detection in network traffic or ad impression streams."
+- "HyperLogLog++ (used in BigQuery's `APPROX_COUNT_DISTINCT`) adds a sparse representation for small cardinalities and a bias correction table, virtually eliminating the error spikes that occur in vanilla HLL at cardinalities below ~40,000. When asked about approximate distinct counts in a data warehouse context, mention HLL++ specifically."
+- "MinHash estimates Jaccard similarity between two sets in O(k) space rather than O(|A| + |B|). LinkedIn uses it to find users with similar profiles for recommendations without comparing every pair. The key insight: `P(min_hash_i(A) == min_hash_i(B)) = |A ∩ B| / |A ∪ B|`, so the fraction of matching min-hashes directly estimates Jaccard similarity."
+- "The key question before using a probabilistic structure: can your application tolerate false positives, and is the error one-sided or two-sided? Bloom/Cuckoo have one-sided error (false positives only). HyperLogLog has symmetric error. Count-Min Sketch has one-sided error (over-estimates only). Choose based on which direction of error is safe for your use case."
 
 ## Hands-on Lab
 
@@ -130,40 +141,24 @@ Count-Min Sketch estimates item frequencies in a data stream. It uses a w×d mat
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/15-probabilistic-data-structures/
+cd system-design-interview/02-advanced/16-probabilistic-data-structures/
 docker compose up
 ```
 
 ### Experiment
 
-The script runs five phases automatically:
+The script runs six phases automatically:
 
 1. **Bloom Filter:** Builds a Python Bloom filter (capacity=100K, 1% FPR). Adds 100K items, tests 10K non-members, measures actual vs theoretical false positive rate. Compares memory: Python set (~2MB) vs Bloom filter (~120KB). Also uses Redis `BF.ADD`/`BF.EXISTS`.
-2. **HyperLogLog:** Adds 100K unique IDs to Redis HLL with `PFADD`, reads cardinality with `PFCOUNT`. Shows ±<1% error. Then adds 50K duplicates — count barely changes. Compares 12KB vs ~2MB exact set.
-3. **Count-Min Sketch:** Python implementation. Processes 150K events with power-law distribution. Compares estimated vs true frequencies for top items. Shows overestimation pattern.
-4. **Top-K:** Uses Redis `TOPK.ADD`/`TOPK.LIST` to find the top 10 most frequent pages in 150K events. Compares with true counts.
-5. Prints a comparison table of all four structures.
-
-### Break It
-
-Demonstrate Bloom filter saturation by exceeding capacity:
-
-```python
-import mmh3, math
-
-# Small filter: capacity=100, 1% FPR
-bf = BloomFilter(100, 0.01)
-for i in range(1000):  # Add 10x the capacity
-    bf.add(f"item_{i}")
-
-# FPR is now ~100% — nearly all bits set
-false_pos = sum(1 for i in range(1000, 2000) if f"item_{i}" in bf)
-print(f"FPR after saturation: {false_pos/1000*100:.1f}%  (expected: ~1%, actual: ~100%)")
-```
+2. **HyperLogLog:** Adds 100K unique IDs to Redis HLL with `PFADD`, reads cardinality with `PFCOUNT`. Shows ±<1% error. Then adds 50K duplicates — count barely changes. Also demonstrates `PFMERGE` across 3 shards with overlapping user sets, showing cross-shard distinct count without raw data transfer.
+3. **Count-Min Sketch:** Python implementation. Shows how width controls the error bound by running the same event stream through CMS instances of width 50, 200, and 2000. Then compares estimated vs true frequencies for top items, confirming over-estimate-only behavior.
+4. **Top-K:** Uses Redis `TOPK.ADD`/`TOPK.LIST` to find the top 10 most frequent pages in 110K events. Compares with true counts and shows accurate memory usage for the internal sketch.
+5. **Bloom Filter Saturation:** Runs the "break it" demo — inserts items at 1x, 2x, 5x, and 10x the designed capacity and measures actual FPR at each fill level. Demonstrates how FPR rises from 1% to near 100% as the bit array saturates.
+6. **Summary:** Comparison table of all structures including Cuckoo filter, plus an error-direction cheat-sheet (which structures over-estimate, which have symmetric error, which have false positives only).
 
 ### Observe
 
-The Bloom filter will show an actual FPR very close to the theoretical 1%. The HyperLogLog count should be within 1% of 100,000. The Count-Min Sketch always over-estimates — the top items may show 5-15% over their true counts due to hash collisions. The Top-K result should closely match the true top-10 by frequency.
+The Bloom filter will show an actual FPR very close to the theoretical 1%. The HyperLogLog count should be within 1% of 100,000. The PFMERGE result will correctly account for overlapping user IDs across shards. The Count-Min Sketch always over-estimates — the top items may show 2-10% above their true counts with width=2000. The saturation demo will show FPR rising from ~1% at 1x capacity to >90% at 10x capacity.
 
 ### Teardown
 
@@ -183,3 +178,5 @@ docker compose down
 - **Not accounting for the growth of Bloom filter FPR over time.** A Bloom filter tuned for 100M items at 1% FPR will be near-useless at 1 billion items — the FPR approaches 100%. Production Bloom filters need a growth strategy: either pre-provision for peak capacity with margin, or use a scalable Bloom filter (SBF) that adds new layers as capacity is exceeded.
 - **Using HyperLogLog for exact counts in billing or compliance.** HyperLogLog's ±0.81% error on 10 million events is ±81,000 events — significant if each event is a billable unit. Always use exact counting (SQL `COUNT(DISTINCT)`) for anything that affects money or legal compliance.
 - **Choosing Count-Min Sketch width too small.** The accuracy of Count-Min Sketch depends on the width (number of columns) relative to the total stream size. If your stream has 1 billion events and your width is 100, every counter tracks ~10 million items on average — estimates will be off by orders of magnitude. Size width to be at least `e / ε` where ε is your target relative error (e.g., for 1% error, width ≥ 272).
+- **Not handling Cuckoo filter insertion failures.** Cuckoo filters return false when insertion fails near full capacity — unlike Bloom filters, there is no graceful degradation, just a hard failure. Any production system using a Cuckoo filter must check the insert return value and have a fallback (typically an exact overflow store). Ignoring insert failures means silently losing membership data, which can cause false negatives — a property the structure was supposed to guarantee against.
+- **Assuming HyperLogLog PFMERGE preserves sparse encoding.** Merging two Redis HLLs always produces a dense output (12KB), even if both inputs were sparse (a few hundred bytes). If your design merges many small-cardinality HLLs frequently, you may inadvertently inflate memory usage by orders of magnitude compared to keeping them separate.

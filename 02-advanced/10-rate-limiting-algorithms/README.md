@@ -87,13 +87,16 @@ The choice of where to enforce rate limits also matters. Client-side rate limiti
 
 ## Interview Talking Points
 
-- "Token bucket allows bursts up to the bucket capacity, then enforces average rate. It's the most common production choice because APIs need to tolerate bursty clients."
-- "Sliding window log is most accurate but O(requests) memory — impractical for high-traffic APIs. Sliding window counter gets you 99% accuracy with O(1) memory."
-- "Fixed window has a boundary burst problem: a client can send 2x the limit in 2x the window time by straddling the reset boundary. Sliding window counter eliminates this."
-- "Distributed rate limiting requires shared state — typically Redis. The check must be atomic (Lua script or pipeline) to avoid race conditions that let requests slip through."
-- "HTTP 429 Too Many Requests should include a `Retry-After` header so clients can back off intelligently rather than hammering in a retry loop."
-- "Stripe uses token bucket per API key with separate buckets for read vs write operations. They expose current bucket state in response headers (`X-RateLimit-Remaining`)."
-- "Leaky bucket is a variant of token bucket where requests fill a queue and drain at a fixed rate — it smooths output but adds latency. Token bucket allows bursts to pass through; leaky bucket does not."
+- "Token bucket allows bursts up to the bucket capacity, then enforces average rate. It's the most common production choice because APIs need to tolerate bursty clients — a client that was idle for 5 seconds should be able to fire a burst without being penalised."
+- "Sliding window log is most accurate but O(requests-per-window) memory. At 1M users × 100 req/s × 1s window that's 100M Redis sorted-set entries just for rate-limit state. Sliding window counter gets ~99% accuracy with O(1) memory — two integers per user."
+- "Fixed window has a boundary burst problem: a client can send 2x the configured limit in ~200ms by straddling the reset boundary. Never use it for user-facing APIs. It's fine for billing period quotas (daily/monthly) where boundary precision doesn't matter."
+- "Distributed rate limiting requires shared atomic state. The check must be a single Redis operation — a Lua script or `redis-cell`'s `CL.THROTTLE`. A non-atomic read-modify-write lets two concurrent requests both see tokens=1, both grant themselves access, and both write 0 — consuming 1 token for 2 requests."
+- "HTTP 429 Too Many Requests must include `Retry-After: N` (seconds) or `X-RateLimit-Reset: <epoch>`. Without it, clients implement exponential back-off with random jitter — or worse, retry in a hot loop and amplify the load. Also return `X-RateLimit-Limit` and `X-RateLimit-Remaining` so clients can self-throttle before hitting the limit."
+- "Stripe uses token bucket per API key with separate buckets for read vs write operations, and separate capacities for test-mode vs live-mode keys. They expose bucket state in response headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) so clients can implement adaptive back-off."
+- "Leaky bucket is distinct from token bucket. Token bucket stores tokens and lets bursts pass through immediately. Leaky bucket stores requests in a queue and drains them at a fixed output rate — bursts are absorbed into the queue, adding latency, but output is perfectly smooth. Use leaky bucket when downstream systems cannot tolerate any bursting."
+- "Multi-layer rate limiting is the production pattern: Nginx/API gateway enforces coarse global limits in shared memory (~1µs overhead), application code enforces per-user and per-endpoint limits via Redis (~1ms overhead), and client SDKs implement local rate limiting to avoid unnecessary network round-trips entirely."
+- "Hot-key problem: a single Redis key tracking a popular global limit can become a bottleneck under millions of ops/s. Solutions: shard the counter across N keys (sum at check time), use Redis Cluster with careful key hashing, or push enforcement to the edge with local counters syncing periodically to Redis."
+- "When Redis goes down, choose fail-open (allow all — maintains availability, removes protection) or fail-closed (reject all — protects backends, causes outage). Most consumer APIs fail-open with alerting. Payment and security-sensitive endpoints may fail-closed. Always design for this failure mode explicitly."
 
 ## Hands-on Lab
 
@@ -103,49 +106,30 @@ The choice of where to enforce rate limits also matters. Client-side rate limiti
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/09-rate-limiting-algorithms/
+cd system-design-interview/02-advanced/10-rate-limiting-algorithms/
 docker compose up
 ```
 
 ### Experiment
 
-The script runs five phases automatically:
+The script runs six phases automatically:
 
 1. Sends 50 requests at 2x the rate limit for all four algorithms, printing allowed/rejected counts and effective throughput.
 2. Aligns to a window boundary and demonstrates the fixed window boundary burst — 20 requests allowed when only 10 should be.
 3. Demonstrates token bucket bursting: idle for 2 seconds to fill the bucket, then fire 15 requests instantly — first 10 pass, rest are rejected.
-4. Shows sliding window log memory behaviour: entry count in the sorted set scales with traffic.
-5. Prints a comparison table with memory, accuracy, and burst-handling characteristics.
+4. Shows sliding window log memory behaviour: entry count in the sorted set scales with traffic, with a memory extrapolation to 1M users.
+5. Demonstrates the atomic vs non-atomic race condition: 20 threads fire simultaneously against a bucket with 1 token. The Lua-backed implementation allows exactly 1; the racy read-modify-write allows more.
+6. Prints a comparison table with memory, accuracy, burst-handling characteristics, and distributed deployment patterns.
 
 ### Break It
 
-Demonstrate the token bucket race condition by removing atomicity:
+Phase 5 already demonstrates the race condition live. To explore further, try increasing the number of threads from 20 to 100 in `experiment.py` — the racy implementation will show more violations. You can also remove the `time.sleep(0.002)` artificial delay from `token_bucket_racy` and observe that the race becomes harder to trigger without the gap, illustrating why this bug is intermittent in production and easy to miss in low-concurrency tests.
 
-```python
-import redis, time, threading
-r = redis.Redis(decode_responses=True)
-
-# Simulate concurrent requests racing on the same bucket
-def racy_check():
-    bucket = r.hgetall("tb:race")
-    tokens = float(bucket.get("tokens", 10))
-    time.sleep(0.001)  # simulate processing gap
-    if tokens >= 1:
-        r.hset("tb:race", mapping={"tokens": tokens - 1, "last_refill": time.time()})
-        return True
-    return False
-
-r.hset("tb:race", mapping={"tokens": 1, "last_refill": time.time()})
-threads = [threading.Thread(target=racy_check) for _ in range(20)]
-[t.start() for t in threads]
-[t.join() for t in threads]
-print("Tokens remaining:", r.hgetall("tb:race")["tokens"])
-# Multiple threads may have all seen tokens=1 and all allowed themselves
-```
+To see the atomic protection hold under stress, modify the Lua script's `token_bucket` to call `r.evalsha` 100 times concurrently — the allowed count should always be exactly 1.
 
 ### Observe
 
-The boundary burst in Phase 2 will show 20 requests allowed across a 1-second window. The token bucket burst in Phase 3 shows exactly 10 allowed then all rejected. The comparison table shows O(N) memory for sliding window log versus O(1) for all other algorithms.
+The boundary burst in Phase 2 will show ~20 requests allowed across ~200ms. The token bucket burst in Phase 3 shows exactly 10 allowed then all rejected. Phase 5 is the most instructive: the racy implementation lets multiple threads through on a bucket with only 1 token — a concrete illustration of why atomic operations are non-negotiable. The comparison table in Phase 6 shows O(N) memory for sliding window log versus O(1) for all other algorithms, and maps each algorithm to its production deployment context.
 
 ### Teardown
 
@@ -157,7 +141,7 @@ docker compose down
 
 - **Stripe API rate limiting:** Stripe uses token buckets per API key with different capacities for test vs live mode and different rates for read vs write endpoints. Response headers include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` so clients can implement adaptive back-off. Source: Stripe API Reference, "Rate Limiting."
 - **Nginx `limit_req_zone`:** Nginx implements a variant of the leaky bucket / sliding window counter in shared memory, configured with `limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s`. It handles rate limiting in C at the kernel boundary, with ~microsecond overhead per request. Source: Nginx documentation, "Module ngx_http_limit_req_module."
-- **Redis built-in rate limiting (Redis 7.0+):** Redis 7 added `WAIT`, `OBJECT FREQ`, and the `redis-cell` module (`CL.THROTTLE`) implements a Generic Cell Rate Algorithm (GCRA) — a variant of the leaky bucket — directly in Redis as an atomic command. Used by GitHub for API rate limiting. Source: Redis Labs, "redis-cell: A Redis module for rate limiting."
+- **redis-cell module (`CL.THROTTLE`):** The `redis-cell` Redis module implements the Generic Cell Rate Algorithm (GCRA) as a single atomic Redis command. GCRA is conceptually a virtual scheduling algorithm: it tracks a single "next allowed time" per key rather than a counter or a sorted set, making it O(1) memory and perfectly accurate — closer to token bucket than leaky bucket. `CL.THROTTLE key max_burst count_per_period period [quantity]` returns allow/deny, remaining tokens, and a Retry-After value in one round-trip. GitHub uses a variant of this approach for their REST API rate limiting. Source: Redis Labs, "redis-cell: A Redis module for rate limiting."
 
 ## Common Mistakes
 

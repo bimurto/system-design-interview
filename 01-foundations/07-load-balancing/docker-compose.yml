@@ -1,123 +1,74 @@
+# YAML anchors eliminate the repetition across four nearly-identical backend services.
+# Each app service is identical except for APP_NAME and LATENCY_MS.
+x-app-defaults: &app-defaults
+  image: python:3.11-slim
+  command: >
+    bash -c "pip install flask -q &&
+    python -c \"
+import os, time, random
+from flask import Flask, jsonify
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
+    # Add small jitter (±10%) to simulate realistic variance, not a flat spike
+    jitter = delay * random.uniform(-0.1, 0.1)
+    time.sleep(max(0, delay + jitter))
+    return jsonify(
+        host=os.environ.get('APP_NAME', 'unknown'),
+        latency_ms=int(os.environ.get('LATENCY_MS', 0))
+    )
+
+@app.route('/health')
+def health():
+    # A real health endpoint would check DB connectivity, cache reachability, etc.
+    # Returning 200 unconditionally is the anti-pattern discussed in README.md.
+    return 'ok', 200
+
+app.run(host='0.0.0.0', port=8000)
+\""
+  healthcheck:
+    # Use wget (available in python:slim) rather than installing curl
+    test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+    interval: 5s
+    timeout: 5s
+    retries: 10
+  # Resource caps: prevents any single backend from consuming unbounded CPU/RAM
+  # during the experiment, keeping the laptop responsive.
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 128M
+
 services:
   app1:
-    image: python:3.11-slim
+    <<: *app-defaults
     environment:
       APP_NAME: app1
       LATENCY_MS: "50"
-    command: >
-      bash -c "pip install flask -q &&
-      python -c \"
-import os, time
-from flask import Flask, jsonify
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
-    time.sleep(delay)
-    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
-
-@app.route('/health')
-def health():
-    return 'ok', 200
-
-app.run(host='0.0.0.0', port=8000)
-\""
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
   app2:
-    image: python:3.11-slim
+    <<: *app-defaults
     environment:
       APP_NAME: app2
       LATENCY_MS: "200"
-    command: >
-      bash -c "pip install flask -q &&
-      python -c \"
-import os, time
-from flask import Flask, jsonify
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
-    time.sleep(delay)
-    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
-
-@app.route('/health')
-def health():
-    return 'ok', 200
-
-app.run(host='0.0.0.0', port=8000)
-\""
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
   app3:
-    image: python:3.11-slim
+    <<: *app-defaults
     environment:
       APP_NAME: app3
       LATENCY_MS: "50"
-    command: >
-      bash -c "pip install flask -q &&
-      python -c \"
-import os, time
-from flask import Flask, jsonify
-app = Flask(__name__)
 
-@app.route('/')
-def index():
-    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
-    time.sleep(delay)
-    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
-
-@app.route('/health')
-def health():
-    return 'ok', 200
-
-app.run(host='0.0.0.0', port=8000)
-\""
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
+  # app4 simulates a degraded backend: 10x slower than the healthy nodes.
+  # This is the node that illustrates why round-robin is insufficient for
+  # variable-latency workloads, and why least_conn or circuit breakers matter.
   app4:
-    image: python:3.11-slim
+    <<: *app-defaults
     environment:
       APP_NAME: app4
       LATENCY_MS: "500"
-    command: >
-      bash -c "pip install flask -q &&
-      python -c \"
-import os, time
-from flask import Flask, jsonify
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
-    time.sleep(delay)
-    return jsonify(host=os.environ.get('APP_NAME','unknown'), latency_ms=int(os.environ.get('LATENCY_MS',0)))
-
-@app.route('/health')
-def health():
-    return 'ok', 200
-
-app.run(host='0.0.0.0', port=8000)
-\""
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
   nginx:
     image: nginx:alpine
@@ -139,3 +90,8 @@ app.run(host='0.0.0.0', port=8000)
       interval: 5s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M

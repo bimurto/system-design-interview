@@ -145,6 +145,19 @@ async def handle_client(websocket):
                             "timestamp": str(msg["created_at"]),
                         }))
                         update_message_status(msg["id"], "delivered")
+                        # ACK2: notify original sender that message is now delivered
+                        # This is a key part of the 3-ACK model: the sender gets ACK2
+                        # when the recipient's device receives the message, even if delayed.
+                        sender_ws = connected_users.get(msg["sender_id"])
+                        if sender_ws:
+                            try:
+                                await sender_ws.send(json.dumps({
+                                    "type":   "receipt",
+                                    "msg_id": msg["id"],
+                                    "status": "delivered",
+                                }))
+                            except Exception:
+                                pass
                     await websocket.send(json.dumps({
                         "type":    "queued_messages_delivered",
                         "count":   len(queued),
@@ -217,6 +230,8 @@ async def handle_client(websocket):
         if user_id:
             connected_users.pop(user_id, None)
             r.delete(f"online:{user_id}")
+            # Write last_seen timestamp on disconnect (matches README description)
+            r.set(f"last_seen:{user_id}", str(int(time.time())))
             print(f"[SERVER] {user_id} disconnected")
 
 

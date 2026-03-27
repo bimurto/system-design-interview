@@ -38,12 +38,17 @@ If any voted NO, coordinator sends ABORT to all. Participants that voted YES rol
       |---- PREPARE ----->|                  |
       |---- PREPARE ----------------------->|
       |<--- YES ----------|                  |
-      |<--- YES ----------------------- ----|
+      |<--- YES -----------------------------|
       |                   |                  |
-      |---- COMMIT ------>|                  |   ← if coordinator crashes here
-      |---- COMMIT ----------------------->|       Participant A committed
-      |                   |                  |       Participant B is stuck!
+      [coordinator writes "commit" to its own durable log]
+      |                   |                  |
+      |---- COMMIT ------>|                  |   ← if coordinator crashes HERE
+      |---- COMMIT ----------------------->|       Participant A already committed
+      |                   |                  |       Participant B is stuck waiting!
+      |                   |                  |       (holds write locks indefinitely)
 ```
+
+The critical window: after the coordinator writes "commit" to its log but before it has sent COMMIT to all participants. Any participant that has not yet received COMMIT is stuck — it cannot commit (only the coordinator decides that) and cannot abort (it voted YES, so aborting would violate the protocol if others committed).
 
 **PostgreSQL XA:** PostgreSQL supports 2PC natively via `PREPARE TRANSACTION 'name'` and `COMMIT PREPARED 'name'`. The prepared transaction is durable — it survives a server crash — and is visible in `pg_prepared_xacts`. This is used by XA-compliant drivers (JDBC, ODBC) for distributed transactions.
 
@@ -56,15 +61,26 @@ Failure path: if `payment-service` receives `inventory.reserved` but the charge 
 
 **Saga orchestration:** a dedicated Saga Orchestrator service holds the saga state machine and sends commands directly to each participant service. Easier to reason about and observe (the orchestrator knows exactly which step the saga is on), but introduces a central service that must be highly available.
 
+**Saga recovery strategies:** When a saga step fails, there are two recovery paths:
+- **Backward recovery (compensate):** run compensating transactions in reverse to undo all completed steps. This is the standard rollback-style recovery. All compensations must be idempotent.
+- **Forward recovery (retry):** if the failure is transient (e.g., downstream service temporarily down), retry the failed step until it succeeds. This requires idempotent steps and a persistent record of which step the saga is on (so retries resume from the right point, not from the beginning).
+
+Real systems use both: retry transient failures for a bounded period, then fall back to compensation if retries are exhausted.
+
+**TCC (Try-Confirm/Cancel):** A pattern popular in fintech. Each service exposes three endpoints: `try` (reserve resources tentatively), `confirm` (finalize the reservation), and `cancel` (release the tentative reservation). A coordinator calls `try` on all participants; if all succeed, calls `confirm`; if any fail, calls `cancel`. Unlike pure 2PC, TCC is non-blocking because the `try` phase only *reserves* resources (not locks them at the DB level) and each service can time out and self-cancel without waiting for the coordinator. Unlike Sagas, TCC provides a stronger atomicity window: from the perspective of business logic, either all confirmations succeed or all are cancelled, and the tentative state is never visible to end users. Cost: each service must implement all three operations and handle partial confirm/cancel scenarios.
+
+**Outbox Pattern:** Guarantees exactly-once event publishing from a service even if the service crashes between writing to its database and publishing to the message bus. The service writes the event to an `outbox` table in the *same local database transaction* as its business data change. A separate process (or CDC tool like Debezium) reads the outbox table and publishes to the message bus, then marks rows as published. Because the write to the outbox and the business data change are in the same transaction, they are atomic — either both happen or neither does. This is the standard solution to "dual write" in event-driven sagas.
+
 ### Trade-offs
 
 | Approach | Consistency | Blocking | Complexity | Throughput | Use Case |
 |---|---|---|---|---|---|
 | 2PC (XA) | Strong (ACID) | Yes — coordinator failure blocks all | High (XA drivers, coordinator logic) | Low (distributed locks) | Same-org DB, short txns |
-| 3PC | Strong-ish | Reduced (but not zero under partitions) | Very high | Low | Theoretical; rarely used |
+| 3PC | Strong-ish | Reduced (but not zero under partitions) | Very high | Low | Theoretical; rarely used in production |
 | Saga (choreography) | Eventual | No | Medium (event contracts, compensations) | High | Microservices, long txns |
-| Saga (orchestration) | Eventual | No | Medium-high (orchestrator state machine) | High | Complex workflows |
-| Outbox pattern | Eventual | No | Low-medium | High | Event publishing with exactly-once |
+| Saga (orchestration) | Eventual | No | Medium-high (orchestrator state machine) | High | Complex workflows, observability required |
+| TCC (Try-Confirm/Cancel) | Near-strong | No (self-cancel on timeout) | High (3 endpoints per service) | Medium | Fintech, inventory reservation, hotel booking |
+| Outbox pattern | Eventual | No | Low-medium | High | Exactly-once event publishing from any saga step |
 
 ### Failure Modes
 
@@ -74,20 +90,27 @@ Failure path: if `payment-service` receives `inventory.reserved` but the charge 
 
 **Dirty reads between saga steps:** because each step commits locally, concurrent transactions can observe intermediate state. Example: a "read current inventory" query between saga steps 1 (inventory deducted) and 3 (inventory restored after compensation) will see the deducted amount. Systems using Sagas must be designed for this — either by using "pending" states that hide intermediate results or by documenting that reads may observe in-progress sagas.
 
-**Idempotency violations:** if a saga step is retried (due to a timeout or at-least-once delivery from a message queue), it must be idempotent — running it twice must have the same effect as running it once. Failing to design idempotent steps leads to double-charges, double-shipments, or double-debits.
+**Idempotency violations:** if a saga step is retried (due to a timeout or at-least-once delivery from a message queue), it must be idempotent — running it twice must have the same effect as running it once. Failing to design idempotent steps leads to double-charges, double-shipments, or double-debits. The standard defense is an idempotency key (a unique ID per logical operation) stored in the target service's database; on retry, the service checks for a prior record with that key before acting.
+
+**Saga semantic vs. ACID rollback:** ACID rollback is as-if-nothing-happened — no other transaction ever observes the partial state. Saga compensation is observable — between the failed step and the completion of compensation, other transactions see intermediate state. This difference is fundamental: a customer might briefly see their inventory reserved (or their account debited) even though the saga will ultimately compensate. Systems must be designed with this in mind, typically by using "pending" or "reserved" states that hide partially-completed sagas from end-user-facing reads.
+
+**Heuristic decisions (2PC edge case):** In 2PC, a participant that has voted YES and received no COMMIT/ABORT for an extended period may take a *heuristic decision* — unilaterally committing or aborting to release locks. XA protocol permits this as a last resort. If the coordinator later arrives with the opposite decision, you have a *heuristic inconsistency*: one participant committed and another aborted. The XA standard allows this but requires manual resolution. This is why distributed transactions across services you don't fully control are extremely dangerous.
 
 ## Interview Talking Points
 
 - "2PC provides strong consistency but is a blocking protocol — if the coordinator crashes after collecting YES votes, participants are frozen until recovery. This is unacceptable for services that need high availability."
-- "The Saga pattern replaces atomicity with eventual consistency. Each step commits locally; failures trigger compensating transactions in reverse order. You trade strong consistency for availability and scalability."
-- "Compensating transactions must be idempotent — if a compensation is run twice (e.g., due to a crash during compensation), the system must still end up in a consistent state."
-- "3PC reduces blocking in failure scenarios but is still unsafe under network partitions — split-brain can cause half the participants to commit and the other half to abort. This is why 2PC is still the practical standard when strong consistency is required."
-- "In practice, most microservice architectures use the Outbox Pattern with Sagas: the service writes the event to an outbox table in the same local transaction as its database write, and a separate process publishes the event to the message bus. This ensures exactly-once event publishing even if the service crashes."
-- "Stripe uses event-driven sagas for payment processing. Each step publishes an idempotency-keyed event, and Stripe's retry infrastructure ensures every step eventually completes or compensates."
+- "The Saga pattern replaces distributed atomicity with eventual consistency. Each step commits locally; failures trigger compensating transactions in reverse order. You trade strong consistency for availability and scalability — and you must design for the intermediate states that are now visible."
+- "Compensating transactions must be idempotent — if a compensation is run twice (e.g., due to a crash during compensation), the system must still end up in a consistent state. Standard technique: check current state before acting, or use a deduplication key table."
+- "3PC reduces blocking in failure scenarios but is still unsafe under network partitions — split-brain can cause half the participants to commit and the other half to abort. This is why 2PC is still the practical standard when strong consistency is required and partition tolerance is not the primary concern."
+- "In practice, most microservice architectures use the Outbox Pattern with Sagas: the service writes the event to an outbox table in the same local transaction as its database write, and a separate process (or CDC/Debezium) publishes the event to the message bus. This solves the dual-write problem and ensures exactly-once event publishing even if the service crashes."
+- "Sagas have two recovery strategies: backward recovery (compensate what was done) and forward recovery (retry the failed step). Real systems use both: retry transient failures for a bounded duration, then compensate. Compensation without idempotent steps is a disaster — you can end up in a worse state than the original failure."
+- "TCC (Try-Confirm/Cancel) offers a middle ground between 2PC and Sagas. It avoids database-level distributed locks by reserving resources at the application layer, and it avoids the visibility of intermediate state that Sagas expose. The cost is that every service must implement three operations and the coordinator must track which phase each participant is in. Popular in fintech and hotel/airline booking systems."
+- "Stripe uses event-driven sagas for payment processing. Each step publishes an idempotency-keyed event, and Stripe's retry infrastructure ensures every step eventually completes or compensates. The idempotency key is stored in Stripe's database as a deduplication record — the same key always returns the same result."
+- "When asked to design a checkout flow across inventory, payment, and shipping services: start by pushing back on whether true atomicity is required. In most e-commerce systems, eventual consistency (with a saga) is acceptable because you can always compensate a failed payment or restore inventory. Reserve 2PC for genuinely ledger-critical flows within a single database cluster."
 
 ## Hands-on Lab
 
-**Time:** ~20-30 minutes
+**Time:** ~30-40 minutes
 **Services:** db-orders (Postgres, port 5433), db-inventory (Postgres, port 5434)
 
 ### Setup
@@ -104,7 +127,7 @@ docker compose up -d
 python experiment.py
 ```
 
-The script runs three phases: (1) successful 2PC where both databases commit atomically, (2) simulated coordinator crash after PREPARE showing both databases stuck in prepared state with blocking, and (3) a Saga choreography where inventory deduction succeeds but order creation fails, triggering compensation that restores inventory to its original value.
+The script runs five phases: (1) successful 2PC where both databases commit atomically, (2) simulated coordinator crash after PREPARE showing both databases stuck in prepared state with blocking, (3) a Saga choreography where inventory deduction succeeds but order creation fails, triggering compensation that restores inventory, (4) a "stuck saga" where the compensation step itself is blocked by a concurrent lock, showing the failure mode that requires dead-letter queues and manual recovery, and (5) an idempotent saga step demonstration showing that retrying a step with the same idempotency key does not double-apply the operation.
 
 ### Break It
 
@@ -148,7 +171,7 @@ print('Moral: long-held locks block compensations — keep saga steps fast')
 
 ### Observe
 
-In Phase 1, both databases commit and show consistent state (inventory reduced by 10, order created). In Phase 2, the prepared transactions appear in `pg_prepared_xacts` — this is the "zombie" state that blocks the system. In Phase 3, watch the state after step 1 (inventory deducted) vs after compensation (inventory restored) — this intermediate state is what concurrent readers would observe.
+In Phase 1, both databases commit and show consistent state (inventory reduced by 10, order created). In Phase 2, the prepared transactions appear in `pg_prepared_xacts` — this is the "zombie" state that blocks the system. In Phase 3, watch the state after step 1 (inventory deducted) vs after compensation (inventory restored) — this intermediate state is what concurrent readers would observe. In Phase 4, watch the compensation time out because a concurrent lock holder blocks it — exactly the "stuck saga" failure mode. In Phase 5, observe that the second call with the same idempotency key returns "SKIPPED" and does not reduce inventory a second time.
 
 ### Teardown
 

@@ -3,12 +3,13 @@
 mock_server.py — Flask app serving 50 mock web pages with links between them.
 
 Simulates a small web for the crawler lab:
-  - GET /           → index page with links
-  - GET /page/<n>   → page N with links to other pages
-  - GET /robots.txt → disallows /private/*
-  - GET /private/<n>→ page that should NOT be crawled
+  - GET /            → index page with links to first 10 pages
+  - GET /page/<n>    → page N with links to other pages (deterministic graph)
+  - GET /robots.txt  → disallows /private/*; sets Crawl-delay: 1
+  - GET /sitemap.xml → XML sitemap listing all 50 pages
+  - GET /private/<p> → page that should NOT be crawled (robots.txt blocked)
   - GET /trap        → links to /trap?page=1, /trap?page=2, etc (crawler trap)
-  - GET /health     → 200 OK
+  - GET /health      → 200 OK (used by Docker healthcheck)
 """
 
 import random
@@ -17,7 +18,6 @@ from flask import Flask, Response, request
 app = Flask(__name__)
 
 NUM_PAGES = 50
-DOMAINS = ["http://mock-server:5100", "http://alpha.mock:5100", "http://beta.mock:5100"]
 
 random.seed(42)
 
@@ -52,6 +52,20 @@ def page_html(page_id: int, title: str, body: str, extra_links: list[str] = None
 @app.route("/health")
 def health():
     return "OK", 200
+
+
+@app.route("/sitemap.xml")
+def sitemap():
+    """Sitemap listing all pages — crawlers use this for explicit URL discovery."""
+    urls = "\n".join(
+        f"  <url><loc>http://localhost:5100/page/{i}</loc></url>"
+        for i in range(NUM_PAGES)
+    )
+    content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+{urls}
+</urlset>"""
+    return Response(content, mimetype="application/xml")
 
 
 @app.route("/robots.txt")

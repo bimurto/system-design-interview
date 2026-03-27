@@ -20,7 +20,7 @@ Consistent hashing appears throughout distributed systems under different names 
 ## How It Works
 
 **Key Lookup on the Hash Ring:**
-1. Hash each node identifier (including virtual node suffixes: `"node-A:0"` through `"node-A:149"`) to a position in the range 0 → 2^128 using a consistent hash function (e.g., MD5, MurmurHash)
+1. Hash each node identifier (including virtual node suffixes: `"node-A:0"` through `"node-A:149"`) to a position in the range 0 → 2^128 using a consistent hash function (e.g., MD5, MurmurHash3)
 2. Store all virtual node positions in a sorted array (the "ring")
 3. When a key arrives, hash the key to a ring position using the same hash function
 4. Binary-search the sorted array for the first ring position ≥ the key's hash — that virtual node's owner serves this key
@@ -33,23 +33,45 @@ Consistent hashing appears throughout distributed systems under different names 
 **Key lookup:** hash the key to a 128-bit integer. Binary-search the sorted array to find the first ring point ≥ that hash. The physical server owning that ring point serves the key. If no point is ≥ the hash (key falls past the last point), wrap around to the first point — hence the modulo in `idx % len(sorted_keys)`.
 
 ```
-  Hash ring (positions 0 .. 2^128, shown as 0..100 for clarity):
+  Hash ring (positions 0 .. 2^128, shown compressed for clarity):
 
-  0                                                          100
-  |──A:0──B:3──A:7──C:12──B:18──A:24──C:31──B:37──C:44─── ...
+  0                                                       2^128
+  ·──●──●──●──●──●──●──●──●──●──●──●──●──●──●──●──●──●──·
+     A  C  B  A  C  A  B  C  A  B  C  B  A  C  B  A  C   (wraps to 0)
 
-  Key "foo" hashes to position 15 → walks clockwise → hits B:18 → served by node-B
-  Key "bar" hashes to position 35 → walks clockwise → hits B:37 → served by node-B
-  Key "baz" hashes to position 45 → walks clockwise → hits A:52 → served by node-A
+  Key "foo" hashes to position X:
+    → binary-search sorted_keys for first pos ≥ X
+    → lands on a "C" virtual node
+    → served by physical node-C
+
+  Key "bar" hashes to position Y (past the last ●):
+    → wraps around → first ● on the ring (node-A)
+    → served by physical node-A
 ```
 
 **Adding a node:** insert its 150 virtual node positions into the sorted array. Each new position "intercepts" keys that used to continue to a further point. Only those keys change owners.
 
 **Removing a node:** delete its 150 positions. Keys that were pointing to those positions now advance to the next point on the ring, which belongs to a neighboring node.
 
-**Cassandra token ranges:** instead of virtual nodes with random positions, Cassandra (in manual token mode) assigns each node a specific range like `[25, 50)`. In `vnodes` mode (default since 1.2), each node owns 256 randomly-placed token ranges. Bootstrapping a new node generates 256 new tokens, distributing load from all existing nodes rather than just one neighbor.
+**Replication / preference lists:** in Dynamo and Cassandra, each key is owned by N physical nodes, not one. Starting from the key's hash position, walk clockwise and collect the next N *distinct physical* nodes — this is the "preference list." Virtual nodes for the same physical server are skipped. This provides fault tolerance: any of the N replicas can serve a read or accept a write.
 
-**Redis Cluster hash slots:** Redis pre-divides the ring into exactly 16,384 slots. `slot = CRC16(key) % 16384`. Each master is assigned a contiguous range of slots (e.g., node-1 owns 0-5460, node-2 owns 5461-10922, node-3 owns 10923-16383). Clients cache the slot-to-node mapping and connect directly. If a client asks the wrong node, it receives a `MOVED` redirect.
+```
+  Preference list for key "foo" with RF=3, ring has A, B, C, D:
+
+  hash("foo") → position X
+  Walk clockwise: first distinct physical node = C (coordinator)
+                  next distinct = A
+                  next distinct = D
+  → preference list = [C, A, D]
+
+  B is not in the list. If C crashes, A and D still have the data.
+```
+
+**Weighted virtual nodes:** in clusters with heterogeneous hardware (different RAM/CPU), a high-capacity node should absorb proportionally more load. Assign it more virtual nodes — e.g., a 2× capacity node gets 300 vnodes instead of 150, claiming ~2× the ring share. Cassandra achieves this in manual token mode by assigning explicit token ranges.
+
+**Cassandra token ranges:** instead of random virtual node placement, Cassandra in manual token mode assigns each node a specific range like `[25, 50)`. In `vnodes` mode (default since 1.2), each node owns 256 randomly-placed token ranges. Bootstrapping a new node generates 256 new tokens, distributing load from all existing nodes rather than just one neighbor.
+
+**Redis Cluster hash slots:** Redis pre-divides the ring into exactly 16,384 slots. `slot = CRC16(key) % 16384`. Each master is assigned a contiguous range of slots (e.g., node-1 owns 0-5460, node-2 owns 5461-10922, node-3 owns 10923-16383). Clients cache the slot-to-node mapping and connect directly. If a client asks the wrong node, it receives a `MOVED` redirect. The 16,384 slot count was chosen deliberately: small enough that the entire slot map fits in a 2 KB gossip message, large enough to support ~1,000 nodes with manageable granularity.
 
 ### Trade-offs
 
@@ -57,27 +79,36 @@ Consistent hashing appears throughout distributed systems under different names 
 |---|---|---|---|---|
 | Naive modulo | ~(N-1)/N of all keys | Perfect | None | O(1) |
 | Consistent ring, no vnodes | ~1/N of keys | Very poor (random gaps) | O(N) | O(log N) |
-| Consistent ring, 150 vnodes | ~1/N of keys | Good (~2-5% std dev) | O(N × vnodes) | O(log(N × vnodes)) |
+| Consistent ring, 150 vnodes | ~1/N of keys | Good (~1-3% std dev) | O(N × vnodes) | O(log(N × vnodes)) |
+| Weighted vnodes | ~1/N of keys | Proportional to weight | O(sum of all vnodes) | O(log(total vnodes)) |
 | Redis 16384 slots | ~1/N of slots | Operator-controlled | O(16384) slot map | O(1) slot lookup |
 
 ### Failure Modes
 
 **Hot-spot from uneven virtual node placement:** with too few virtual nodes (e.g., replicas=1), one server can end up owning 50%+ of the ring by chance. Mitigation: use replicas ≥ 100. Monitor per-node key counts and rebalance if needed.
 
-**Node removal cascades all keys to one neighbor:** when a node is removed, all its keys move to the single clockwise neighbor. If that neighbor was already at capacity, it may be overwhelmed. Mitigation: use replicas so keys are spread across many neighbors; in Cassandra, bootstrapping a replacement node before decommissioning the old one avoids this.
+**Node removal cascades all keys to one neighbor:** when a node is removed, all its keys move to the single clockwise neighbor (if RF=1). If that neighbor was already at capacity, it may be overwhelmed. Mitigation: use replication (RF ≥ 2) so keys are spread across many neighbors; in Cassandra, bootstrapping a replacement node before decommissioning the old one avoids this.
+
+**Node crash during data migration:** after adding a node, there is a window where the ring says the new node owns certain keys but those keys haven't been migrated yet. Reads to the new node return misses or stale data. Mitigation: double-read (ask both old and new owner), or use read repair / hinted handoff (Cassandra). The transition window must be bounded and monitored.
 
 **Clock skew causes inconsistent ring views:** in distributed systems, two clients may briefly disagree on which nodes are in the ring (e.g., during a rolling upgrade). This can cause the same key to be routed to different servers, leading to cache misses or split-brain writes. Mitigation: use a consistent configuration store (ZooKeeper, etcd) as the source of truth for ring membership.
 
-**Hash collision across virtual nodes:** two different virtual node labels hash to the same ring position. With MD5 (128 bits) and typical deployments (≤100,000 virtual nodes), the birthday-problem probability is negligible (~10⁻²⁷). Not a practical concern.
+**Hot key problem — consistent hashing does not help:** a single key accessed by millions of requests always lands on the same node (or the same N nodes with replication). No amount of ring tuning distributes one key across more nodes. Solutions are application-level: key splitting (append a random suffix and aggregate reads), local in-process caching, or dedicated read replicas.
+
+**Hash collision across virtual nodes:** two different virtual node labels hash to the same ring position. With MD5 (128 bits) and typical deployments (≤100,000 virtual nodes), the birthday-problem probability is negligible (~10⁻²⁷). Not a practical concern, but document it if your code doesn't handle duplicate ring positions.
+
+**`remove_node` implementation pitfall — O(N) list scan:** a naive implementation calls `list.remove(pos)` for each virtual node, which is O(M) where M is the total ring size. For 100 nodes × 200 vnodes = 20,000 entries, removing a node with 200 vnodes costs 200 × 20,000 = 4,000,000 comparisons. Use `bisect.bisect_left` to find the position in O(log M), then delete by index in O(1) — demonstrated in `experiment.py`.
 
 ## Interview Talking Points
 
-- "Without virtual nodes, a ring with 3 physical nodes has 3 points — distribution is controlled by chance, and one node can get 70% of keys. Virtual nodes fix this by giving each server 150+ positions on the ring."
-- "Adding or removing a node only remaps the keys that were owned by that node's neighbors on the ring — roughly 1/N of total keys, not 75% like naive modulo."
-- "Redis Cluster uses 16,384 hash slots (not a ring) — `CRC16(key) % 16384` — but the principle is the same: slots are assigned to masters, and adding a master means migrating a subset of slots."
-- "Consistent hashing is used in CDN routing (same URL → same edge server → cache hit), distributed caches (Memcached client libraries), and distributed databases (Cassandra, DynamoDB)."
-- "The number of virtual nodes (replicas) trades CPU and memory for distribution uniformity. 100-200 virtual nodes per physical node is a common default."
-- "Cassandra's vnodes (default 256 per node) also make bootstrap faster: a new node takes a small range from many existing nodes, so the data transfer is parallelized across the cluster."
+- "Without virtual nodes, a ring with 3 physical nodes has 3 points — distribution is controlled by chance, and one node can get 70% of keys. Virtual nodes fix this by giving each server 150+ positions on the ring, letting the law of large numbers even things out."
+- "Adding or removing a node only remaps the keys that were owned by that node's ring segments — roughly 1/N of total keys. Naive modulo remaps ~75% when going from 3 to 4 nodes."
+- "Real systems like Dynamo and Cassandra use replication: walk clockwise from the key's hash and collect the next N distinct physical nodes — the preference list. Virtual node positions for the same physical server are skipped. This gives fault tolerance without a central directory."
+- "Redis Cluster uses 16,384 hash slots, not a ring. The number was chosen so the full slot map fits in a 2 KB gossip message. Clients receive MOVED redirects when they hit the wrong node."
+- "The hot key problem is orthogonal to consistent hashing — a single viral key always lands on the same node regardless of how many virtual nodes you have. You need application-level solutions: key splitting, read replicas, or local caching."
+- "Weighted virtual nodes handle heterogeneous hardware: a 2× capacity node gets 2× the virtual nodes, absorbing ~2× the key share. Cassandra achieves this via explicit token assignment."
+- "Cassandra's 256 vnodes per node make bootstrap faster: a new node takes small ranges from many existing nodes simultaneously, distributing the data transfer load across the whole cluster instead of one neighbor."
+- "During a node addition, there's a migration window where the ring says a key belongs to the new node but the data hasn't moved yet. Production systems handle this with read repair, hinted handoff, or a double-read to the old owner."
 
 ## Hands-on Lab
 
@@ -89,19 +120,22 @@ Consistent hashing appears throughout distributed systems under different names 
 ```bash
 cd system-design-interview/02-advanced/01-consistent-hashing/
 docker compose up
-# Or run directly (no dependencies):
+# Or run directly (no dependencies beyond Python stdlib):
 python experiment.py
 ```
 
 ### Experiment
 
-The script runs five phases automatically:
+The script runs eight phases automatically:
 
 1. Builds a 3-node ring with 150 virtual nodes each, distributes 10,000 keys, and prints each node's share (expect ~33%).
 2. Adds a 4th node and shows only ~25% of keys remapped, printing a before/after comparison for 10 sample keys.
-3. Runs the same add-node scenario with naive modulo, showing ~75% of keys remapped.
-4. Sweeps virtual node counts from 1 to 500, printing std deviation and min/max node load at each level.
-5. Prints a summary comparison table.
+3. Removes a node and shows only ~25% of keys remapped — with an operational warning about data migration windows.
+4. Runs the same add-node scenario with naive modulo, showing ~75% of keys remapped.
+5. Sweeps virtual node counts from 1 to 500, printing std deviation and min/max node load at each level.
+6. Demonstrates replication preference lists: `get_nodes(key, N)` returns N distinct physical nodes clockwise from the key's position.
+7. Demonstrates weighted virtual nodes: a 2× capacity node absorbs ~50% of keys.
+8. Prints a summary comparison table and common gotchas.
 
 ### Break It
 
@@ -140,7 +174,7 @@ print('Moral: 1 vnode per server = terrible balance')
 
 ### Observe
 
-With `replicas=1`, one node may receive 50-60% of keys while another gets 10-20%. With `replicas=150`, the std deviation drops below 100 keys (~1% of ideal). The naive-modulo section shows 74-76% of keys remapping when adding a 4th server — compare to ~25% for consistent hashing.
+With `replicas=1`, one node may receive 50-60% of keys while another gets 10-20%. With `replicas=150`, the std deviation drops below 100 keys (~1% of ideal). The naive-modulo section shows 74-76% of keys remapping when adding a 4th server — compare to ~25% for consistent hashing. The replication phase shows that `get_nodes(key, 3)` always returns all 3 physical nodes in a 3-node ring — any node can fail without data loss.
 
 ### Teardown
 
@@ -159,5 +193,7 @@ docker compose down
 - **Using too few virtual nodes.** A ring with 1-5 virtual nodes per physical server has wildly uneven distribution. Always benchmark with your actual number of physical nodes and set virtual nodes to at least 100-150.
 - **Forgetting to handle node failures in the ring membership.** If a node crashes and the application continues routing to it (because the ring hasn't been updated), requests fail. Ring membership must be kept in sync with cluster health — use a separate health-check loop to call `remove_node` on failure.
 - **Assuming consistent hashing solves all data skew problems.** Consistent hashing distributes keys evenly only if key access frequency is also even. A "hot key" (one key accessed by millions of requests) always lands on the same node regardless of the ring — consistent hashing does not help. Solutions are application-level: key splitting, local caching, or read replicas.
-- **Confusing Redis Cluster hash slots with a ring.** Redis does not use a circular ring; it uses a flat array of 16,384 slots. The important difference is that slot assignment is explicit and operator-controlled, not computed from node positions. Cluster rebalancing requires explicitly migrating slot ranges with `CLUSTER SETSLOT`.
+- **Confusing Redis Cluster hash slots with a ring.** Redis does not use a circular ring; it uses a flat array of 16,384 slots. The important difference is that slot assignment is explicit and operator-controlled, not computed from node positions. Cluster rebalancing requires explicitly migrating slot ranges with `CLUSTER SETSLOT`. The slot count (16,384) was chosen so the full map fits in a 2 KB gossip bitmap.
 - **Not accounting for data migration time when adding nodes.** Consistent hashing tells you which keys should move — it does not move them automatically. In a live system, there is a window after a node is added but before data migration completes where the new node serves stale or missing data. Cassandra handles this with hinted handoff and read repair.
+- **Using `list.remove()` in `remove_node`.** `list.remove(x)` scans the list linearly — O(M) where M is total ring size. At scale (100 nodes × 200 vnodes = 20k entries), removing one node costs O(200 × 20k) comparisons. Use `bisect.bisect_left` to locate each position in O(log M), then `del list[idx]` in O(1).
+- **Treating replication as automatic.** `get_nodes(key, N)` tells you which N nodes *should* hold the key. The actual replication protocol (quorum writes, read repair, anti-entropy) must be implemented separately. Consistent hashing is only the routing layer.

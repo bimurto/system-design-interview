@@ -64,16 +64,22 @@ When a request arrives at a load balancer, the balancer selects a backend using 
 
 **Slow backend accumulating connections:** with round-robin, a backend that degrades (GC pause, I/O saturation) continues receiving new requests even as existing ones queue up. Connection queues grow until the backend becomes completely unresponsive. Mitigation: circuit breakers that trip when a backend's error rate exceeds a threshold, combined with least-conn to naturally route around slow backends.
 
+**Thundering herd on backend recovery:** when a failed backend comes back online, it momentarily has 0 active connections. Under least-conn, every new request floods to it until it accumulates load — potentially crashing it again immediately. Nginx Plus's `slow_start` directive ramps traffic to a recovering backend gradually. Open-source Nginx does not support `slow_start`; compensate with application-level circuit breakers (resilience4j, Hystrix) or a minimum connection floor in your LB config.
+
+**Passive health check gap:** `proxy_next_upstream` in Nginx retries a failed request on another backend (error, timeout, 5xx). But if a backend is slow rather than failing — returning 200 after 10 seconds — passive checks don't catch it. Active health checks (Nginx Plus `/health_check` or an external checker like consul-template) are needed to remove slow-but-alive backends from the pool.
+
 **Session loss during scale-in:** if sticky sessions are in use and the sticky backend is removed (scale-in event, rolling deploy), all sessions on that backend are lost. Users are dropped mid-session. The correct fix is stateless design: sessions externalized to Redis, so any backend can handle any request.
 
 ## Interview Talking Points
 
 - "Stateless services don't need sticky sessions — design for statelessness. Sessions go in Redis, files go in object storage. Then any load balancing algorithm works and you can freely scale in/out."
-- "Least connections is better than round-robin when backends have variable latency. Round-robin will give equal traffic to a degraded 500ms backend and a healthy 50ms backend, driving tail latency up."
+- "Least connections is better than round-robin when backends have variable latency. Round-robin will give equal traffic to a degraded 500ms backend and a healthy 50ms backend, driving tail latency up. But least-conn only helps under concurrent load — with sequential requests, all backends have 0 active connections at each decision point, so it degrades to round-robin."
+- "Weighted round-robin is the right tool for canary deployments and blue/green traffic migration: set the new version to weight=1 (10%), watch metrics, then ramp up. It's also correct when backends have genuinely different hardware capacity."
 - "Health checks must match actual application health, not just TCP port open. A health endpoint that checks database connectivity, not just HTTP 200, catches half-failed backends before they affect users."
 - "L4 vs L7: L4 is faster but blind to application content. L7 enables content routing, TLS termination, and header manipulation. For most web workloads, L7 overhead is negligible."
 - "SSL termination at the load balancer offloads TLS from backends and centralizes certificate management. Backends communicate over HTTP on the internal network, which must be a trusted private subnet."
 - "Global load balancing: DNS-based (GeoDNS) adds latency from DNS TTL lag; Anycast routes by BGP and is near-instant. Cloudflare uses Anycast — same IP, routed to nearest PoP."
+- "Connection draining (deregistration delay): when removing a backend during a rolling deploy, the load balancer should stop sending new requests but allow in-flight requests to complete. AWS ALB calls this deregistration delay (default 300s). Without it, in-flight requests to a terminating backend get dropped."
 
 ## Hands-on Lab
 
@@ -94,7 +100,11 @@ docker compose up -d
 python experiment.py
 ```
 
-The script sends requests through three Nginx upstream configurations, measuring distribution and latency for each algorithm.
+The script sends requests through four Nginx upstream configurations, measuring distribution and latency for each algorithm:
+- `/` → round-robin
+- `/wrr/` → weighted round-robin (app1×3, app2×2, app3×3, app4×1)
+- `/lc/` → least_conn
+- `/iphash/` → ip_hash
 
 ### Break It
 
@@ -137,20 +147,26 @@ docker compose start app1 app2 app3 app4
 
 ### Observe
 
-Expected output from `experiment.py`:
+Expected output from `experiment.py` (approximate — exact numbers vary with timing):
 
 ```
-Phase 1 (round-robin, 20 requests):
-  app1 ( 50ms)  ##### (5 reqs, 25%)  avg ~50ms
-  app2 (200ms)  ##### (5 reqs, 25%)  avg ~200ms
-  app3 ( 50ms)  ##### (5 reqs, 25%)  avg ~50ms
-  app4 (500ms)  ##### (5 reqs, 25%)  avg ~500ms  ← equal traffic despite 10x slower
+Phase 1 (round-robin, 40 sequential requests):
+  app1 ( 50ms declared)  ########## (10 reqs, 25%)  avg  ~55ms
+  app2 (200ms declared)  ########## (10 reqs, 25%)  avg ~205ms
+  app3 ( 50ms declared)  ########## (10 reqs, 25%)  avg  ~55ms
+  app4 (500ms declared)  ########## (10 reqs, 25%)  avg ~505ms  ← equal traffic despite 10x slower
 
-Phase 3 (least_conn, 20 concurrent):
-  app1 ( 50ms)  ########## (10 reqs, 50%)  ← gets more traffic because it's fast
-  app3 ( 50ms)  ########## (8  reqs, 40%)
-  app2 (200ms)  ## (2 reqs, 10%)
-  app4 (500ms)  # (0-1 reqs)               ← almost no new connections
+Phase 3 (weighted RR, 40 sequential requests):
+  app1 ( 50ms declared)  ############ (13 reqs, 33%)  avg  ~55ms
+  app2 (200ms declared)  ######## ( 9 reqs, 22%)      avg ~205ms
+  app3 ( 50ms declared)  ############ (13 reqs, 33%)  avg  ~55ms
+  app4 (500ms declared)  ##### ( 5 reqs, 11%)         avg ~505ms  ← reduced share
+
+Phase 4 (least_conn, 40 concurrent):
+  app1 ( 50ms declared)  ############### (15 reqs, 38%)  ← fast, gets more
+  app3 ( 50ms declared)  ############### (15 reqs, 38%)  ← fast, gets more
+  app2 (200ms declared)  ###### ( 7 reqs, 18%)
+  app4 (500ms declared)  ## ( 3 reqs,  8%)              ← slow, gets almost none
 ```
 
 ### Teardown
@@ -161,7 +177,7 @@ docker compose down -v
 
 ## Real-World Examples
 
-- **GitHub:** Uses HAProxy at L4 for TCP load balancing and Nginx at L7 for HTTP routing. Their load balancer tier handles millions of git push/pull operations per day. They documented moving from a single load balancer to an active-active pair to eliminate the SPOF — source: GitHub Engineering Blog, "Mitigating replication lag and reducing read load with freno" (2017).
+- **GitHub:** Uses HAProxy for load balancing across their infrastructure. Their teams have documented eliminating single-load-balancer SPOFs by moving to active-active pairs with shared VIPs via VRRP. HAProxy's stats socket enables zero-downtime backend draining during rolling deploys: mark a backend as MAINT, wait for connections to drain, then take it offline — source: GitHub Engineering Blog.
 - **Cloudflare:** Routes traffic using Anycast — the same 104.16.0.0/12 IP range is announced from 300+ data centers. BGP routing sends each packet to the nearest PoP. This means a DDoS targeting Cloudflare is automatically spread across 300 locations, each absorbing a fraction — source: Cloudflare Blog, "How Cloudflare's Global Anycast Network Works."
 - **Netflix:** Uses AWS Elastic Load Balancing (ALB) in front of their stateless microservices. Because services are stateless (all state in Cassandra/EVCache), any algorithm works — they use round-robin. Their Zuul API gateway does L7 routing, forwarding requests to different backend clusters based on path — source: Netflix Tech Blog, "Zuul 2: The Netflix Journey to Asynchronous, Non-Blocking Systems" (2016).
 
@@ -171,4 +187,5 @@ docker compose down -v
 - **Using IP hash for stateless services.** Modern applications should externalize state to Redis or a database. Once you do, you don't need sticky sessions, and IP hash wastes capacity by distributing unevenly (clients with many users behind one IP overload one backend).
 - **Health check endpoint that always returns 200.** A `/health` endpoint that returns 200 regardless of application state lets broken backends receive traffic. The endpoint must check critical dependencies: database connectivity, downstream service reachability, and disk space.
 - **Ignoring slow backends with round-robin.** A single degraded backend at 10x normal latency receives the same traffic as healthy backends. Under high load this creates a cascading failure: the slow backend queues up connections, degrading further. Use least-conn or circuit breakers to route around slow backends.
+- **Not accounting for connection draining during deploys.** Sending SIGTERM to a backend immediately while in-flight requests are active drops those requests. Proper rolling deploys require a deregistration grace period: remove the backend from the load balancer pool, wait for in-flight requests to complete (ALB's deregistration delay, HAProxy's `maxconn drain`), then shut down. Without this, every deploy causes a brief error spike.
 - **Forgetting SSL certificate renewal.** With TLS termination at the load balancer, the certificate lives in one place. Forgetting to renew it takes down HTTPS for all backends simultaneously. Use auto-renewal (Let's Encrypt / ACM) and monitor certificate expiry as a metric.

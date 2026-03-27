@@ -41,16 +41,65 @@ Kafka's producer-side idempotence (enabled with `enable.idempotence=true`) assig
     → No duplicate charge created.
 ```
 
-**Atomic insert pattern (Postgres):**
+**Two-phase atomic pattern (Postgres):**
+
+A naive implementation does SELECT → if not found → INSERT. This has a TOCTOU (time-of-check-time-of-use) race: two concurrent requests both see no row, both attempt INSERT, and one fails at the DB constraint. The loser needs a second SELECT to retrieve the winner's result. More importantly, there is no way to distinguish "request is still in flight" from "request never started" — which matters when the payment processor call is slow or fails mid-flight.
+
+The production-grade approach uses a two-phase row lifecycle:
 
 ```sql
-INSERT INTO charges (idempotency_key, amount, currency, response_body)
-VALUES ($1, $2, $3, $4)
+-- Phase 1: claim the key atomically (no SELECT before this)
+INSERT INTO charges (idempotency_key, amount, currency, customer_id, status)
+VALUES ($1, $2, $3, $4, 'processing')
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING id;
+
+-- If RETURNING id IS NULL, the key already exists — fetch its current state:
+SELECT amount, currency, customer_id, status, response_body
+FROM charges WHERE idempotency_key = $1;
+
+-- status='processing' → another request is in flight → HTTP 409 (retry later)
+-- status='success'    → idempotent replay → HTTP 200 + X-Idempotent-Replayed: true
+
+-- Phase 2: after payment processor confirms, commit the result
+UPDATE charges
+SET status='success', response_body=$2
+WHERE idempotency_key=$1;
 ```
 
-If two concurrent requests arrive with the same key, only one INSERT succeeds. The other sees `RETURNING id` return NULL and falls back to SELECT to retrieve the winner's response. The `UNIQUE` constraint on `idempotency_key` is the database-level guarantee.
+The `UNIQUE` constraint on `idempotency_key` is the atomic gate — no application-level locking required. Only one INSERT wins regardless of concurrency.
+
+**Why two-phase matters:**
+
+```
+  Single-INSERT approach (fragile):
+    1. Build response body (includes charge ID, status=success)
+    2. INSERT (idempotency_key, response_body='{"status":"success",...}')
+    3. Call payment processor
+       → If processor FAILS: row says "success" but no charge was created.
+          All retries return a "success" response for a charge that never happened.
+
+  Two-phase approach (correct):
+    1. INSERT status='processing'          ← atomic claim
+    2. Call payment processor
+       → If processor FAILS: row stays 'processing'. Next retry gets HTTP 409,
+          backs off, retries later. The claim row can be expired or reset.
+       → If processor SUCCEEDS:
+    3. UPDATE status='success', response_body='{...}'
+          Future retries get HTTP 200 (idempotent replay).
+```
+
+**Parameter fingerprinting:**
+
+A client bug can reuse an idempotency key with different parameters (different amount or customer). Silently returning the original response would be dangerous — a $100 response served for a $999 request. The correct behaviour is to compare stored parameters against incoming parameters and return HTTP 422 if they differ:
+
+```
+  Key: "uuid-abc", stored: amount=100, customer=alice
+  Retry: key="uuid-abc", amount=999, customer=alice
+  → HTTP 422: idempotency_key reused with different parameters
+    stored:   { amount: 100, customer: alice }
+    received: { amount: 999, customer: alice }
+```
 
 **Deduplication window:**
 
@@ -99,20 +148,26 @@ If two concurrent requests arrive with the same key, only one INSERT succeeds. T
 
 **Idempotency key collision (UUID birthday problem):** UUID v4 has 2^122 possible values. At 1 billion requests per day, the probability of a collision in a year is approximately 10^-18 — negligible in practice. If using shorter keys (8 characters), collision probability rises dramatically — use UUID v4 or a content hash.
 
-**Response stored but charge not actually processed:** The server inserts the idempotency key and response before calling the payment processor, which then fails. All retries return "success" but no charge was created. Mitigation: store the response only after the payment processor confirms success, or use a two-phase approach (mark as "processing", then update to "success").
+**Response stored before charge is confirmed (single-phase anti-pattern):** If the server inserts the idempotency key and a "success" response in a single step before calling the payment processor, a processor failure leaves the row claiming success for a charge that never happened. All subsequent retries return the cached "success" without re-attempting the charge. Use the two-phase approach: claim with `status='processing'`, commit `status='success'` only after the processor confirms.
 
-**Idempotency key reuse across different operations:** A client accidentally reuses a UUID for a different charge (different amount or customer). The server returns the original response for the first charge, silently ignoring the new request. Mitigation: include the key parameters (amount, customer_id) in the deduplication check and return an error if they differ from the stored values.
+**In-flight request with no status tracking:** Without a `'processing'` state, when a request is mid-flight and a concurrent retry arrives, the server either races to re-execute or uses application-level locking. Stripe returns HTTP 409 Conflict for any retry that arrives while the original request is still being processed — this requires explicitly storing the "in flight" status. Without 409, a slow payment processor call will cause concurrent retries to execute the charge multiple times.
 
-**Deduplication window too short for client retry logic:** If the deduplication window is 1 hour but the client implements exponential back-off with a maximum retry duration of 2 hours, retries after the window re-create the operation. Align deduplication window to the maximum client retry duration with margin.
+**Idempotency key reuse across different operations:** A client accidentally reuses a UUID for a different charge (different amount or customer). Without parameter fingerprinting, the server silently returns the original response. Mitigation: store and compare (amount, currency, customer_id) — return HTTP 422 if the incoming parameters differ from stored values.
+
+**Deduplication window too short for client retry logic:** If the deduplication window is 1 hour but the client implements exponential back-off with a maximum retry duration of 2 hours, retries after the window expiry re-execute the operation. The deduplication window must exceed the maximum possible client retry duration with margin.
+
+**Stale 'processing' rows after processor failure:** If the payment processor call fails (the process crashes mid-flight), the row stays in `status='processing'` forever. Clients retrying will always get HTTP 409. Mitigation: a background job resets rows stuck in `'processing'` for longer than the maximum expected processor latency (e.g., 30 seconds). Alternatively, the claim INSERT includes an `expires_at` column and the SELECT checks for expiry.
 
 ## Interview Talking Points
 
-- "At-least-once + idempotent consumers is the practical way to achieve effectively-exactly-once in distributed systems. True exactly-once requires coordination between both ends."
-- "The idempotency key pattern: client generates a UUID per logical operation, sends it with every retry. Server uses a UNIQUE constraint on the key to prevent duplicate processing and stores the response for replay."
-- "Every write endpoint that clients might retry needs an idempotency key. Charges, emails, order creation, infrastructure provisioning — any non-idempotent write that has real consequences."
-- "Stripe stores idempotency keys for 24 hours. After that window, the same key may trigger a new charge. Clients must not retry after the deduplication window expires."
-- "Kafka producer idempotence (PID + sequence numbers) prevents duplicate messages within a session. Kafka transactions extend this to atomic cross-partition writes — the foundation for Kafka Streams exactly-once processing."
-- "Natural idempotency: GET is always idempotent. PUT (replace) is idempotent. DELETE is idempotent (deleting something already deleted succeeds). POST (create) is not naturally idempotent — requires an idempotency key."
+- "At-least-once delivery plus idempotent consumers is the practical path to effectively-exactly-once semantics. True end-to-end exactly-once requires coordination at both the producer and consumer — impossible to guarantee at the network layer alone."
+- "The idempotency key pattern: client generates a UUID once per logical operation and includes it in every retry. The server uses a `UNIQUE` constraint on the key as the atomic gate. The database does the deduplication — no application-level locking needed."
+- "Use a two-phase row lifecycle, not a single INSERT with the response body. Claim first with `status='processing'`, call the payment processor, then commit `status='success'`. This prevents the failure mode where a cached 'success' response is stored before the external call is confirmed — a single-phase INSERT bakes in the response before knowing if the charge worked."
+- "Stripe returns HTTP 409 Conflict if a request with the same key is still in flight. This requires explicitly tracking the 'processing' state. Without it, a slow processor call plus an impatient client retry causes the charge to execute twice."
+- "Parameter fingerprinting: store the key parameters (amount, currency, customer_id) alongside the idempotency key. If a retry arrives with the same key but different parameters, return HTTP 422 — it is a client bug and must be surfaced, not silently served the wrong cached response."
+- "Kafka producer idempotence (PID + sequence numbers) prevents duplicate messages within a producer session. Kafka transactions extend this to atomic cross-partition writes — the basis for Kafka Streams exactly-once. Cost: roughly 2x latency, ~20% throughput reduction versus at-least-once."
+- "Natural idempotency: GET is always idempotent. PUT (replace semantics) is idempotent. DELETE is idempotent — deleting an absent resource returns 404 or 200, both acceptable. POST (create) is not — it requires an idempotency key."
+- "Stale 'processing' rows are a hidden production issue: if the server crashes between claiming the key and committing the result, the row stays 'processing' forever and all retries get 409. Fix with a background sweep that resets rows stuck in 'processing' beyond the max expected processor latency."
 
 ## Hands-on Lab
 
@@ -122,19 +177,20 @@ If two concurrent requests arrive with the same key, only one INSERT succeeds. T
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/14-idempotency-exactly-once/
+cd system-design-interview/02-advanced/15-idempotency-exactly-once/
 docker compose up
 ```
 
 ### Experiment
 
-The script runs five phases automatically:
+The script runs six phases automatically:
 
 1. Makes a POST `/charge` with a UUID idempotency key — gets HTTP 201 (new charge created).
 2. Retries the same request three times with the same key — gets HTTP 200 with `X-Idempotent-Replayed: true` each time. The charge ID in the response is identical to Phase 1.
 3. Makes a new charge with a different UUID key — gets HTTP 201 (separate charge created).
-4. Launches 10 concurrent threads all sending the same charge with the same idempotency key simultaneously. Exactly 1 returns 201; the others return 200. Only one row is in the database.
-5. Shows the full charges table in Postgres: each row has its idempotency key, amount, customer, and stored response body.
+4. Launches 10 concurrent threads all sending the same charge with the same idempotency key simultaneously. Exactly 1 returns 201; the others return 200 (replay) or 409 (in flight). Only one row reaches `status='success'` in the database.
+5. Demonstrates parameter fingerprinting: reuses an existing key with a different amount — gets HTTP 422 showing the stored vs received parameters.
+6. Shows the full charges table in Postgres: each row has its idempotency key, amount, customer, and status lifecycle.
 
 ### Break It
 
@@ -159,7 +215,9 @@ print('5 different keys = 5 charges (customer charged 5x!)')
 
 ### Observe
 
-Phase 4 shows that even with 10 concurrent requests hitting the database simultaneously, the `ON CONFLICT (idempotency_key) DO NOTHING` clause ensures exactly one row is inserted. The Postgres unique constraint is the atomic guarantee — no application-level locking required.
+Phase 4 shows that with 10 concurrent requests hitting the database simultaneously, the `ON CONFLICT (idempotency_key) DO NOTHING` clause ensures exactly one row is inserted. The Postgres unique constraint is the atomic guarantee — no application-level locking required. Concurrent losers that arrive before the winner commits the response receive HTTP 409 (in-flight state); those that arrive after receive HTTP 200 (idempotent replay).
+
+Phase 5 shows parameter fingerprinting: the API detects when a key is reused with a different amount and returns HTTP 422 rather than silently serving the wrong cached response.
 
 ### Teardown
 

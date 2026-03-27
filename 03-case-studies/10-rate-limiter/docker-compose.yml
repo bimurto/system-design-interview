@@ -1,11 +1,12 @@
 services:
   redis:
-    image: redis:7
+    image: redis:7-alpine
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
 
   api1:
     image: python:3.11-slim
@@ -17,8 +18,9 @@ services:
       SERVER_ID: "api1"
     volumes:
       - ./api_server.py:/api_server.py
+    # Pin library versions for reproducibility; quiet suppresses progress noise
     command: >
-      sh -c "pip install flask redis --quiet && python /api_server.py"
+      sh -c "pip install flask==3.0.3 redis==5.0.8 --quiet && python /api_server.py"
     ports:
       - "8001:8000"
     healthcheck:
@@ -26,7 +28,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 45s
 
   api2:
     image: python:3.11-slim
@@ -39,7 +41,7 @@ services:
     volumes:
       - ./api_server.py:/api_server.py
     command: >
-      sh -c "pip install flask redis --quiet && python /api_server.py"
+      sh -c "pip install flask==3.0.3 redis==5.0.8 --quiet && python /api_server.py"
     ports:
       - "8002:8000"
     healthcheck:
@@ -47,7 +49,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 45s
 
   nginx:
     image: nginx:alpine
@@ -65,3 +67,4 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 10s

@@ -21,75 +21,134 @@ The core challenge: payment systems must be **exactly-once** in the face of netw
 
 ---
 
-## Requirements
+## Step 1 — Clarify Requirements (3–5 min)
 
-### Functional
-- Charge a customer's payment method and credit the merchant
-- Support idempotent retries: same idempotency_key → same result
-- Maintain a double-entry ledger for all money movements
-- Issue refunds (with their own idempotency)
-- Query transaction status by ID
+Before drawing anything, lock down scope with the interviewer. Ambiguity kills payment system designs.
 
-### Non-Functional
-- Exactly-once charge semantics (no duplicates, no lost charges)
-- ACID transactions: partial state must never persist
-- Ledger sum must always equal zero (accounting invariant)
-- Sub-500ms P99 for charge endpoint
-- 99.99% availability
+**Functional scope questions:**
+- Are we building the full payment stack (card network integration, ACH settlement) or just the merchant-facing API layer? *(This lab: API layer + ledger)*
+- Do we support authorization-only (pre-auth) or only immediate capture?
+- Is partial refund required, or only full refunds?
+- Multi-currency? Which currencies, and who owns FX conversion?
+- Recurring/subscription billing, or only one-time charges?
+- Do merchants get per-transaction webhooks on state changes?
 
-### Capacity Estimation
+**Non-functional scope questions:**
+- Global or single-region?
+- PCI-DSS scope? Are raw card numbers ever stored, or do we use tokens from a vault (e.g., Stripe Elements)?
+- Consistency requirement on balance reads: strong (always see latest) or eventual (lag acceptable)?
+- What is the acceptable fraud loss rate? (Affects fraud scoring latency budget)
 
-| Metric | Calculation | Result |
-|---|---|---|
-| Transactions/second | 100M/day / 86,400s | ~1,160 TPS |
-| Peak TPS | 3× average | ~3,500 TPS |
-| Ledger entries/TPS | 2 per transaction (debit + credit) | ~7,000 writes/s |
-| Postgres write throughput | 7K rows/s | 1 node (handles ~50K writes/s) |
-| Idempotency key store | 100M keys/day × 100B each | ~10GB/day (pruned daily) |
-| Transaction table size | 1B rows × 500B/row | ~500GB/year |
+**Stated requirements for this design:**
+- Merchant API: POST /charge, POST /refund, GET /transaction
+- Idempotent retries: same `idempotency_key` → same response
+- Double-entry ledger: immutable, append-only, sum always = 0
+- No raw card storage — cards pre-tokenized by payment vault
+- Single-region, active-passive failover
+- Exactly-once semantics; 99.99% uptime; P99 charge latency < 500ms
 
 ---
 
-## High-Level Architecture
+## Step 2 — Capacity Estimation (3–5 min)
+
+### Baseline Numbers
+
+| Metric | Calculation | Result |
+|---|---|---|
+| Transactions/second | 100M charges/day ÷ 86,400 s | ~1,160 TPS avg |
+| Peak TPS | 3× average (holiday, sale events) | ~3,500 TPS |
+| Read:write ratio | Status checks, reporting, reconciliation | ~10:1 |
+| Read QPS peak | 10 × 3,500 | ~35,000 QPS |
+
+### Write Path Sizing
+
+| Resource | Calculation | Result |
+|---|---|---|
+| Ledger writes/s | 2 entries × 3,500 TPS | 7,000 rows/s |
+| Transaction writes/s | 1 row × 3,500 TPS | 3,500 rows/s |
+| Total DB writes | ledger + transactions + indexes | ~15,000 write ops/s |
+| Single Postgres node capacity | NVMe SSD, synchronous commit | ~50,000 writes/s — 1 node suffices for now |
+| Idempotency key store (Redis) | 100M keys/day × 150 B each | ~15 GB/day; pruned at 24h TTL |
+
+### Storage Growth
+
+| Table | Row size | Annual rows | Annual size |
+|---|---|---|---|
+| transactions | ~500 B | 36.5 B (100M/day × 365) | ~18 TB |
+| ledger_entries | ~300 B | 73 B (2 per transaction) | ~22 TB |
+
+**Implication:** at full Stripe scale, Postgres on a single node does not scale for storage — sharding by `account_id` is necessary after ~2 years of growth. For the interview, mention this as the inflection point.
+
+### Network Bandwidth
+
+| Direction | Calculation | Result |
+|---|---|---|
+| Inbound requests | 3,500 req/s × 1 KB avg payload | ~3.5 MB/s |
+| Card network calls | 3,500 × ~800 B (auth request/response) | ~2.8 MB/s |
+| Outbound webhooks | 3,500 × 1 KB | ~3.5 MB/s |
+
+All well within a single region's commodity network capacity.
+
+---
+
+## Step 3 — High-Level Design (10 min)
 
 ```
   Client (Merchant SDK)
        │  POST /charge  {amount, currency, customer_id, idempotency_key}
        ▼
-  ┌────────────────────────────────────────────────────────────┐
-  │              Payment Service                                │
-  │                                                            │
-  │  1. Validate request (amount > 0, valid currency, etc.)    │
-  │  2. Check idempotency_key (Redis cache → Postgres)         │
-  │     → If duplicate: return original response               │
-  │     → If new: proceed                                      │
-  │  3. BEGIN TRANSACTION                                       │
-  │     a. INSERT transactions (id, idem_key, amount, status)  │
-  │     b. INSERT ledger_entries (debit customer)              │
-  │     c. INSERT ledger_entries (credit merchant)             │
-  │     d. [optional] Call card network (Stripe → Visa/MC)     │
-  │  4. COMMIT                                                  │
-  │  5. Cache idempotency_key in Redis (24h TTL)               │
-  │  6. Return transaction result                               │
-  └───────────────────────────────┬────────────────────────────┘
-                                  │
-                    ┌─────────────▼──────────────┐
-                    │         Postgres            │
-                    │  transactions table         │
-                    │  ledger_entries table       │
-                    │  (ACID, UNIQUE constraints) │
-                    └─────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────┐
+  │              API Gateway / Load Balancer (L7)                  │
+  │   TLS termination, rate limiting per API key, routing          │
+  └───────────────────────────┬────────────────────────────────────┘
+                              │
+  ┌───────────────────────────▼────────────────────────────────────┐
+  │                    Payment Service                              │
+  │                                                                │
+  │  1. Validate request (amount > 0, valid currency, etc.)        │
+  │  2. Check idempotency_key                                      │
+  │       → Redis L1 cache (< 1ms): return cached response        │
+  │       → Postgres UNIQUE index (fallback): return stored row    │
+  │       → New key: proceed to step 3                             │
+  │  3. BEGIN TRANSACTION                                          │
+  │     a. INSERT transactions (id, idem_key, amount, status)      │
+  │     b. INSERT ledger_entries DEBIT  customer_id                │
+  │     c. INSERT ledger_entries CREDIT merchant_id                │
+  │  4. COMMIT  ← atomic: all succeed or none persist             │
+  │  5. [async] Call card network (authorize → capture)            │
+  │  6. Cache response in Redis (24h TTL)                          │
+  │  7. [async] Publish PaymentCreated event → webhook queue       │
+  │  8. Return 201 with transaction object                         │
+  └──────────┬──────────────────────────────────────┬─────────────┘
+             │                                      │
+  ┌──────────▼───────────┐              ┌───────────▼────────────┐
+  │       Postgres        │              │    Redis               │
+  │  transactions table   │              │  idem:{key} → response │
+  │  ledger_entries table │              │  24h TTL, LRU eviction │
+  │  ACID, UNIQUE idem_key│              └────────────────────────┘
+  │  append-only ledger   │
+  └───────────────────────┘
+             │
+  ┌──────────▼───────────┐
+  │  Reconciliation Job   │
+  │  (nightly/hourly)     │
+  │  Verify SUM(ledger)=0 │
+  │  Cross-check vs Visa/ │
+  │  Mastercard files     │
+  └───────────────────────┘
 ```
 
 **Postgres** is the source of truth. ACID transactions ensure that either all three operations (insert transaction + 2 ledger entries) succeed, or none do. No partial state can persist.
 
 **UNIQUE constraint** on `idempotency_key` in the transactions table is the last-line defense against concurrent duplicates. If two requests race with the same key, Postgres's unique index ensures only one INSERT succeeds. The loser gets a `UniqueViolation` exception, fetches and returns the winner's result.
 
-**Redis** caches idempotency keys for fast duplicate detection on the hot path (< 1ms vs ~5ms for a Postgres SELECT). Redis is a performance optimization, not correctness guarantee — Postgres is authoritative.
+**Redis** caches idempotency keys for fast duplicate detection on the hot path (< 1ms vs ~5ms for a Postgres SELECT). Redis is a performance optimization, not a correctness guarantee — Postgres is authoritative.
+
+**TOCTOU warning (important for interviews):** a naive implementation checks `SELECT WHERE idempotency_key = ?` and then `INSERT`. Between those two statements, a concurrent request with the same key can slip through the SELECT (both see "not found") and both attempt an INSERT. The Postgres UNIQUE constraint is the atomic guard: only one INSERT wins, the other throws `UniqueViolation`. The pre-check SELECT is an optimization only — never rely on it for correctness.
 
 ---
 
-## Deep Dives
+## Step 4 — Deep Dives
 
 ### 1. Idempotency: Every Payment Endpoint Needs It
 
@@ -194,7 +253,59 @@ Stripe uses an orchestration model: their Charge object transitions through stat
 
 **Stripe's approach:** continuous reconciliation running in the background, not just nightly. A streaming job (Flink) reads the ledger event stream and computes running totals per account. Any imbalance triggers an immediate PagerDuty alert.
 
-### 5. Fraud Detection (Brief Overview)
+### 5. Authorization vs Capture: The Two-Step Card Flow
+
+Most card payments are not a single atomic operation — they are two distinct network calls:
+
+```
+Step 1 — Authorization (instant, ~100ms)
+  Merchant → Card Network → Issuing Bank
+  "Can this customer spend $200?"
+  Bank response: authorized (reservation placed on customer's limit)
+  Ledger: DEBIT customer-escrow $200, CREDIT escrow-001 $200
+  Transaction status: "authorized"
+
+Step 2 — Capture (batch, T+1 or T+2)
+  Merchant → Card Network → Settlement
+  "Actually charge the $200 we authorized yesterday."
+  Money moves from bank reserves to merchant settlement account.
+  Ledger: DEBIT escrow-001 $200, CREDIT merchant-001 $200
+  Transaction status: "captured" → "settled"
+```
+
+**Why two steps?**
+- Hotel/car rental: authorize on check-in, capture on check-out (amount may differ slightly)
+- E-commerce: authorize at order time, capture only when shipped
+- Reduces fraud: merchant can void authorization if order is cancelled, no money moved
+
+**Partial capture:** you can capture less than the authorized amount (e.g., only 2 of 3 items shipped). The remainder of the authorization is automatically released.
+
+**Authorization expiry:** most issuers hold an authorization for 5–7 days. After that, it expires and the reserved funds return to the customer. Merchants must capture within this window.
+
+**In the ledger:** Authorization creates entries against an escrow account. Capture moves from escrow to merchant. If voided, the escrow entries are reversed. The invariant (sum=0) holds at every step.
+
+### 6. Currency, Precision, and FX
+
+**Never use floating-point for money.** IEEE 754 cannot represent 0.10 exactly:
+```python
+>>> 0.1 + 0.2
+0.30000000000000004
+```
+
+**Use `NUMERIC(18, 2)` in Postgres.** Or store amounts as integer minor units (cents): $9.99 → 999 cents. Integer arithmetic is exact.
+
+**Multi-currency design:**
+- Store `(amount, currency)` together — never just amount
+- All internal ledger entries use the presentment currency
+- FX conversion creates two separate transactions: sell USD, buy EUR
+- FX rate is locked at authorization time (settlement may differ slightly — FX risk)
+- Settlement always happens in the local currency of the merchant's bank
+
+**Stripe's approach:** charges are in the presentment currency. Payouts to the merchant's bank account are in the bank's local currency. Stripe absorbs the FX spread as margin.
+
+**Interview tip:** if asked about multi-currency at scale, mention the complexity of FX reconciliation — your internal ledger is in multiple currencies, and the sum-to-zero invariant must hold per-currency, not in aggregate.
+
+### 7. Fraud Detection (Brief Overview)
 
 Velocity checks (rule-based):
 - > 5 transactions from same IP in 10 minutes → flag
@@ -207,6 +318,39 @@ ML scoring (beyond scope):
 - Applied to every transaction in < 100ms (model inference is fast)
 
 3D Secure (3DS): redirect customer to card issuer's authentication page for high-risk transactions. Shifts fraud liability from merchant to issuer.
+
+---
+
+---
+
+## Failure Modes and Scale Challenges
+
+These are the failure scenarios interviewers expect you to reason through for a senior/staff role:
+
+### 1. Response Lost After Commit (The Idempotency Cliff)
+Payment service commits to Postgres, then crashes before returning the HTTP response. The client never sees 201. Client retries with the same `idempotency_key` → hits the UNIQUE constraint → fetches and returns the committed row. **No double charge.** This is why idempotency must be tied to the database commit, not the HTTP response.
+
+### 2. Card Network Call Inside vs Outside the Transaction
+If you call Visa/Mastercard *inside* the Postgres transaction:
+- Postgres holds row locks for the full duration of the network call (~100–300ms)
+- Under load, this exhausts the connection pool and causes cascading failures
+
+Better pattern: commit the `authorized` record to Postgres first, then call the card network asynchronously, then update status to `captured` or `failed`. The transaction can be retried if the card call fails.
+
+### 3. Redis Cache Miss + Postgres Failover
+Redis is down. Postgres primary fails mid-request. Client retries hit the replica (which just became primary). The idempotency_key check on the new primary correctly returns the original result — because Postgres replication is synchronous (with `synchronous_commit=on`). If you use async replication, a recent write may be lost, causing the replica to process the charge again → double charge. **Always use synchronous replication for payment-critical data.**
+
+### 4. Partial Refund Leaves Ledger Imbalanced
+A bug in the refund service inserts the credit entry but crashes before the debit entry. Postgres rolls back the transaction — both entries are gone. The original charge is untouched. The ledger sum remains zero. The client retries the refund with the same `idempotency_key` → idempotency guard detects no refund exists (rollback wiped it) → processes the refund again correctly.
+
+### 5. Ledger Corruption via Direct DB Update
+An engineer runs `UPDATE ledger_entries SET amount = 50 WHERE id = 123` to "fix" a bug. The entry was $100 → $50. The matching entry is still $100 → ledger sum is now -$50. **Solution:** ledger_entries must be immutable in code and at the DB layer (revoke UPDATE/DELETE privileges on the table for the application role). Corrections are new entries that reverse and re-enter.
+
+### 6. Idempotency Key Collision
+Two merchants, same `idempotency_key` value (e.g., "order-1"). **Solution:** scope idempotency keys to `(api_key, idempotency_key)`. Stripe's UNIQUE constraint is `UNIQUE (api_key_id, idempotency_key)`, not just `UNIQUE (idempotency_key)`.
+
+### 7. Thundering Herd on Card Network Timeout
+Card network (Visa) is slow (P99 = 2s). At 3,500 TPS, you have 7,000 concurrent in-flight card calls. Each holds a DB connection. Connection pool exhausted → new requests fail immediately → cascade. **Solution:** circuit breaker (stop calling Visa if error rate > 5%), bulkhead pattern (separate thread pool / connection pool for card network calls vs. DB calls), and exponential backoff with jitter on retries.
 
 ---
 
@@ -342,3 +486,12 @@ docker compose down -v
 
 10. **Q: Walk me through a Stripe charge from API call to settlement.**
     A: (1) Merchant calls POST /v1/charges with amount, source (card token), idempotency_key. (2) Stripe checks idempotency_key — new request. (3) Stripe validates card token, performs fraud scoring. (4) Stripe sends authorization request to card network (Visa/Mastercard) — ~100ms. (5) Network returns authorized/declined. (6) If authorized: INSERT transaction (pending), INSERT ledger entries (debit customer, credit Stripe escrow). COMMIT. (7) Return charge object to merchant (201). (8) Daily: Stripe captures authorized charges in batch, moves money from escrow to merchant account, sends to ACH. (9) Merchant receives funds in 2-7 business days. (10) Daily settlement file from Visa reconciled against Stripe's ledger.
+
+11. **Q: Two concurrent requests arrive with the same idempotency_key at the exact same millisecond. How does your system handle it?**
+    A: The optimistic path (pre-check SELECT) may return "not found" for both. Both attempt an INSERT. Postgres evaluates the UNIQUE constraint atomically within the btree index latch — only one INSERT succeeds. The loser gets a `UniqueViolation` (serialization error). The loser's handler catches it, does a SELECT to find the winner's row, and returns that row as the response. No double charge. This is why the UNIQUE constraint — not the pre-check SELECT — is the correctness guarantee. The pre-check is purely a performance optimization to avoid hitting the UNIQUE path on the common case.
+
+12. **Q: How do you handle multi-currency payments at scale?**
+    A: Store `(amount, currency)` together always. Use `NUMERIC(18, 2)` or integer minor units (cents) — never FLOAT. Ledger entries are in the presentment currency; the sum-to-zero invariant holds per-currency independently. FX conversion is a separate pair of transactions: debit in source currency, credit in target currency, with the exchange rate locked at the time of the transaction and stored on the record. For reconciliation, compare per-currency totals, not aggregate across currencies — that aggregate is meaningless. At PayPal scale, shards are often currency-aligned to avoid cross-currency query complexity.
+
+13. **Q: Why should you not call the card network inside the database transaction?**
+    A: A card network call takes 100–300ms on average, with tail latency potentially seconds (timeouts). If this call is inside a `BEGIN...COMMIT` block, Postgres holds row locks for the full duration. At 3,500 TPS with 200ms average card latency, you have ~700 concurrent transactions holding locks. Under load spikes this exhausts connection pools and causes cascading failures. The correct pattern: (1) COMMIT the `authorized` record synchronously to Postgres first, (2) call the card network asynchronously or in a follow-up step, (3) UPDATE status to `captured` or `failed`. The idempotency key ensures retries are safe even if the card call fails and must be retried.

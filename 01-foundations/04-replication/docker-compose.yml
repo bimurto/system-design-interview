@@ -12,9 +12,12 @@ services:
     command: >
       postgres
       -c wal_level=replica
-      -c max_wal_senders=3
-      -c max_replication_slots=3
-      -c wal_keep_size=64
+      -c max_wal_senders=5
+      -c max_replication_slots=5
+      -c wal_keep_size=256
+      -c max_slot_wal_keep_size=512
+      -c hot_standby=on
+      -c synchronous_commit=on
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -24,6 +27,8 @@ services:
   postgres-replica1:
     image: postgres:15
     environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       PGPASSWORD: postgres
     ports:
       - "5433:5432"
@@ -36,7 +41,7 @@ services:
           echo 'Waiting for primary...'
           sleep 2
         done
-        postgres
+        postgres -c hot_standby=on -c hot_standby_feedback=on
       "
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -47,6 +52,8 @@ services:
   postgres-replica2:
     image: postgres:15
     environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       PGPASSWORD: postgres
     ports:
       - "5434:5432"
@@ -59,7 +66,7 @@ services:
           echo 'Waiting for primary...'
           sleep 2
         done
-        postgres
+        postgres -c hot_standby=on -c hot_standby_feedback=on
       "
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

@@ -5,7 +5,12 @@ services:
       - "8001:8001"
     volumes:
       - ./rest_api.py:/app/rest_api.py:ro
-    command: bash -c "pip install flask -q && python /app/rest_api.py"
+    environment:
+      - REDIS_HOST=redis
+    command: bash -c "pip install flask redis -q && python /app/rest_api.py"
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 5s
@@ -26,3 +31,15 @@ services:
       timeout: 5s
       retries: 12
       start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

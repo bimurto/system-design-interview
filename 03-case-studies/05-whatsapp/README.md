@@ -16,7 +16,7 @@ WhatsApp serves 2 billion users sending over 100 billion messages per day. The c
 | Messages per day | 100 billion |
 | Messages per second (peak) | ~2 million |
 | Media files per day | 4.5 billion |
-| Servers (at 1M conn/server) | ~1,000 chat servers |
+| Chat servers (at 1M conn/server) | ~100 servers (peak concurrent connections) |
 
 A famous WhatsApp engineering fact: in 2014, they served 450 million users with just 32 engineers. The technical foundation was Erlang/OTP, a platform designed for building massively concurrent network servers with lightweight processes.
 
@@ -43,12 +43,21 @@ A famous WhatsApp engineering fact: in 2014, they served 450 million users with 
 
 | Metric | Calculation | Result |
 |---|---|---|
-| Messages/second | 100B/day / 86400s | ~1.16M/s |
+| Messages/second (avg) | 100B/day / 86400s | ~1.16M/s |
+| Messages/second (peak 3×) | 1.16M × 3 | ~3.5M/s |
 | Storage/message | 200B avg (text + metadata) | — |
 | Daily text storage | 100B × 200B | 20 TB/day |
 | Media storage | 4.5B files × avg 100KB | 450 TB/day |
+| Total storage/day | 20 TB + 450 TB | ~470 TB/day |
+| Inbound bandwidth (text) | 1.16M msg/s × 200B | ~232 MB/s |
 | Connection memory | 100M conn × 10KB per conn | 1 TB RAM total |
-| Chat servers needed | 100M conn / 1M per server | 100 servers |
+| Chat servers (1M conn/server) | 100M conn / 1M | ~100 servers |
+| Chat servers with 3× headroom | 100 × 3 | ~300 servers |
+| Group message fan-out | 100B msgs × avg 5 recipients | ~500B deliveries/day |
+
+Note: "100 servers" handles peak *concurrent connections*, not total registered users. WhatsApp has ~2B registered users but only ~100M online simultaneously. If you sized for all users being online at once (unrealistic), you'd need ~2,000 servers.
+
+**Key insight for the interview:** The bottleneck is not storage or CPU — it is maintaining 100M long-lived TCP connections. Each idle WebSocket connection costs ~10KB RAM (kernel socket buffer + app state). A 256GB server can hold ~25M idle connections; with 1M as a conservative ceiling accounting for active traffic, you need ~100 servers.
 
 ---
 
@@ -133,6 +142,87 @@ When a message is sent to an offline user:
 
 **Queue depth limit:** if a user accumulates too many queued messages (WhatsApp internal limit), older messages may be dropped with a "X older messages" notification. This prevents the queue from growing unboundedly for inactive users.
 
+**Delayed ACK2:** note that ACK2 (delivered ✓✓) travels to the original sender when the recipient reconnects, not when the message was originally sent. The sender's app updates the tick status asynchronously. If the sender is also offline when the recipient reconnects, the ACK2 is itself queued.
+
+### 5. Cassandra Schema for Message Storage
+
+At 100B messages/day, the schema design determines whether you get hot partitions or linear scalability.
+
+**Naive partition key (wrong):** `user_id` — all of a user's messages land on one node. A user with many messages creates a hot partition.
+
+**Production partition key:** `(chat_id, bucket)` where `bucket = date_trunc('day', created_at)`. This spreads writes across days and keeps read scans time-bounded.
+
+```
+CREATE TABLE messages (
+    chat_id     UUID,
+    bucket      DATE,        -- partition key: one partition per chat per day
+    message_id  TIMEUUID,    -- clustering key: time-ordered within partition
+    sender_id   UUID,
+    content     BLOB,        -- encrypted ciphertext
+    status      TEXT,
+    PRIMARY KEY ((chat_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id ASC)
+  AND gc_grace_seconds = 864000  -- 10 days tombstone grace
+  AND compaction = {'class': 'TimeWindowCompactionStrategy',
+                    'compaction_window_unit': 'DAYS',
+                    'compaction_window_size': 1};
+```
+
+**TimeWindowCompactionStrategy (TWCS):** Cassandra's built-in strategy for time-series data. It groups SSTables by time window (1 day here) and compacts only within windows, so old data is never re-compacted. This gives dramatically better write and compaction performance for append-heavy workloads like message ingest.
+
+**Read pattern:** `SELECT * FROM messages WHERE chat_id=? AND bucket=? AND message_id > ? LIMIT 50` — a single partition scan, always O(page size).
+
+**Unread message tracking:** a separate table `user_inbox (user_id, chat_id, last_delivered_message_id)` tracks the delivery cursor per user per chat. On reconnect, the server reads the cursor and queries only messages after it — avoiding a full scan.
+
+### 6. Multi-Device Sync (WhatsApp Linked Devices)
+
+WhatsApp supports linking up to 4 devices to one account (phone + WhatsApp Web + desktop). This introduces a fan-out and ordering challenge:
+
+**Identity key per device:** each linked device has its own Signal Protocol key pair. Sending a message to "Alice" means encrypting it once per device (4 separate ciphertexts), not once and forwarding plaintext.
+
+**Primary device vs linked devices:** the primary phone must be online at least once every 14 days, or linked devices lose access. This is a deliberate design — the phone holds the root identity key.
+
+**Message ordering across devices:** messages are ordered by server-assigned sequence number, not device timestamp. Device clocks can drift; server timestamp is the canonical order. Each device applies the same sequence → same display order.
+
+**Sync messages:** when device A sends a message, the server also sends a "sync copy" to device B and C, encrypted with each device's key. This keeps all devices' sent-message history in sync without the server ever having the plaintext.
+
+---
+
+## Failure Modes and Scale Challenges
+
+### Chat Server Crash — Connection Loss
+
+When a chat server crashes, all WebSocket connections on that server are lost simultaneously. Clients detect the TCP close and reconnect, but there is a thundering herd problem: all affected users try to reconnect at the same time, potentially overwhelming the remaining servers or the reconnecting server when it restarts.
+
+**Mitigations:**
+- **Exponential backoff with jitter:** clients wait `min(base * 2^attempt + random_ms, cap)` before reconnecting. Jitter prevents synchronized retry storms.
+- **Consistent hashing stability:** with consistent hashing, reconnecting clients are distributed across the ring proportionally. A single server failure redistributes its ~1% of connections, not all of them.
+- **Message durability:** because messages are written to Cassandra before delivery (ACK1), no message is lost when a server crashes mid-delivery. On reconnect, the client receives all undelivered messages from the store.
+
+### Redis Pub/Sub Failure — Cross-Server Routing Breaks
+
+If Redis becomes unavailable, inter-server message routing fails. Messages between users on different servers are not delivered (they are queued in Cassandra), but same-server messages still work via the in-memory `user_id → websocket` map.
+
+**Mitigation:** fall back to polling-based delivery (recipient gets messages on reconnect from Cassandra). This degrades real-time delivery for cross-server users but preserves eventual delivery. Redis cluster mode with N shards reduces blast radius.
+
+### Presence Key Expiry Race — Ghost Online Status
+
+A user's heartbeat might stop just before the TTL expires, causing the system to show them as offline when they are still connected (ungraceful network pause). Conversely, after a crash, the Redis key persists for up to 90 seconds, briefly showing a disconnected user as online.
+
+**Mitigation:** 90-second TTL with 30-second heartbeat gives a 3× safety margin for heartbeat jitter. Ghost online status (90s window) is an accepted trade-off — better than polling for presence updates. For "last seen" accuracy, the disconnect timestamp is written by the server when it detects a clean close.
+
+### Group Message Fan-Out Storm
+
+A group with 1,024 members (WhatsApp's current limit) receiving a burst of messages creates O(members × messages) deliveries. If 10,000 groups all get a message simultaneously, that is 10M individual delivery tasks.
+
+**Mitigation:** async fan-out with back-pressure. The sender's ACK1 is sent immediately after server receipt. Fan-out to group members happens asynchronously. A per-group rate limit prevents a single group from monopolizing delivery workers. Offline members are batch-queued, not individually written per message (group queue entry references the message once).
+
+### Cassandra Hot Partition During Message Storms
+
+A group chat with very high message volume writes to the same `(chat_id, bucket)` partition for the entire day. At extreme message rates, this creates a hot partition on one Cassandra node.
+
+**Mitigation:** for high-traffic group chats, add a `sub-bucket` to the partition key: `(chat_id, bucket, shard)` where shard is `message_id % N`. Reads must query all N shards and merge. This trades read complexity for write distribution.
+
 ---
 
 ## How It Actually Works
@@ -177,8 +267,8 @@ Six phases run automatically:
 1. **Connect:** Alice, Bob, and Carol connect via WebSocket; verify Redis presence keys
 2. **Online delivery:** Alice sends a message to Bob (online); observe all 3 ACK states
 3. **Offline queuing:** Bob disconnects; Alice sends 3 messages; verify they queue in Postgres
-4. **Reconnect:** Bob reconnects; queued messages are delivered immediately
-5. **Presence:** demonstrate heartbeat TTL refresh, observe online/offline transitions
+4. **Reconnect:** Bob reconnects; queued messages delivered; Alice receives delayed ACK2 receipts
+5. **Presence:** heartbeat TTL refresh; observe online/offline transitions; last_seen timestamp
 6. **Delivery guarantees:** inspect Postgres message status counts, discuss at-least-once
 
 ### Break It
@@ -227,11 +317,19 @@ docker compose exec db psql -U app whatsapp -c \
 ```bash
 # Watch message state transitions in Postgres
 docker compose exec db psql -U app whatsapp -c \
-  "SELECT sender_id, recipient_id, status, content FROM messages ORDER BY created_at LIMIT 20;"
+  "SELECT sender_id, recipient_id, status, created_at, delivered_at FROM messages ORDER BY created_at LIMIT 20;"
 
 # Check Redis presence keys and their TTLs
 docker compose exec cache redis-cli KEYS "online:*"
 docker compose exec cache redis-cli TTL online:alice
+
+# Check last_seen timestamps (written on clean disconnect)
+docker compose exec cache redis-cli KEYS "last_seen:*"
+docker compose exec cache redis-cli GET last_seen:bob
+
+# Inspect the full message lifecycle for a specific recipient
+docker compose exec db psql -U app whatsapp -c \
+  "SELECT id, sender_id, status, created_at, delivered_at, read_at FROM messages WHERE recipient_id='bob' ORDER BY created_at;"
 ```
 
 ### Teardown

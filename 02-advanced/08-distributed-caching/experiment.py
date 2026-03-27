@@ -10,6 +10,7 @@ What this demonstrates:
   3. Hot key problem — all requests for one key hit one node
   4. Key splitting strategy to distribute hot key load
   5. Redis data structures for different caching patterns
+  6. Cache stampede — mutex lock prevents thundering herd on single key
 """
 
 import time
@@ -18,6 +19,7 @@ import subprocess
 import json
 import random
 import string
+import math
 from collections import defaultdict, Counter
 
 try:
@@ -73,16 +75,52 @@ def hash_slot(key):
 
 
 def get_cluster_slot_assignment(rc):
-    """Get slot ranges for each node."""
+    """
+    Get slot ranges for each node.
+
+    Uses CLUSTER SHARDS (Redis 7+) which supersedes the deprecated CLUSTER SLOTS.
+    CLUSTER SHARDS returns a list of dicts, one per shard, each containing:
+      'slots'   — flat list of [start, end, start, end, ...]
+      'nodes'   — list of node dicts with 'port', 'role', etc.
+    Falls back to CLUSTER SLOTS for older Redis versions.
+    """
     r1 = get_raw(7001)
-    info = r1.execute_command("CLUSTER", "SLOTS")
     assignments = {}
-    for slot_range in info:
-        start, end = slot_range[0], slot_range[1]
-        master_info = slot_range[2]
-        # master_info: [host, port, node_id]
-        port = master_info[1]
-        assignments[port] = assignments.get(port, []) + [(start, end)]
+    try:
+        shards = r1.execute_command("CLUSTER", "SHARDS")
+        # shards is a list of [slots_array, nodes_array] pairs (RESP2 format)
+        for shard in shards:
+            # In RESP2: shard = [b'slots', [...], b'nodes', [...]]
+            # Parse as key-value pairs
+            shard_dict = {}
+            for i in range(0, len(shard), 2):
+                shard_dict[shard[i]] = shard[i + 1]
+            slots_flat = shard_dict.get(b"slots", shard_dict.get("slots", []))
+            nodes_list = shard_dict.get(b"nodes", shard_dict.get("nodes", []))
+            # slots_flat is [start1, end1, start2, end2, ...]
+            slot_ranges = []
+            for j in range(0, len(slots_flat), 2):
+                slot_ranges.append((int(slots_flat[j]), int(slots_flat[j + 1])))
+            # Find the master node's port
+            for node_entry in nodes_list:
+                node_dict = {}
+                for k in range(0, len(node_entry), 2):
+                    node_dict[node_entry[k]] = node_entry[k + 1]
+                role = node_dict.get(b"role", node_dict.get("role", b""))
+                if isinstance(role, bytes):
+                    role = role.decode()
+                if role == "master":
+                    port = int(node_dict.get(b"port", node_dict.get("port", 0)))
+                    assignments[port] = assignments.get(port, []) + slot_ranges
+                    break
+    except Exception:
+        # Fallback: CLUSTER SLOTS (deprecated but still functional pre-Redis 7)
+        info = r1.execute_command("CLUSTER", "SLOTS")
+        for slot_range in info:
+            start, end = slot_range[0], slot_range[1]
+            master_info = slot_range[2]
+            port = master_info[1]
+            assignments[port] = assignments.get(port, []) + [(start, end)]
     return assignments
 
 
@@ -289,13 +327,13 @@ def main():
 
     total = get_sharded_total(sharded_key)
     print(f"  Sharded total: {total} (should be {NUM_WRITES})")
-    print(f"\n  Writes distributed across {NUM_SHARDS} shards:")
-    for shard_id in sorted(shard_dist)[:5]:
+    print(f"\n  Writes distributed across all {NUM_SHARDS} shards:")
+    for shard_id in sorted(shard_dist):
         count = shard_dist[shard_id]
         slot  = hash_slot(get_shard_key(sharded_key, shard_id))
         port  = slot_to_node(slot, assignments) or "?"
         bar   = "#" * (count // 20)
-        print(f"    shard:{shard_id} → node:{port} slot:{slot}  {count} writes  {bar}")
+        print(f"    shard:{shard_id} → node:{port} slot:{slot:5d}  {count} writes  {bar}")
 
     print(f"""
   Key splitting trade-offs:
@@ -371,6 +409,109 @@ def main():
     STREAM: event log with consumer groups (Kafka-lite)
 """)
 
+    # ── Phase 6: Cache stampede — mutex lock ──────────────────────
+    section("Phase 6: Cache Stampede — Mutex Lock vs Thundering Herd")
+
+    stampede_key = "expensive:computation"
+    lock_key     = f"lock:{stampede_key}"
+    DB_LATENCY   = 0.05   # simulated DB query takes 50ms
+    NUM_THREADS  = 30
+
+    print(f"""
+  Cache stampede: a popular key expires under high concurrency.
+  All {NUM_THREADS} threads miss simultaneously and hammer the DB at once.
+
+  Scenario A — no mutex:
+    All threads see a cache miss → all query the DB → {NUM_THREADS}x DB load
+  Scenario B — mutex (SET NX EX):
+    Thread that wins the lock queries DB; others wait or return stale.
+""")
+
+    # ── Scenario A: stampede (no mutex) ───────────────────────────
+    db_hit_counts = Counter()
+    db_lock = threading.Lock()  # local lock to safely count DB hits
+
+    def fetch_without_mutex(thread_id):
+        r = get_cluster()
+        val = r.get(stampede_key)
+        if val is None:  # cache miss
+            # Simulate DB query (no coordination)
+            time.sleep(DB_LATENCY)
+            with db_lock:
+                db_hit_counts["no_mutex"] += 1
+            r.set(stampede_key, "result", ex=5)
+
+    # Ensure key is expired / absent
+    rc.delete(stampede_key)
+    threads = [threading.Thread(target=fetch_without_mutex, args=(i,)) for i in range(NUM_THREADS)]
+    t0 = time.perf_counter()
+    for t in threads: t.start()
+    for t in threads: t.join()
+    elapsed_a = time.perf_counter() - t0
+
+    print(f"  Scenario A (no mutex): {db_hit_counts['no_mutex']} DB hits "
+          f"from {NUM_THREADS} threads in {elapsed_a:.2f}s")
+    print(f"    → {NUM_THREADS}x DB load; every thread fetched independently")
+
+    # ── Scenario B: mutex via Redis SETNX ─────────────────────────
+    rc.delete(stampede_key)
+    rc.delete(lock_key)
+
+    def fetch_with_mutex(thread_id):
+        r = get_cluster()
+        val = r.get(stampede_key)
+        if val is not None:
+            return  # cache hit — fast path
+
+        # Try to acquire mutex (NX = only set if not exists, EX = auto-expire)
+        acquired = r.set(lock_key, "1", nx=True, ex=2)
+        if acquired:
+            # This thread owns the lock — fetch from DB
+            time.sleep(DB_LATENCY)
+            with db_lock:
+                db_hit_counts["mutex"] += 1
+            r.set(stampede_key, "result", ex=5)
+            r.delete(lock_key)
+        else:
+            # Lock is held by another thread — wait briefly and retry from cache
+            retries = 0
+            while retries < 10:
+                time.sleep(0.01)
+                val = r.get(stampede_key)
+                if val is not None:
+                    return  # cache is warm now
+                retries += 1
+            # Fallback: could return stale value or error; here we just return
+
+    threads = [threading.Thread(target=fetch_with_mutex, args=(i,)) for i in range(NUM_THREADS)]
+    t0 = time.perf_counter()
+    for t in threads: t.start()
+    for t in threads: t.join()
+    elapsed_b = time.perf_counter() - t0
+
+    print(f"\n  Scenario B (mutex):    {db_hit_counts['mutex']} DB hit  "
+          f"from {NUM_THREADS} threads in {elapsed_b:.2f}s")
+    print(f"    → 1x DB load; {NUM_THREADS - db_hit_counts['mutex']} threads waited and read from cache")
+
+    print(f"""
+  Stampede reduction: {db_hit_counts['no_mutex']}x DB calls → {db_hit_counts['mutex']}x DB call
+
+  Mutex implementation details:
+    SET lock:key 1 NX EX <ttl>
+      NX   = only set if key does NOT exist (atomic compare-and-set)
+      EX   = auto-expire the lock even if the lock-holder crashes
+      ttl  = must exceed expected DB query time, else next thread
+             re-acquires lock before cache is warm → partial stampede
+
+  Trade-offs of the mutex approach:
+    + Reduces DB fan-out from N threads to 1
+    + Atomic — no race condition between NX check and set
+    - Threads block (or return nothing) while lock is held
+    - If lock TTL < DB latency, another thread steals the lock
+    - Better alternative for reads: return stale value while one
+      thread refreshes in background (stale-while-revalidate pattern)
+""")
+
     # ── Summary ───────────────────────────────────────────────────
     section("Summary — Redis Cluster vs Sentinel")
 
@@ -389,6 +530,12 @@ def main():
     • Simpler than Cluster for small datasets
     • No horizontal scaling of writes
 
+  Eviction policies — must configure before memory fills:
+    allkeys-lru   → pure cache, uniform access pattern (safe default)
+    allkeys-lfu   → pure cache, power-law/hot-key access (better hit rate)
+    volatile-lru  → mixed store (some keys have no TTL and must survive)
+    noeviction    → writes fail on OOM — NEVER use for a cache layer
+
   Cache warm-up strategies:
     1. Lazy (cache-aside): populate on first miss — cold start latency
     2. Eager: pre-populate before traffic arrives (from DB dump or script)
@@ -400,7 +547,12 @@ def main():
     • Fix: stagger deploys, use a "warm-up" phase before serving traffic,
       or use a distributed mutex so only one server repopulates each key
 
-  Next: ../08-search-systems/
+  Cache stampede (single key, Phase 6):
+    • One popular key expires → N concurrent misses → N DB hits
+    • Fix: SET lock:key 1 NX EX <ttl> — only one thread fetches
+    • Alternative: stale-while-revalidate (return old value, refresh async)
+
+  Next: ../09-search-systems/
 """)
 
 

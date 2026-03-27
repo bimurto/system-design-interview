@@ -20,11 +20,22 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      # Use two listener names: one for internal container-to-container traffic,
+      # one advertised to external clients (localhost). This is required on
+      # Docker for Mac/Windows where network_mode:host is not available.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Kappa architecture relevance: long retention makes historical replay possible.
+      # Default is 168 hours (7 days); set to -1 for infinite retention (size-limited).
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: -1
+      # Limit log segment size to 256 MB so old segments are eligible for deletion sooner.
+      KAFKA_LOG_SEGMENT_BYTES: 268435456
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
@@ -39,11 +50,14 @@ services:
         condition: service_healthy
     volumes:
       - ./experiment.py:/experiment.py
+    # Run via the external port so experiment.py needs no code changes for Docker mode.
     command: >
       bash -c "pip install kafka-python-ng -q && python /experiment.py"
-    network_mode: host
-    healthcheck:
-      test: ["CMD", "python", "-c", "import kafka; print('ok')"]
-      interval: 10s
-      retries: 5
-      start_period: 30s
+    # Use a named network instead of network_mode:host — host networking is Linux-only
+    # and silently fails on Docker Desktop (Mac/Windows), causing confusing connection errors.
+    networks:
+      - stream-net
+
+networks:
+  stream-net:
+    driver: bridge

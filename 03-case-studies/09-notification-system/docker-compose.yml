@@ -53,6 +53,6 @@ services:
     volumes:
       - ./experiment.py:/experiment.py
     command: >
-      sh -c "pip install kafka-python psycopg2-binary --quiet && python /experiment.py"
+      sh -c "pip install kafka-python-ng psycopg2-binary --quiet && python /experiment.py"
     profiles:
       - experiment

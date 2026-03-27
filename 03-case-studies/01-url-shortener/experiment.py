@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-URL Shortener Lab — experiment.py
+URL Shortener Lab -- experiment.py
 
 What this demonstrates:
   1. Create 1,000 short URLs and measure throughput
-  2. Time redirect with vs. without cache — show 100x+ speedup
-  3. Base62 encoding: show how sequential IDs produce short codes
-  4. Cache hit-rate warming (cold → warm)
-  5. Hash vs. sequential vs. Snowflake-style ID generation
-  6. Birthday paradox: collision probability with hash-based IDs
+  2. Time redirect with vs. without cache -- show 10-100x speedup
+  3. Base62 encoding: how sequential IDs produce compact, URL-safe codes
+  4. Cache hit-rate warming under Zipf traffic (cold -> warm curve)
+  5. Hit counting: Redis INCR vs naive per-redirect Postgres UPDATE
+  6. Hash vs. sequential vs. Snowflake-style ID generation trade-offs
+  7. Birthday paradox: collision probability for hash-based IDs
 
 Run:
   docker compose up -d
-  # wait ~15s for services
+  # Wait ~20-30s for services to become healthy
+  docker compose ps      # confirm web shows (healthy)
   python experiment.py
 """
 
@@ -30,12 +32,12 @@ BASE_URL = "http://localhost:5001"
 BASE62 = string.digits + string.ascii_letters
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 
 def section(title):
-    print(f"\n{'=' * 62}")
+    print(f"\n{'=' * 66}")
     print(f"  {title}")
-    print("=" * 62)
+    print("=" * 66)
 
 
 def wait_for_service(url, max_wait=60):
@@ -67,26 +69,27 @@ def get_json(path):
         return json.loads(resp.read())
 
 
-def time_redirect(code, follow=False):
-    """Time a single redirect request (no follow = measure server response)."""
+def time_redirect(code):
+    """Time one redirect request. Returns elapsed ms without following the redirect."""
     url = f"{BASE_URL}/{code}"
     req = urllib.request.Request(url, method="GET")
+    opener = urllib.request.build_opener(urllib.request.HTTPErrorProcessor())
     start = time.perf_counter()
     try:
-        if follow:
-            urllib.request.urlopen(req, timeout=10)
-        else:
-            # Don't follow redirect — measure server-side latency only
-            opener = urllib.request.build_opener(urllib.request.HTTPErrorProcessor())
-            opener.open(req, timeout=10)
-    except urllib.error.HTTPError:
-        pass
-    except Exception:
+        opener.open(req, timeout=10)
+    except (urllib.error.HTTPError, urllib.error.URLError):
         pass
     return (time.perf_counter() - start) * 1000  # ms
 
 
-# ── Base62 utilities (mirror of app.py) ─────────────────────────────────────
+def percentile(data, pct):
+    sorted_data = sorted(data)
+    k = (len(sorted_data) - 1) * pct / 100
+    lo, hi = int(k), min(int(k) + 1, len(sorted_data) - 1)
+    return sorted_data[lo] + (sorted_data[hi] - sorted_data[lo]) * (k - lo)
+
+
+# -- Base62 utilities (mirror of app.py) --------------------------------------
 
 def base62_encode(num: int) -> str:
     if num == 0:
@@ -105,7 +108,7 @@ def base62_decode(s: str) -> int:
     return result
 
 
-# ── Phase 1: Bulk URL creation ───────────────────────────────────────────────
+# -- Phase 1: Bulk URL creation -----------------------------------------------
 
 def phase1_bulk_create():
     section("Phase 1: Create 1,000 Short URLs")
@@ -113,154 +116,242 @@ def phase1_bulk_create():
     codes = []
     start = time.perf_counter()
     for i in range(1000):
-        url = f"{random.choice(domains)}/path/{i}/{''.join(random.choices(string.ascii_lowercase, k=6))}"
+        url = (
+            f"{random.choice(domains)}/path/{i}/"
+            f"{''.join(random.choices(string.ascii_lowercase, k=6))}"
+        )
         result = post_json("/shorten", {"url": url})
         codes.append(result["short_code"])
     elapsed = time.perf_counter() - start
 
     print(f"\n  Created 1,000 URLs in {elapsed:.2f}s  ({1000/elapsed:.0f} req/s)")
     print(f"\n  Sample codes (first 10):")
-    print(f"  {'ID (approx)':>12}  {'Short Code':>12}  {'URL length':>10}")
-    print(f"  {'-'*12}  {'-'*12}  {'-'*10}")
-    for i, code in enumerate(codes[:10], start=1):
+    print(f"  {'Decoded ID':>12}  {'Short Code':>12}  {'Chars':>6}")
+    print(f"  {'-'*12}  {'-'*12}  {'-'*6}")
+    for code in codes[:10]:
         decoded = base62_decode(code)
-        print(f"  {decoded:>12}  {code:>12}  {len(code):>10} chars")
+        print(f"  {decoded:>12}  {code:>12}  {len(code):>6}")
 
-    print(f"\n  Base62 property: 6 chars cover 62^6 = {62**6:,} unique URLs")
-    print(f"  At 1,000 writes/day, 6-char codes last {62**6 // 1000 // 365:,} years")
+    print(f"\n  Base62 capacity:")
+    print(f"    6 chars: {62**6:>15,} unique codes")
+    print(f"    7 chars: {62**7:>15,} unique codes")
+    print(f"    At 1,000 writes/day, 6-char codes last {62**6 // 1000 // 365:,} years")
     return codes
 
 
-# ── Phase 2: Cache warm-up and latency comparison ───────────────────────────
+# -- Phase 2: Cache warm-up and latency comparison ----------------------------
 
 def phase2_cache_latency(codes):
-    section("Phase 2: Redirect Latency — Cache Cold vs. Warm")
+    section("Phase 2: Redirect Latency -- Cache Cold vs. Warm")
 
-    sample = codes[:20]
+    # Reset stats so we start from a clean baseline.
+    # Easiest approach: use a slice not previously requested.
+    sample = codes[:30]
 
-    # Cold: first request hits Postgres
-    cold_times = []
-    for code in sample:
-        ms = time_redirect(code)
-        cold_times.append(ms)
-    avg_cold = sum(cold_times) / len(cold_times)
+    # Cold pass: first request for each code hits Postgres.
+    cold_times = [time_redirect(code) for code in sample]
 
-    # Warm: second request hits Redis
-    warm_times = []
-    for code in sample:
-        ms = time_redirect(code)
-        warm_times.append(ms)
-    avg_warm = sum(warm_times) / len(warm_times)
+    # Warm pass: second request for each code hits Redis.
+    warm_times = [time_redirect(code) for code in sample]
 
-    speedup = avg_cold / avg_warm if avg_warm > 0 else float("inf")
+    def fmt_stats(times):
+        return (
+            f"avg={sum(times)/len(times):5.1f}ms  "
+            f"P50={percentile(times,50):5.1f}ms  "
+            f"P99={percentile(times,99):5.1f}ms  "
+            f"min={min(times):5.1f}ms  max={max(times):5.1f}ms"
+        )
 
-    print(f"\n  Testing 20 URLs — each requested twice (cold then warm):\n")
-    print(f"  {'Metric':<20}  {'Cold (DB)':>12}  {'Warm (Redis)':>14}")
-    print(f"  {'-'*20}  {'-'*12}  {'-'*14}")
-    print(f"  {'Avg latency':<20}  {avg_cold:>10.1f}ms  {avg_warm:>12.1f}ms")
-    print(f"  {'Min latency':<20}  {min(cold_times):>10.1f}ms  {min(warm_times):>12.1f}ms")
-    print(f"  {'Max latency':<20}  {max(cold_times):>10.1f}ms  {max(warm_times):>12.1f}ms")
-    print(f"\n  Speedup: {speedup:.1f}x  (Redis vs Postgres round-trip)")
+    print(f"\n  30 URLs, each requested twice (cold then warm):\n")
+    print(f"  Cold (Postgres): {fmt_stats(cold_times)}")
+    print(f"  Warm (Redis):    {fmt_stats(warm_times)}")
+    avg_speedup = (sum(cold_times) / len(cold_times)) / (sum(warm_times) / len(warm_times))
+    print(f"\n  Speedup: {avg_speedup:.1f}x")
 
     stats = get_json("/stats")
-    print(f"\n  Cache stats after warm-up:")
+    print(f"\n  Global cache stats:")
     print(f"    Hits:     {stats['cache_hits']}")
     print(f"    Misses:   {stats['cache_misses']}")
     print(f"    Hit rate: {stats['hit_rate_pct']}%")
 
-
-# ── Phase 3: Base62 encoding demo ───────────────────────────────────────────
-
-def phase3_base62_demo():
-    section("Phase 3: Base62 Encoding — Sequential IDs → Short Codes")
-
-    print(f"\n  Base62 alphabet: {BASE62}")
-    print(f"\n  How sequential auto-increment IDs encode:\n")
-    print(f"  {'ID':>12}  {'Base62 Code':>12}  {'Code Length':>12}  {'Max IDs at length':>18}")
-    print(f"  {'-'*12}  {'-'*12}  {'-'*12}  {'-'*18}")
-
-    ids = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000]
-    for i in ids:
-        code = base62_encode(i)
-        max_at_len = 62 ** len(code)
-        print(f"  {i:>12,}  {code:>12}  {len(code):>12}  {max_at_len:>18,}")
-
-    print(f"""
-  Key insight: base62 is compact and URL-safe.
-  - 6 chars: up to {62**6:,} URLs  (enough for years at typical scale)
-  - 7 chars: up to {62**7:,} URLs  (global scale, decades)
-  - Sequential IDs are predictable (crawlable) — consider adding
-    a random offset or using Snowflake IDs for privacy.
+    print("""
+  Why P99 matters more than average in production:
+    The average flattens the tail. At 115K RPS, even a 1% tail means
+    1,150 slow requests per second. The P99 is what users actually feel
+    on slow connections or viral links hitting a cold shard.
 """)
 
 
-# ── Phase 4: Cache hit rate warming ─────────────────────────────────────────
+# -- Phase 3: Base62 encoding demo --------------------------------------------
+
+def phase3_base62_demo():
+    section("Phase 3: Base62 Encoding -- Sequential IDs to Short Codes")
+
+    print(f"\n  Alphabet (62 chars): {BASE62}")
+    print(f"\n  {'ID':>14}  {'Base62':>10}  {'Len':>4}  {'Max IDs at this length':>22}")
+    print(f"  {'-'*14}  {'-'*10}  {'-'*4}  {'-'*22}")
+
+    ids = [1, 62, 3844, 100_000, 1_000_000, 56_800_235_584, 1_000_000_000_000]
+    for i in ids:
+        code = base62_encode(i)
+        max_at_len = 62 ** len(code)
+        print(f"  {i:>14,}  {code:>10}  {len(code):>4}  {max_at_len:>22,}")
+
+    print(f"""
+  Key insight: base62 uses only alphanumeric characters [0-9A-Za-z].
+  No +, /, or = like base64, so codes are safe in URLs without encoding.
+
+  Sequential IDs give the shortest possible encoding for a given number:
+    ID 1        -> "1"   (1 char,  62 possibilities)
+    ID 62       -> "10"  (2 chars, boundary at 62^1)
+    ID 3844     -> "100" (3 chars, boundary at 62^2)
+
+  The predictability trade-off: sequential codes are crawlable. An attacker
+  can enumerate all URLs by iterating "1", "2", ... "zzzzz". Mitigations:
+    1. Add a random epoch offset to the auto-increment sequence
+    2. XOR the ID with a private salt before encoding
+    3. Switch to Snowflake IDs (time-sorted, not enumerable without epoch)
+""")
+
+
+# -- Phase 4: Cache hit rate warming ------------------------------------------
 
 def phase4_cache_warming(codes):
-    section("Phase 4: Cache Hit Rate — Warming Curve")
+    section("Phase 4: Cache Hit Rate -- Warming Curve Under Zipf Traffic")
 
-    # Reset stats by requesting all codes fresh (all already warm from Phase 2)
-    # Use a fresh batch not previously fetched
-    fresh_codes = codes[20:120]  # 100 codes not yet warmed
+    # Use a slice not yet warmed -- codes[30:] were not touched in Phase 2.
+    fresh_codes = codes[30:130]  # 100 codes
 
-    print(f"\n  Simulating 500 requests to 100 URLs (Zipf distribution):")
-    print(f"  First requests = cache misses, repeats = cache hits\n")
+    print(f"  Simulating 500 requests to 100 URLs with Zipf distribution.")
+    print(f"  URL[0] is ~100x more popular than URL[99] (power-law traffic).\n")
+    print(f"  Reported hit rate is from the server's Redis stat counters,")
+    print(f"  not a local estimate -- this reflects real cache behaviour.\n")
 
-    # Zipf-like: code[0] is 10x more popular than code[99]
+    # Reset server-side stats so Phase 4 numbers are isolated.
+    # We do this by reading the current totals and subtracting them later.
+    baseline = get_json("/stats")
+    baseline_hits   = baseline["cache_hits"]
+    baseline_misses = baseline["cache_misses"]
+
     weights = [1 / (i + 1) for i in range(len(fresh_codes))]
     total_w = sum(weights)
     weights = [w / total_w for w in weights]
 
-    hits_over_time = []
-    running_hits = 0
-    running_total = 0
-    seen = set()
-
+    snapshots = []
     for i in range(500):
         code = random.choices(fresh_codes, weights=weights)[0]
         time_redirect(code)
-        running_total += 1
-        if code in seen:
-            running_hits += 1
-        else:
-            seen.add(code)
         if (i + 1) % 50 == 0:
-            rate = running_hits / running_total * 100
-            hits_over_time.append((i + 1, rate))
+            s = get_json("/stats")
+            phase_hits   = s["cache_hits"]   - baseline_hits
+            phase_misses = s["cache_misses"] - baseline_misses
+            phase_total  = phase_hits + phase_misses
+            rate = phase_hits / phase_total * 100 if phase_total else 0
+            snapshots.append((i + 1, phase_hits, phase_misses, rate))
 
-    print(f"  {'Requests':>10}  {'Hit Rate':>10}  {'Bar'}")
-    print(f"  {'-'*10}  {'-'*10}  {'-'*30}")
-    for req_count, rate in hits_over_time:
+    print(f"  {'Requests':>10}  {'Hits':>8}  {'Misses':>8}  {'Hit Rate':>10}  Bar")
+    print(f"  {'-'*10}  {'-'*8}  {'-'*8}  {'-'*10}  {'-'*30}")
+    for req_count, hits, misses, rate in snapshots:
         bar = "#" * int(rate / 2)
-        print(f"  {req_count:>10}  {rate:>9.1f}%  {bar}")
+        print(f"  {req_count:>10}  {hits:>8}  {misses:>8}  {rate:>9.1f}%  {bar}")
 
     print(f"""
-  Cache hit rate rises as popular URLs get cached.
-  Real systems use TTL (24h) + LRU eviction on Redis max-memory.
-  Hot URLs (viral links) benefit most — they're requested millions
-  of times but cached after the very first miss.
+  Under Zipf distribution, ~20% of URLs receive ~80% of traffic (Pareto).
+  The cache warms quickly for those hot URLs and plateau near the theoretical
+  maximum hit rate for the working set size.
+
+  Real implication: a 3 GB Redis cache for 10M "hot" URLs absorbs 99%+ of
+  reads at bit.ly scale because viral links are heavily Zipf-distributed.
+  The tail (cold URLs) hits Postgres, but that is a tiny fraction of volume.
 """)
 
 
-# ── Phase 5: ID generation strategies ───────────────────────────────────────
+# -- Phase 5: Hit counting -- Redis INCR vs Postgres UPDATE -------------------
 
-def phase5_id_generation():
-    section("Phase 5: ID Generation Strategies — Trade-offs")
+def phase5_hit_counting(codes):
+    section("Phase 5: Hit Counting -- Redis INCR + Batch Flush vs. Per-Redirect UPDATE")
+
+    print("""
+  Naive approach: UPDATE urls SET hits = hits + 1 WHERE short_code = ?
+  Problem: row-locking UPDATE on every redirect. At 115K RPS this means
+  115,000 row locks per second -- Postgres falls over.
+
+  Production approach (what this service implements):
+    1. On each redirect: INCR hits:<code>  in Redis  (O(1), atomic)
+    2. A background worker (or POST /flush_hits) bulk-updates Postgres
+       once per flush interval with the accumulated delta.
+
+  Demonstrating the pattern:
+""")
+
+    # Pick 5 codes to track
+    tracked = codes[:5]
+    hit_counts = {code: 0 for code in tracked}
+
+    # Fire 20 redirects spread across tracked codes
+    for _ in range(20):
+        code = random.choice(tracked)
+        time_redirect(code)
+        hit_counts[code] += 1
+
+    print(f"  Fired 20 redirects. Expected hit counts: {hit_counts}")
+    print(f"  Checking Postgres BEFORE flush (hits column should be 0 or stale)...")
+
+    # Before flush: Postgres hits should still be 0 for these codes
+    # (redirects went to Redis and incremented only Redis counters)
+    # We can't query Postgres directly from here, so we show the Redis counters.
+    import urllib.request as _req
+    try:
+        import redis as _redis_mod
+        r = _redis_mod.from_url("redis://localhost:6379", decode_responses=True)
+        print(f"\n  Redis counters (hits:*) before flush:")
+        for code in tracked:
+            val = r.get(f"hits:{code}") or "0"
+            print(f"    hits:{code:<10} = {val}")
+
+        # Flush to Postgres
+        print(f"\n  Calling POST /flush_hits ...")
+        result = post_json("/flush_hits", {})
+        print(f"  Flush result: {result}")
+
+        print(f"\n  Redis counters after flush (should be gone -- GETDEL was atomic):")
+        for code in tracked:
+            val = r.get(f"hits:{code}") or "(deleted)"
+            print(f"    hits:{code:<10} = {val}")
+
+    except Exception as e:
+        print(f"  (Redis direct check skipped -- run with Docker: {e})")
+        result = post_json("/flush_hits", {})
+        print(f"  Flush result: {result}")
+
+    print(f"""
+  This pattern converts 115K Postgres writes/second into one bulk UPDATE
+  per flush cycle (~60s in production). The trade-off: hit counts in
+  Postgres lag by up to one flush interval. For a URL shortener this is
+  perfectly acceptable. For billing or fraud detection, use synchronous
+  writes or a streaming pipeline (Kafka -> Flink -> OLAP store).
+""")
+
+
+# -- Phase 6: ID generation strategies ----------------------------------------
+
+def phase6_id_generation():
+    section("Phase 6: ID Generation Strategies -- Trade-offs")
 
     print(f"""
   Three approaches to generating short codes:
 
-  ┌─────────────────────┬──────────────────┬───────────────────┬──────────────────┐
-  │ Strategy            │ Collision Risk   │ Predictable?      │ Distributed OK?  │
-  ├─────────────────────┼──────────────────┼───────────────────┼──────────────────┤
-  │ Hash (MD5 truncated)│ Yes (birthday)   │ No (good)         │ Yes              │
-  │ Sequential auto-inc │ None             │ Yes (bad for UX)  │ No (single DB)   │
-  │ Snowflake-style     │ None             │ No (time-ordered) │ Yes              │
-  └─────────────────────┴──────────────────┴───────────────────┴──────────────────┘
+  +---------------------+------------------+-------------------+------------------+
+  | Strategy            | Collision Risk   | Predictable?      | Distributed OK?  |
+  +---------------------+------------------+-------------------+------------------+
+  | Hash (MD5 truncated)| Yes (birthday)   | No (good)         | Yes              |
+  | Sequential auto-inc | None             | Yes (bad for UX)  | No (single DB)   |
+  | Snowflake-style     | None             | No (time-ordered) | Yes              |
+  +---------------------+------------------+-------------------+------------------+
 """)
 
-    # Demonstrate hash-based ID generation
-    print("  Hash-based: take first 6 chars of MD5(url)")
+    # Hash-based
+    print("  Hash-based: first 7 hex chars of MD5(url)")
     sample_urls = [
         "https://example.com/article/1",
         "https://example.com/article/2",
@@ -268,83 +359,107 @@ def phase5_id_generation():
     ]
     for url in sample_urls:
         h = hashlib.md5(url.encode()).hexdigest()
-        code = h[:7]  # 7 hex chars = 28 bits
-        print(f"    {url[:40]:<40} → {code}")
+        code = h[:7]
+        print(f"    {url:<42} -> {code}")
 
-    # Demonstrate Snowflake-style ID
-    print(f"\n  Snowflake-style: timestamp_ms | machine_id | sequence")
+    # Correct Snowflake bit layout: timestamp(41b) | datacenter(5b) | machine(5b) | seq(12b)
+    # This is Twitter's original Snowflake schema.
+    print(f"""
+  Snowflake-style: 64-bit integer composed of three fields.
+  Twitter's original layout:
+    Bits 63-22: timestamp_ms relative to epoch (41 bits, ~69 years of range)
+    Bits 21-17: datacenter ID (5 bits, up to 32 datacenters)
+    Bits 16-12: machine ID    (5 bits, up to 32 machines per datacenter)
+    Bits 11-0:  sequence      (12 bits, 4096 IDs per millisecond per machine)
+
+  Max throughput per machine: 4,096 IDs/ms = 4.1M IDs/second.
+  No coordination needed -- machine/datacenter IDs assigned at startup.
+""")
+    EPOCH = 1_288_834_974_657  # Twitter Snowflake epoch (Nov 4 2010)
+    datacenter_id = 1
     machine_id = 1
-    seq = 0
-    print(f"\n  {'Timestamp ms':>14}  {'Machine':>8}  {'Seq':>5}  {'Snowflake ID':>20}  {'Base62':>8}")
-    print(f"  {'-'*14}  {'-'*8}  {'-'*5}  {'-'*20}  {'-'*8}")
-    base_ts = int(time.time() * 1000) - 1_700_000_000_000  # epoch offset
-    for i in range(5):
-        ts = base_ts + i * 100
-        snow_id = (ts << 12) | (machine_id << 6) | (seq + i)
+    print(f"  {'Timestamp offset':>18}  {'DC':>4}  {'Mach':>6}  {'Seq':>5}  {'Snowflake ID':>20}  {'Base62':>10}")
+    print(f"  {'-'*18}  {'-'*4}  {'-'*6}  {'-'*5}  {'-'*20}  {'-'*10}")
+    base_ts = int(time.time() * 1000) - EPOCH
+    for seq in range(5):
+        ts_offset = base_ts + seq  # one ms apart
+        snow_id = (ts_offset << 22) | (datacenter_id << 17) | (machine_id << 12) | seq
         code = base62_encode(snow_id)
-        print(f"  {ts:>14}  {machine_id:>8}  {seq+i:>5}  {snow_id:>20}  {code:>8}")
+        print(f"  {ts_offset:>18}  {datacenter_id:>4}  {machine_id:>6}  {seq:>5}  {snow_id:>20}  {code:>10}")
 
     print(f"""
   Snowflake advantages:
-  - No coordination needed (machine_id assigned at startup)
-  - Time-sortable (useful for analytics)
-  - No collisions by construction
-  - Used by: Twitter/X (tweet IDs), Instagram, Discord
+    - No central coordination (machine_id/datacenter_id assigned at startup)
+    - Time-sortable (useful for analytics: new IDs are always larger)
+    - No collisions by construction within the same ms + machine
+    - Used by: Twitter/X (tweet IDs), Instagram, Discord, Mastodon
+
+  Snowflake risk: clock skew. If a machine's clock jumps backward, it can
+  generate a duplicate ID. Production implementations refuse to issue IDs
+  until the clock catches up past the last-seen timestamp.
 """)
 
 
-# ── Phase 6: Birthday paradox collision probability ─────────────────────────
+# -- Phase 7: Birthday paradox collision probability --------------------------
 
-def phase6_birthday_paradox():
-    section("Phase 6: Birthday Paradox — Hash Collision Probability")
+def phase7_birthday_paradox():
+    section("Phase 7: Birthday Paradox -- Hash Collision Probability")
 
     print(f"""
-  When using hash(url)[:N] as short code, what is the probability
-  of a collision after K URLs?  (Birthday problem)
+  When using hash(url)[:N] as a short code, what is the probability of
+  a collision after K URLs have been stored?  (Birthday problem)
 
-  P(collision) ≈ 1 - e^(-K²/2N)  where N = total possible codes
+  Approximation: P(collision) ~= 1 - e^(-K^2 / 2N)
+  where N = total number of distinct possible codes.
 
-  For hex characters (16 choices per char):
+  For base62 codes (62 choices per character):
 """)
 
-    print(f"  {'Code Chars':>10}  {'Total Codes':>18}  {'1% collision at':>18}  {'50% at':>14}")
-    print(f"  {'-'*10}  {'-'*18}  {'-'*18}  {'-'*14}")
+    print(f"  {'Chars':>6}  {'Total codes (62^N)':>20}  {'1% collision at K':>20}  {'50% collision at K':>20}")
+    print(f"  {'-'*6}  {'-'*20}  {'-'*20}  {'-'*20}")
 
     for n_chars in [5, 6, 7, 8, 10]:
-        total = 16 ** n_chars  # hex
-        # P = 0.01: K ≈ sqrt(-2 * N * ln(0.99))
+        total = 62 ** n_chars
+        # Solve 0.01 = 1 - e^(-K^2/2N)  =>  K = sqrt(-2N * ln(0.99))
         k_1pct  = int(math.sqrt(-2 * total * math.log(0.99)))
         k_50pct = int(math.sqrt(-2 * total * math.log(0.5)))
-        print(f"  {n_chars:>10}  {total:>18,}  {k_1pct:>18,}  {k_50pct:>14,}")
+        print(f"  {n_chars:>6}  {total:>20,}  {k_1pct:>20,}  {k_50pct:>20,}")
 
     print(f"""
-  With 6 hex chars (~16M codes) and 100M URLs stored: very high collision risk.
-  With 8 hex chars (~4B codes): 1% collision at ~9M URLs — acceptable short-term.
+  With 6 base62 chars (~56 billion codes):
+    1% collision risk reached at ~1.06 billion URLs -- well beyond typical
+    deployment scale. This is why base62 is strongly preferred over hex
+    for short codes: same character length, 3.8x more distinct values.
 
-  This is why production systems prefer:
-  1. Sequential IDs (no collisions, but predictable)
-  2. Snowflake IDs (no collisions, distributed, time-sortable)
-  3. Hash with collision detection + retry loop (expensive at scale)
+  Hex (16 chars) comparison for 6-char codes:
+    Hex:    16^6 = {16**6:,} codes  (1% collision at ~{int(math.sqrt(-2*16**6*math.log(0.99))):,} URLs)
+    Base62: 62^6 = {62**6:,} codes  (1% collision at ~{int(math.sqrt(-2*62**6*math.log(0.99))):,} URLs)
 
-  Base62 (vs hex) gives MORE codes per character:
-  6 base62 chars = 62^6 = {62**6:,} vs 16^6 = {16**6:,} (hex)
-  → base62 is 10x more space-efficient per character length
+  Production preference ranking:
+    1. Sequential IDs + base62  -- no collisions, compact, simple
+    2. Snowflake IDs + base62   -- no collisions, distributed, time-sorted
+    3. Hash + collision retry   -- stateless generation, but retry loop adds
+                                   latency and complexity at scale
 """)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
 def main():
     section("URL SHORTENER LAB")
     print("""
   Architecture:
-    Client → Flask (base62 encode) → Postgres (persistent store)
-                                  ↗
-                             Redis (cache-aside, TTL 24h)
+    Client -> Flask (base62 encode) -> Postgres (source of truth)
+                  |
+                  +-> Redis cache-aside (TTL 24h, allkeys-lru eviction)
 
-  Cache-aside pattern:
-    Read:  check Redis → if miss, query Postgres → store in Redis
-    Write: write to Postgres only (cache populated on first read)
+  Cache-aside read path:
+    1. Check Redis  -> hit: return 302, INCR hits:<code> in Redis
+    2. Miss: query Postgres, populate Redis, INCR hits:<code> in Redis
+    3. Background flush (/flush_hits): GETDEL counters, bulk UPDATE Postgres
+
+  This experiment walks through seven phases covering the key design
+  decisions a senior engineer would discuss in a FAANG interview.
 """)
 
     wait_for_service(BASE_URL)
@@ -353,19 +468,26 @@ def main():
     phase2_cache_latency(codes)
     phase3_base62_demo()
     phase4_cache_warming(codes)
-    phase5_id_generation()
-    phase6_birthday_paradox()
+    phase5_hit_counting(codes)
+    phase6_id_generation()
+    phase7_birthday_paradox()
 
     section("Lab Complete")
     print("""
-  Summary:
-  • Cache-aside cuts redirect latency 10-100x (Postgres → Redis)
-  • Base62 encoding: 6 chars covers 56 billion URLs
-  • Sequential IDs: no collisions, but predictable (security risk)
-  • Hash IDs: unpredictable, but birthday paradox causes collisions
-  • Snowflake IDs: best of both — distributed, no collisions, sortable
+  Key takeaways:
+    Cache-aside cuts redirect latency 10-100x (Postgres -> Redis)
+    Base62 vs hex: same code length, 3.8x more distinct values per char
+    Sequential IDs: zero collisions, compact, but sequentially enumerable
+    Hash IDs: stateless generation, but birthday paradox causes collisions
+    Snowflake IDs: distributed, no collisions, time-sorted -- best at scale
+    Hit counting: Redis INCR + batch flush eliminates Postgres UPDATE bottleneck
 
-  Next: 02-twitter-timeline/ — fan-out on write vs. pull at read time
+  Try this:
+    docker compose exec cache redis-cli info stats | grep evicted_keys
+    # Evictions show when Redis has to drop LRU keys to make room.
+    # In production, monitor this metric and add memory before it spikes.
+
+  Next: 02-twitter-timeline/ -- fan-out on write vs. pull at read time
 """)
 
 

@@ -8,6 +8,10 @@ What this demonstrates:
   3. Politeness: per-domain rate limiting (max 1 req/s per domain)
   4. robots.txt respect: /private/* pages are never fetched
   5. Crawler trap detection: ?page=N parameter depth limit
+  6. URL normalization: collapse session IDs, tracking params, fragments
+  7. SimHash near-duplicate content detection (Hamming distance <= 3)
+  8. Scale math: capacity numbers for a 5B-page Google-scale crawler
+  9. DB summary: pages stored in Postgres by domain and depth
 
 Run:
   docker compose up -d mock-server redis db
@@ -19,6 +23,7 @@ Run:
 """
 
 import hashlib
+import math
 import os
 import re
 import time
@@ -106,17 +111,35 @@ def is_trap_url(url: str) -> bool:
     return False
 
 
+SESSION_ID_PARAMS = frozenset({
+    "jsessionid", "phpsessid", "sid", "sessionid", "aspsessionid",
+    "cfid", "cftoken", "utm_source", "utm_medium", "utm_campaign",
+})
+
+
 def normalize_url(url: str) -> str:
-    """Normalize URL: lowercase scheme+host, sort query params, strip fragment."""
+    """Normalize URL for deduplication.
+
+    Steps (mirrors production crawlers like Googlebot/CommonCrawl):
+      1. Lowercase scheme and host
+      2. Strip fragment (#section) — never sent to server
+      3. Remove tracking/session ID query parameters
+      4. Sort remaining query parameters alphabetically
+    """
     parsed = urllib.parse.urlparse(url)
-    query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(parsed.query)))
+    # Filter out session/tracking params, then sort the rest
+    filtered_params = [
+        (k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
+        if k.lower() not in SESSION_ID_PARAMS
+    ]
+    query = urllib.parse.urlencode(sorted(filtered_params))
     normalized = urllib.parse.urlunparse((
         parsed.scheme.lower(),
         parsed.netloc.lower(),
         parsed.path,
         parsed.params,
         query,
-        "",  # no fragment
+        "",  # strip fragment — never part of server-side identity
     ))
     return normalized
 
@@ -164,6 +187,51 @@ class BloomFilter:
 
     def memory_bytes(self) -> int:
         return len(self.bits)
+
+
+# ── SimHash (Near-Duplicate Content Detection) ────────────────────────────────
+
+class SimHash:
+    """
+    64-bit SimHash for near-duplicate page detection.
+
+    Algorithm (Charikar 2002, used by Google for web dedup):
+      1. Tokenise page into shingles (word n-grams)
+      2. Hash each shingle to a 64-bit integer
+      3. For each bit position, sum +1 if that bit is 1, -1 if 0
+      4. Final hash: bit i = 1 if sum[i] > 0, else 0
+
+    Two pages are near-duplicates if Hamming distance <= 3.
+    """
+
+    BITS = 64
+
+    @staticmethod
+    def _shingles(text: str, k: int = 3) -> list[str]:
+        words = re.findall(r'\w+', text.lower())
+        return [" ".join(words[i:i + k]) for i in range(len(words) - k + 1)]
+
+    @classmethod
+    def compute(cls, text: str) -> int:
+        v = [0] * cls.BITS
+        for shingle in cls._shingles(text) or [text]:
+            h = mmh3.hash64(shingle, signed=False)[0]
+            for i in range(cls.BITS):
+                v[i] += 1 if (h >> i) & 1 else -1
+        fingerprint = 0
+        for i in range(cls.BITS):
+            if v[i] > 0:
+                fingerprint |= (1 << i)
+        return fingerprint
+
+    @staticmethod
+    def hamming(a: int, b: int) -> int:
+        x = a ^ b
+        count = 0
+        while x:
+            count += x & 1
+            x >>= 1
+        return count
 
 
 # ── robots.txt Parser ─────────────────────────────────────────────────────────
@@ -374,8 +442,8 @@ def phase2_bloom_dedup_demo():
   A Bloom filter is a probabilistic set: it can answer "definitely not seen"
   or "probably seen" — with a tunable false-positive rate.
 
-  At 5B URLs, a plain hash set would need ~200GB RAM.
-  A Bloom filter needs only ~1.2GB for 5B items at 1% FPR.
+  At 5B URLs, a plain hash set would need ~320GB RAM (5B × 64B/URL).
+  A Bloom filter needs only ~5.7GB for 5B items at 1% FPR.
 
   Formula: m = -n*ln(p) / (ln2)^2
     n=5,000,000,000  p=0.01  → m ≈ 47.9B bits ≈ 5.7 GB
@@ -528,8 +596,149 @@ def phase5_trap_detection():
 """)
 
 
-def phase6_scale_math():
-    section("Phase 6: Scale Math — 5B Pages in 2 Weeks")
+def phase6_url_normalization():
+    section("Phase 6: URL Normalization — Collapsing Duplicate URL Variants")
+
+    print("""
+  URL normalization collapses URL variants that point to the same content.
+  Without normalization, the Bloom filter cannot detect these as duplicates.
+
+  Rules applied (in order):
+    1. Lowercase scheme + host  (HTTP://Example.COM → http://example.com)
+    2. Strip fragment           (/page#section → /page)
+    3. Remove session/tracking params (jsessionid, phpsessid, utm_*)
+    4. Sort query params alphabetically (?b=2&a=1 → ?a=1&b=2)
+""")
+
+    test_cases = [
+        (
+            "Scheme + host case",
+            "HTTP://Example.COM/Path",
+            "http://example.com/Path",
+        ),
+        (
+            "Fragment removal",
+            "http://example.com/page#comments",
+            "http://example.com/page",
+        ),
+        (
+            "Session ID stripping",
+            "http://example.com/page?jsessionid=abc123&id=5",
+            "http://example.com/page?id=5",
+        ),
+        (
+            "UTM tracking removal",
+            "http://example.com/article?utm_source=twitter&utm_medium=social&id=9",
+            "http://example.com/article?id=9",
+        ),
+        (
+            "Query param sorting",
+            "http://example.com/search?z=last&a=first&m=mid",
+            "http://example.com/search?a=first&m=mid&z=last",
+        ),
+        (
+            "Combined: session + fragment + sort",
+            "HTTP://Example.COM/page?b=2&sid=XYZ&a=1#top",
+            "http://example.com/page?a=1&b=2",
+        ),
+    ]
+
+    print(f"  {'Case':<35} {'Match?':>7}")
+    print(f"  {'-'*35}  {'-'*7}")
+    all_pass = True
+    for label, raw, expected in test_cases:
+        result = normalize_url(raw)
+        match = result == expected
+        if not match:
+            all_pass = False
+        status = "PASS" if match else "FAIL"
+        print(f"  {label:<35}  {status:>7}")
+        if not match:
+            print(f"    Input:    {raw}")
+            print(f"    Expected: {expected}")
+            print(f"    Got:      {result}")
+
+    print(f"""
+  Normalization ensures these two crawler encounters map to ONE Bloom
+  filter entry — avoiding redundant fetches of the same server resource.
+
+  {'All normalization tests passed.' if all_pass else 'WARNING: some tests failed — check normalize_url().'}
+""")
+
+
+def phase7_simhash_content_dedup():
+    section("Phase 7: SimHash — Near-Duplicate Content Detection")
+
+    print("""
+  URL deduplication (Bloom filter) catches exact URL matches.
+  But the same article often lives at multiple URLs:
+    - /article/123  and  /print/article/123  (printer-friendly mirror)
+    - /2024/01/01/story  and  /story?id=1     (slug vs query-param)
+    - Syndicated content on multiple domains
+
+  SimHash (Charikar 2002): a locality-sensitive hash (LSH) where
+  near-identical texts produce hashes with small Hamming distance.
+
+  Algorithm:
+    1. Tokenise text into 3-word shingles
+    2. Hash each shingle to a 64-bit integer (MurmurHash)
+    3. For each bit position, accumulate +1 (bit=1) or -1 (bit=0)
+    4. Final fingerprint: bit i = 1 iff sum[i] > 0
+
+  Two pages are near-duplicates if Hamming(fp_A, fp_B) <= 3.
+  (3 bits differs in 64 ≈ 95% content similarity)
+""")
+
+    canonical = (
+        "The quick brown fox jumps over the lazy dog near the river bank. "
+        "It was a bright sunny afternoon and the fox had been running all day."
+    )
+    near_dup = (
+        "The quick brown fox jumps over the lazy dog near the river. "
+        "It was a bright sunny afternoon and the fox had been running all day long."
+    )
+    different = (
+        "Distributed systems require careful consideration of consistency and "
+        "availability trade-offs. The CAP theorem states you can only have two "
+        "of consistency, availability, and partition tolerance."
+    )
+    empty = ""
+
+    pages = [
+        ("Canonical article",       canonical),
+        ("Near-duplicate (2 words changed)", near_dup),
+        ("Completely different page",        different),
+        ("Empty page",                       empty),
+    ]
+
+    fps = {}
+    print(f"  Computing SimHash fingerprints:")
+    for label, text in pages:
+        fp = SimHash.compute(text) if text else 0
+        fps[label] = fp
+        print(f"    {label:<40}  fp={fp:016x}")
+
+    canonical_fp = fps["Canonical article"]
+    print(f"\n  Hamming distances from canonical article (threshold = 3):")
+    print(f"  {'Comparison':<40} {'Distance':>10}  {'Near-dup?':>10}")
+    print(f"  {'-'*40}  {'-'*10}  {'-'*10}")
+    for label, _ in pages[1:]:
+        dist = SimHash.hamming(canonical_fp, fps[label])
+        is_dup = dist <= 3
+        print(f"  {label:<40}  {dist:>10}  {'YES' if is_dup else 'no':>10}")
+
+    print("""
+  Production usage (Google/CommonCrawl):
+    - Compute SimHash of page body text after stripping HTML tags
+    - Store fingerprint in Postgres alongside canonical_url
+    - Before indexing: lookup pages with Hamming distance <= 3
+    - Only index the canonical URL; redirect near-dups to it
+    - Saves ~30% index space (web has massive duplicate content)
+""")
+
+
+def phase8_scale_math():
+    section("Phase 8: Scale Math — 5B Pages in 2 Weeks")
 
     print("""
   System design numbers for a Google-scale crawler:
@@ -545,20 +754,37 @@ def phase6_scale_math():
     bandwidth_mbps = pages_per_sec * avg_page_kb * 1024 / 1_000_000
 
     # Bloom filter sizing for 5B URLs
-    import math
     n = total_pages
     p = 0.01
     m_bits = -n * math.log(p) / (math.log(2) ** 2)
     k_hashes = math.ceil((m_bits / n) * math.log(2))
 
-    print(f"  {'Metric':<45} {'Value':>20}")
-    print(f"  {'-'*45}  {'-'*20}")
-    print(f"  {'Pages/day':<45} {pages_per_day:>20,.0f}")
-    print(f"  {'Pages/second':<45} {pages_per_sec:>20,.0f}")
-    print(f"  {'Bandwidth @ 50KB/page':<45} {bandwidth_mbps:>18.0f} MB/s")
-    print(f"  {'Bloom filter size (1% FPR, 5B URLs)':<45} {m_bits/8/1e9:>17.1f} GB")
-    print(f"  {'Optimal hash functions':<45} {k_hashes:>20}")
-    print(f"  {'Bloom memory vs hash set (64B/URL)':<45} {'~6GB vs ~320GB':>20}")
+    # Storage and operational overhead
+    unique_domains = 200_000_000
+    robots_cache_ttl_hours = 24
+    robots_fetches_per_day = unique_domains / robots_cache_ttl_hours / 3600  # per second
+    dns_cache_ttl_s = 300  # 5-minute DNS TTL
+    dns_lookups_per_sec = pages_per_sec / (dns_cache_ttl_s * 10)  # ~10 pages/domain hit cache
+
+    raw_html_storage_tb = (total_pages * avg_page_kb * 1024) / 1e12
+    storage_cost_monthly = raw_html_storage_tb * 1000 * 0.023  # S3 at $0.023/GB
+
+    # Write IOPS: each page fetch = 1 object store write + 1 Postgres row
+    write_iops = pages_per_sec  # Postgres metadata inserts/sec
+
+    print(f"  {'Metric':<52} {'Value':>20}")
+    print(f"  {'-'*52}  {'-'*20}")
+    print(f"  {'Pages/day':<52} {pages_per_day:>20,.0f}")
+    print(f"  {'Pages/second (crawl throughput)':<52} {pages_per_sec:>20,.0f}")
+    print(f"  {'Bandwidth @ 50KB/page':<52} {bandwidth_mbps:>18.0f} MB/s")
+    print(f"  {'Bloom filter size (1% FPR, 5B URLs)':<52} {m_bits/8/1e9:>17.1f} GB")
+    print(f"  {'Optimal hash functions (k)':<52} {k_hashes:>20}")
+    print(f"  {'Bloom memory vs hash set (64B/URL)':<52} {'~6GB vs ~320GB':>20}")
+    print(f"  {'Raw HTML storage (250TB total)':<52} {raw_html_storage_tb:>17.0f} TB")
+    print(f"  {'S3 storage cost/month':<52} ${storage_cost_monthly:>18,.0f}")
+    print(f"  {'Postgres write IOPS (metadata)':<52} {write_iops:>18,.0f}/s")
+    print(f"  {'robots.txt fetches (200M domains, 24h TTL)':<52} {robots_fetches_per_day:>18.0f}/s")
+    print(f"  {'Crawler workers (@ 10 pages/s each)':<52} {pages_per_sec/10:>20,.0f}")
 
     print(f"""
   Distributed crawler architecture:
@@ -583,8 +809,8 @@ def phase6_scale_math():
 """)
 
 
-def phase7_db_summary(conn):
-    section("Phase 7: Crawl Results in Postgres")
+def phase9_db_summary(conn):
+    section("Phase 9: Crawl Results in Postgres")
 
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM crawled_pages")
@@ -647,8 +873,10 @@ def main():
     phase3_politeness()
     phase4_robots_txt()
     phase5_trap_detection()
-    phase6_scale_math()
-    phase7_db_summary(conn)
+    phase6_url_normalization()
+    phase7_simhash_content_dedup()
+    phase8_scale_math()
+    phase9_db_summary(conn)
 
     conn.close()
 
@@ -659,6 +887,8 @@ def main():
   - Per-domain rate limiting prevents overloading servers (politeness)
   - robots.txt compliance is mandatory for ethical crawling
   - Crawler traps (infinite pagination) stopped by depth limit + param check
+  - URL normalization collapses session IDs, tracking params, fragments
+  - SimHash detects near-duplicate content at different URLs (saves ~30% index)
   - At 5B pages: Bloom filter saves ~314GB RAM vs a hash set
 
   Next: 08-search-engine/ — inverting the crawled content into a searchable index

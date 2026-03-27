@@ -6,20 +6,39 @@ services:
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./static:/usr/share/nginx/html:ro
+    # Constrain resources so the experiment reflects realistic server behaviour
+    # rather than an unconstrained host. 256MB is generous for a static file
+    # server but prevents the container from consuming all host memory when
+    # the 10MB payload experiment runs many iterations.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost/health || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
 
+  # The client service exists so you can exec into a container that shares the
+  # Docker network with nginx and run experiments from inside the network
+  # (simulating a service-to-service call rather than host-to-container).
+  #
+  #   docker compose exec client python /workspace/experiment.py
+  #
+  # For local development, running `python experiment.py` directly on the host
+  # against port 8080 is simpler and is the default workflow documented in the
+  # README. The client container is optional.
   client:
     image: python:3.11-slim
     command: sleep infinity
     depends_on:
       nginx:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://nginx/health')"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+    # No healthcheck needed: this container is a utility shell, not a service.
+    # A healthcheck that curls nginx would be testing the wrong container and
+    # create a confusing dependency loop in the compose health graph.
+    volumes:
+      - .:/workspace:ro
+    working_dir: /workspace

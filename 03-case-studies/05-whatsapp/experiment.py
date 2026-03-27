@@ -17,6 +17,7 @@ Run:
 """
 
 import asyncio
+import datetime
 import json
 import os
 import time
@@ -214,7 +215,8 @@ async def phase3_offline_delivery(alice, bob):
         }))
         receipt = await recv_with_timeout(alice, timeout=2.0)
         status = receipt.get("status") if receipt else "unknown"
-        print(f"    '{content[:40]}...' → ACK1 ({status})")
+        preview = content[:40] + ("..." if len(content) > 40 else "")
+        print(f"    '{preview}' → ACK1 ({status})")
         await asyncio.sleep(0.1)
 
     # Verify messages are in Postgres
@@ -238,30 +240,57 @@ async def phase3_offline_delivery(alice, bob):
 
 # ── Phase 4: Reconnect and deliver queued messages ────────────────────────────
 
-async def phase4_reconnect(offline_msgs):
+async def phase4_reconnect(offline_msgs, alice):
     section("Phase 4: Bob Reconnects — Queued Messages Delivered")
 
     print(f"\n  Bob reconnecting...")
     bob = await connect_client("bob")
 
-    # Collect the delivered messages
-    delivered = []
-    for _ in range(len(offline_msgs) + 2):  # +2 for potential extra msgs
-        msg = await recv_with_timeout(bob, timeout=3.0)
-        if msg is None:
-            break
-        if msg.get("type") == "message":
-            delivered.append(msg)
-        elif msg.get("type") == "queued_messages_delivered":
-            print(f"\n  Server: delivered {msg.get('count')} queued messages")
+    # Collect messages Bob receives and ACK2 receipts Alice receives concurrently.
+    # When the server delivers queued messages to Bob it also sends ACK2 to Alice —
+    # this is the 3-ACK model in action: the sender learns of delivery even though
+    # it happened hours after the original send.
+    delivered_to_bob = []
+    ack2_to_alice = []
 
-    print(f"\n  Bob received {len(delivered)} messages on reconnect:")
-    for msg in delivered:
-        print(f"    From {msg.get('from')}: '{msg.get('content', '')[:45]}'")
+    # Poll both connections for a short window
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic())
+
+        # Check Bob
+        bob_msg = await recv_with_timeout(bob, timeout=min(0.3, remaining))
+        if bob_msg:
+            if bob_msg.get("type") == "message":
+                delivered_to_bob.append(bob_msg)
+            elif bob_msg.get("type") == "queued_messages_delivered":
+                print(f"\n  Server: delivered {bob_msg.get('count')} queued messages to Bob")
+
+        # Check Alice for delayed ACK2 receipts
+        alice_msg = await recv_with_timeout(alice, timeout=min(0.3, remaining))
+        if alice_msg and alice_msg.get("type") == "receipt" and alice_msg.get("status") == "delivered":
+            ack2_to_alice.append(alice_msg)
+
+    print(f"\n  Bob received {len(delivered_to_bob)} messages on reconnect:")
+    for msg in delivered_to_bob:
+        preview = msg.get('content', '')[:45]
+        print(f"    From {msg.get('from')}: '{preview}'")
+
+    print(f"\n  Alice received {len(ack2_to_alice)} delayed ACK2 (delivered) receipts:")
+    for receipt in ack2_to_alice:
+        print(f"    msg_id={receipt.get('msg_id')} → status=delivered ✓✓")
+    if not ack2_to_alice:
+        print(f"    (none — Alice may have disconnected before Bob reconnected)")
+
+    print(f"""
+  Key insight: ACK2 (delivered ✓✓) is sent to Alice the moment Bob's device
+  receives the message — even if that's hours after Alice originally sent it.
+  The server is the intermediary for all receipt forwarding.
+""")
 
     r = get_redis()
     bob_online = r.exists("online:bob")
-    print(f"\n  Redis online:bob = {'1 (back online)' if bob_online else '0'}")
+    print(f"  Redis online:bob = {'1 (back online)' if bob_online else '0'}")
 
     # Verify Postgres statuses updated
     conn = get_db()
@@ -288,9 +317,9 @@ async def phase5_presence(alice, bob, carol):
 
     print(f"""
   WhatsApp presence system:
-    Online:   WebSocket connected + Redis key online:{{user_id}} with 90s TTL
-    Offline:  Key expires or explicit delete on disconnect
-    Last seen: stored on disconnect (not shown here — privacy setting)
+    Online:    WebSocket connected + Redis key online:{{user_id}} with 90s TTL
+    Offline:   Key deleted on clean disconnect; expires after 90s on crash
+    Last seen: last_seen:{{user_id}} timestamp written to Redis on disconnect
 
   TTL-based approach:
     Client sends heartbeat every 30s → refreshes Redis TTL to 90s
@@ -302,7 +331,15 @@ async def phase5_presence(alice, bob, carol):
     print(f"  Current presence:")
     for user in users:
         ttl = r.ttl(f"online:{user}")
-        status = f"ONLINE (TTL: {ttl}s)" if ttl > 0 else "OFFLINE"
+        if ttl > 0:
+            status = f"ONLINE (TTL: {ttl}s)"
+        else:
+            last_seen_ts = r.get(f"last_seen:{user}")
+            if last_seen_ts:
+                dt = datetime.datetime.fromtimestamp(int(last_seen_ts))
+                status = f"OFFLINE (last seen: {dt.strftime('%H:%M:%S')})"
+            else:
+                status = "OFFLINE"
         print(f"    {user}: {status}")
 
     # Simulate heartbeats
@@ -407,7 +444,7 @@ async def async_main():
     alice, bob, carol = await phase1_connect()
     await phase2_online_delivery(alice, bob)
     offline_msgs = await phase3_offline_delivery(alice, bob)
-    bob = await phase4_reconnect(offline_msgs)
+    bob = await phase4_reconnect(offline_msgs, alice)
     await phase5_presence(alice, bob, carol)
     await phase6_delivery_guarantees()
 
@@ -424,8 +461,9 @@ async def async_main():
   • WebSocket persistent connections: server maps user_id → socket in memory
   • 3-receipt model: sent (✓) → delivered (✓✓) → read (✓✓ blue)
   • Offline delivery: messages queued in Postgres, delivered on reconnect
-  • Presence: Redis TTL with heartbeat refresh; auto-expires after 90s
-  • At-least-once delivery + UUID idempotency key prevents duplicates
+  • Delayed ACK2: sender gets delivered receipt when recipient reconnects, not at send time
+  • Presence: Redis TTL with heartbeat refresh; auto-expires after 90s; last_seen on disconnect
+  • At-least-once delivery + UUID idempotency key (ON CONFLICT DO NOTHING) prevents duplicates
 
   Next: 06-google-drive/ — chunked upload, delta sync, content deduplication
 """)

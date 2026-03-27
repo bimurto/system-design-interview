@@ -4,15 +4,18 @@ Service Discovery & Coordination Lab — etcd 3-node cluster.
 
 What this demonstrates:
   1. Register 3 "services" with TTL leases
-  2. Watch for service changes (etcd watch)
-  3. Let one service's lease expire → client detects deregistration
-  4. Leader election using etcd transactions (compare-and-swap)
-  5. Leader failure → another candidate takes over
+  2. Watch for service changes (etcd prefix watch)
+  3. Let one service's lease expire → client detects auto-deregistration
+  4. Leader election — concurrent race using atomic CAS transactions
+  5. Leader failure → another candidate takes over via watch
+  6. Fencing tokens — how etcd revision numbers prevent zombie-leader writes
+  7. Summary: registry comparison, Redlock controversy, operational gotchas
 """
 
 import os
 import time
 import threading
+import random
 import etcd3
 
 ETCD_HOST = os.environ.get("ETCD_HOST", "localhost")
@@ -27,11 +30,15 @@ def section(title):
     print("=" * 65)
 
 
+def banner(msg):
+    print(f"\n  >>> {msg}")
+
+
 def get_client():
     return etcd3.client(host=ETCD_HOST, port=2379)
 
 
-# ── Service Registration ───────────────────────────────────────────────────
+# ── Service Registration ────────────────────────────────────────────────────
 
 class Service:
     def __init__(self, name, address, ttl=10):
@@ -50,10 +57,14 @@ class Service:
             self.address,
             lease=self.lease
         )
-        print(f"  Registered: {self.name} → {self.address} (TTL={self.ttl}s)")
+        print(f"  Registered: {self.name} → {self.address} (lease TTL={self.ttl}s)")
 
     def start_heartbeat(self):
-        """Refresh lease every TTL/3 seconds to keep service alive."""
+        """Refresh lease every TTL/3 seconds to keep service alive.
+
+        TTL/3 gives two full missed heartbeats before the lease expires,
+        providing tolerance for transient network hiccups.
+        """
         def heartbeat_loop():
             while not self._stop.is_set():
                 try:
@@ -64,21 +75,30 @@ class Service:
 
         self._thread = threading.Thread(target=heartbeat_loop, daemon=True)
         self._thread.start()
+        print(f"  Heartbeat started for {self.name} (refresh every {self.ttl/3:.1f}s)")
 
     def stop_heartbeat(self):
-        """Stop heartbeat — lease will expire after TTL seconds."""
+        """Stop heartbeat — lease will expire after TTL seconds.
+
+        Models a process that is still running but has stopped renewing its
+        lease (e.g., stuck in a GC pause or network partition).
+        """
         self._stop.set()
-        print(f"  Stopped heartbeat for {self.name} (lease will expire in ~{self.ttl}s)")
+        print(f"  Heartbeat stopped for {self.name} (lease expires in ~{self.ttl}s)")
 
     def deregister(self):
-        """Immediately remove the service."""
+        """Immediately remove the service by revoking the lease.
+
+        Lease revocation is synchronous and immediate — the key disappears
+        the moment the revoke RPC completes. This models graceful shutdown.
+        """
         if self.lease:
             self.lease.revoke()
-        print(f"  Deregistered: {self.name}")
+        print(f"  Deregistered: {self.name} (lease revoked — key removed immediately)")
 
 
 def list_services(client):
-    """Return all currently registered services."""
+    """Return all currently registered services under SERVICE_PREFIX."""
     services = {}
     results = client.get_prefix(SERVICE_PREFIX)
     for value, meta in results:
@@ -87,20 +107,43 @@ def list_services(client):
     return services
 
 
-# ── Leader Election ────────────────────────────────────────────────────────
+def print_services(client, label=""):
+    services = list_services(client)
+    suffix = f" {label}" if label else ""
+    print(f"\n  Registered services{suffix} ({len(services)}):")
+    if services:
+        for name, addr in sorted(services.items()):
+            print(f"    {name:20s} → {addr}")
+    else:
+        print("    (none)")
+    return services
+
+
+# ── Leader Election ─────────────────────────────────────────────────────────
 
 class Candidate:
     def __init__(self, name):
-        self.name   = name
-        self.client = get_client()
-        self.lease  = None
+        self.name      = name
+        self.client    = get_client()
+        self.lease     = None
         self.is_leader = False
+        self.fencing_token = None  # etcd revision of the winning put
 
-    def campaign(self):
-        """Try to become leader using compare-and-swap."""
+    def campaign(self, jitter_ms=0):
+        """Try to become leader using an atomic compare-and-swap transaction.
+
+        The transaction writes the leader key only if its version == 0
+        (i.e., the key does not exist). Exactly one concurrent caller wins.
+        The winner records the etcd revision as a fencing token.
+
+        jitter_ms: optional random sleep before campaigning to avoid
+                   thundering herd when many candidates detect leader death.
+        """
+        if jitter_ms > 0:
+            time.sleep(random.random() * jitter_ms / 1000)
+
         self.lease = self.client.lease(15)
-        # Atomic: put the key only if it doesn't exist
-        success, _ = self.client.transaction(
+        success, responses = self.client.transaction(
             compare=[
                 self.client.transactions.version(LEADER_KEY) == 0
             ],
@@ -110,6 +153,12 @@ class Candidate:
             failure=[]
         )
         self.is_leader = success
+        # Record the fencing token: the etcd revision of the successful write.
+        # Any storage system can use this to reject writes from stale leaders.
+        if success:
+            _, meta = self.client.get(LEADER_KEY)
+            if meta:
+                self.fencing_token = meta.mod_revision
         return success
 
     def get_current_leader(self):
@@ -120,11 +169,15 @@ class Candidate:
         if self.is_leader and self.lease:
             self.lease.revoke()
             self.is_leader = False
-            print(f"  {self.name} resigned leadership (lease revoked)")
+            print(f"  {self.name} resigned leadership (lease revoked → key deleted)")
 
-    def watch_for_takeover(self, timeout=20):
-        """Watch leader key — when current leader dies, campaign."""
-        print(f"  {self.name} watching for leader vacancy...")
+    def watch_for_takeover(self, timeout=20, jitter_ms=200):
+        """Watch the leader key; campaign when current leader's key is deleted.
+
+        jitter_ms: spread campaign attempts to avoid thundering herd.
+        Returns the watcher thread so the caller can join() it.
+        """
+        print(f"  {self.name} watching for leader vacancy (jitter up to {jitter_ms}ms)...")
         start = time.time()
         events_iterator, cancel = self.client.watch(LEADER_KEY)
 
@@ -132,13 +185,16 @@ class Candidate:
             for event in events_iterator:
                 if time.time() - start > timeout:
                     break
-                # Key was deleted (leader resigned/died)
-                if type(event).__name__ == 'DeleteEvent':
-                    print(f"  {self.name} detected leader vacancy! Campaigning...")
-                    if self.campaign():
-                        print(f"  {self.name} is now leader!")
+                # Use isinstance for robust event type checking
+                if isinstance(event, etcd3.events.DeleteEvent):
+                    print(f"  {self.name} detected leader DELETE event — campaigning...")
+                    if self.campaign(jitter_ms=jitter_ms):
+                        print(f"  *** {self.name} won the new election! "
+                              f"(fencing token: revision={self.fencing_token})")
                         cancel()
                         return
+                    else:
+                        print(f"  {self.name} lost the race (another candidate was faster)")
             cancel()
 
         t = threading.Thread(target=watch_thread, daemon=True)
@@ -146,16 +202,21 @@ class Candidate:
         return t
 
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
     section("SERVICE DISCOVERY & COORDINATION LAB")
     print("""
   Architecture: 3-node etcd cluster (Raft consensus)
 
-    etcd0 ←→ etcd1 ←→ etcd2
-      ↑           ↑
-    client      client
+    etcd0 ←──peer──→ etcd1 ←──peer──→ etcd2
+      ↑                  ↑
+    client             client
+    (reads/writes)     (reads/writes)
+
+  Raft guarantees: writes committed only when acknowledged by
+  a majority (2/3 nodes). A minority partition cannot serve
+  consistent reads or accept writes.
 
   Service discovery pattern:
     1. Service registers itself with a TTL lease
@@ -166,8 +227,13 @@ def main():
 
     client = get_client()
 
-    # ── Phase 1: Register services with TTL leases ─────────────────
+    # ── Phase 1: Register services with TTL leases ─────────────────────────
     section("Phase 1: Register 3 Services with TTL Leases")
+    print("""
+  Each service creates a lease with a TTL, then writes its key bound to
+  that lease. If the lease expires (no heartbeat renewal), etcd atomically
+  deletes all keys bound to that lease — no manual cleanup required.
+""")
 
     svc_a = Service("api-server-1", "10.0.0.1:8080", ttl=8)
     svc_b = Service("api-server-2", "10.0.0.2:8080", ttl=8)
@@ -176,145 +242,237 @@ def main():
     svc_a.register()
     svc_b.register()
     svc_c.register()
+    print()
 
-    # Start heartbeats for A and B, but NOT for C (will expire)
+    # Start heartbeats for A and B, but NOT for C (will expire naturally)
     svc_a.start_heartbeat()
     svc_b.start_heartbeat()
-    # svc_c: no heartbeat — will expire after 8s
+    print(f"  NOTE: api-server-3 has NO heartbeat — lease will expire in ~8s")
 
-    services = list_services(client)
-    print(f"\n  Registered services ({len(services)}):")
-    for name, addr in sorted(services.items()):
-        print(f"    {name} → {addr}")
+    print_services(client, "(after registration)")
 
-    # ── Phase 2: Watch for changes ────────────────────────────────
-    section("Phase 2: Watch for Service Changes (etcd watch)")
+    # ── Phase 2: Watch for changes ─────────────────────────────────────────
+    section("Phase 2: Watch for Service Changes (etcd prefix watch)")
+    print("""
+  A prefix watch streams all events (PUT/DELETE) under /services/api/.
+  This is how load balancers and clients keep their routing tables current
+  without polling — event latency is typically <10ms.
+""")
 
     change_log = []
+    watch_ready = threading.Event()
 
     def watch_services():
         events_iterator, cancel = client.watch_prefix(SERVICE_PREFIX)
+        watch_ready.set()
         for event in events_iterator:
             key = event.key.decode().replace(SERVICE_PREFIX, "")
-            event_type = type(event).__name__
             val = event.value.decode() if event.value else ""
-            change_log.append((event_type, key, val, time.time()))
-            if "Delete" in event_type:
-                print(f"  [WATCH] DELETE: {key} (service deregistered!)")
+            ts  = time.strftime("%H:%M:%S")
+            if isinstance(event, etcd3.events.DeleteEvent):
+                change_log.append(("DELETE", key, "", ts))
+                print(f"  [{ts}] WATCH DELETE: {key:20s} ← service deregistered")
             else:
-                print(f"  [WATCH] PUT:    {key} → {val}")
+                change_log.append(("PUT", key, val, ts))
+                print(f"  [{ts}] WATCH PUT:    {key:20s} → {val}")
 
     watcher_thread = threading.Thread(target=watch_services, daemon=True)
     watcher_thread.start()
+    watch_ready.wait(timeout=5)
 
-    print("  Watcher running. Now deregistering api-server-3 and waiting for lease expiry...\n")
-    time.sleep(1)
-
-    # Immediately deregister C
+    banner("Performing explicit deregistration of api-server-3 (graceful shutdown)...")
+    time.sleep(0.5)
     svc_c.deregister()
-    time.sleep(1)
+    time.sleep(1.5)  # let the watch event print before moving on
 
-    services = list_services(client)
-    print(f"\n  Services after deregistration ({len(services)}):")
-    for name, addr in sorted(services.items()):
-        print(f"    {name} → {addr}")
+    print_services(client, "(after explicit deregistration)")
 
-    # ── Phase 3: Let a lease expire naturally ─────────────────────
-    section("Phase 3: Lease Expiry — Service B Stops Heartbeat")
-    print("  Stopping heartbeat for api-server-2 (lease TTL=8s)...")
-    svc_b.stop_heartbeat()
-    print("  Waiting 10s for lease to expire...\n")
-    time.sleep(10)
-
-    services = list_services(client)
-    print(f"  Services after lease expiry ({len(services)}):")
-    for name, addr in sorted(services.items()):
-        print(f"    {name} → {addr}")
-    if "api-server-2" not in services:
-        print("  api-server-2 auto-removed from registry (lease expired)")
-
-    # ── Phase 4: Leader election ───────────────────────────────────
-    section("Phase 4: Leader Election (compare-and-swap)")
+    # ── Phase 3: Let a lease expire naturally ──────────────────────────────
+    section("Phase 3: Lease Expiry — api-server-2 Stops Heartbeat (crash simulation)")
     print("""
-  Three candidates compete for leadership.
-  Etcd transaction: atomically write the leader key only if it's empty.
-  Only one can win — the first to execute the transaction successfully.
+  Stopping the heartbeat models a crashed process that can no longer renew
+  its lease. etcd will wait for the full TTL to elapse before deleting the
+  key. The watch fires a DELETE event automatically — no operator action.
+
+  This is why TTL sizing matters:
+    - Too short (1-2s): healthy services deregister during network blips
+    - Too long (60s):   dead services stay registered, clients get errors
+    - Rule of thumb: TTL = 3-5x heartbeat interval
 """)
 
-    # Clear any stale leader key
+    svc_b.stop_heartbeat()
+    print(f"\n  Waiting 10s for the 8s lease to expire...\n")
+
+    # Count down so the output is clearly tied to time passing
+    for remaining in range(10, 0, -2):
+        time.sleep(2)
+        print(f"  ...{remaining - 2}s remaining" if remaining > 2 else "  ...lease should have expired")
+
+    print()
+    services = print_services(client, "(after lease expiry)")
+    if "api-server-2" not in services:
+        print("\n  api-server-2 was auto-removed — no manual deregistration needed")
+
+    # ── Phase 4: Concurrent leader election ────────────────────────────────
+    section("Phase 4: Leader Election — Concurrent CAS Race")
+    print("""
+  Three candidates campaign concurrently in separate threads.
+  Each executes an atomic etcd transaction:
+
+    IF version(/election/leader) == 0     # key does not exist
+    THEN put(/election/leader, <name>, lease=<lease>)
+    ELSE (no-op)
+
+  Exactly one thread wins — the one whose transaction was ordered first by
+  the etcd leader. All others see version > 0 and lose atomically.
+""")
+
+    # Clean up any stale leader key from a previous run
     try:
         client.delete(LEADER_KEY)
     except Exception:
         pass
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     candidates = [Candidate("node-A"), Candidate("node-B"), Candidate("node-C")]
 
-    results = []
-    for c in candidates:
-        won = c.campaign()
-        results.append((c.name, won))
-        print(f"  {c.name} campaigned: {'WON ELECTION' if won else 'lost (key already set)'}")
+    # Use threads so the race is real — not sequential (sequential always lets node-A win)
+    results = {}
+    campaign_threads = []
 
-    leader_name = next(c.name for c, (n, won) in zip(candidates, results) if won)
-    leader = next(c for c in candidates if c.name == leader_name)
+    def run_campaign(candidate):
+        won = candidate.campaign(jitter_ms=0)  # no jitter — maximize race contention
+        results[candidate.name] = won
+
+    for c in candidates:
+        t = threading.Thread(target=run_campaign, args=(c,))
+        campaign_threads.append(t)
+
+    banner("Starting all 3 campaigns simultaneously...")
+    for t in campaign_threads:
+        t.start()
+    for t in campaign_threads:
+        t.join()
+
+    # Determine winner
+    winner = None
+    for c in candidates:
+        won = results[c.name]
+        status = "WON ELECTION" if won else "lost (key already set by winner)"
+        fencing = f"  fencing token: revision={c.fencing_token}" if won else ""
+        print(f"  {c.name}: {status}{fencing}")
+        if won:
+            winner = c
 
     current = candidates[0].get_current_leader()
-    print(f"\n  Current leader in etcd: {current}")
+    print(f"\n  etcd confirms current leader: {current}")
+    print(f"  (Winner was determined by Raft ordering — whoever's transaction")
+    print(f"   reached the etcd leader first won, regardless of local timing)")
 
-    # ── Phase 5: Leader failure and re-election ───────────────────
-    section("Phase 5: Leader Failure → New Election")
-    print(f"  Current leader: {leader.name}")
-    print(f"  Simulating leader failure (revoking lease)...\n")
+    # ── Phase 5: Leader failure and re-election ────────────────────────────
+    section("Phase 5: Leader Failure → Automatic Re-election")
+    print(f"""
+  Current leader: {winner.name}
+  Simulating leader failure by revoking its lease.
 
-    # Set up watchers for non-leaders
-    non_leaders = [c for c in candidates if c.name != leader.name]
-    watch_threads = [c.watch_for_takeover(timeout=15) for c in non_leaders]
+  Non-leaders are watching the leader key in background threads.
+  When they receive the DELETE event, each campaigns with jitter
+  to avoid the thundering herd problem.
+""")
+
+    non_leaders = [c for c in candidates if c.name != winner.name]
+    watch_threads = [c.watch_for_takeover(timeout=15, jitter_ms=300) for c in non_leaders]
 
     time.sleep(0.5)
-    leader.resign()
-    time.sleep(3)  # Give watchers time to detect and campaign
+    winner.resign()
 
-    current_leader = candidates[0].get_current_leader()
-    print(f"\n  New leader after failure: {current_leader or '(no leader yet — watch fired)'}")
+    # Wait for re-election to complete
+    for t in watch_threads:
+        t.join(timeout=10)
 
-    # ── Phase 6: Summary ──────────────────────────────────────────
-    section("Phase 6: Summary")
+    time.sleep(1)
+    new_leader_name = candidates[0].get_current_leader()
+    new_leader = next((c for c in non_leaders if c.name == new_leader_name), None)
+    if new_leader_name:
+        print(f"\n  New leader: {new_leader_name} "
+              f"(fencing token: revision={new_leader.fencing_token if new_leader else 'N/A'})")
+    else:
+        print(f"\n  No leader yet — election still in progress")
+
+    # ── Phase 6: Fencing tokens ────────────────────────────────────────────
+    section("Phase 6: Fencing Tokens — Preventing Zombie Leader Writes")
+    print("""
+  Problem: A leader pauses (GC, network) → lease expires → new leader elected.
+  Old leader resumes, thinks it's still leader, and writes to storage.
+  Result: two simultaneous "leaders" — data corruption.
+
+  Solution: fencing tokens (etcd revision numbers are monotonically increasing).
+
+    Timeline:
+      t=0   node-A wins election. etcd revision = 42 (fencing token).
+            Storage system records: "last accepted token = 42"
+
+      t=5   node-A stalls (GC pause). Lease expires.
+      t=6   node-B wins election. etcd revision = 57 (new fencing token).
+            Storage system records: "last accepted token = 57"
+
+      t=10  node-A resumes. Sends write with its token (revision=42).
+            Storage system rejects: 42 < 57 → this is a stale write.
+
+      t=10  node-B sends write with its token (revision=57).
+            Storage system accepts: 57 == 57 → valid write.
+
+  Key insight: the storage system — not the leader — enforces correctness.
+  The leader cannot prevent itself from being a zombie; the storage layer must.
+""")
+
+    # Demonstrate by reading the current fencing token from etcd
+    _, meta = client.get(LEADER_KEY)
+    if meta:
+        print(f"  Current leader key revision (fencing token): {meta.mod_revision}")
+        print(f"  Any write with revision < {meta.mod_revision} would be rejected")
+        print(f"  (In practice: your storage system must check this; etcd does not enforce it)")
+    else:
+        print(f"  (Leader key not present — election may still be in progress)")
+
+    print("""
+  NOTE: Redlock (Redis-based distributed lock) does NOT provide fencing tokens.
+  Martin Kleppmann (2016) showed Redlock is unsafe under:
+    - Clock skew between Redis nodes
+    - GC pauses causing lease expiry mid-critical-section
+  Antirez (Redis author) disputed the severity.
+  Consensus: use etcd (fencing tokens via revision) when correctness is critical.
+""")
+
+    # ── Phase 7: Watch event summary + comparison ──────────────────────────
+    section("Phase 7: Event Log & Registry Comparison")
+
+    print(f"\n  Watch events captured during this run ({len(change_log)}):")
+    print(f"  {'Time':10s} {'Type':8s} {'Service'}")
+    print(f"  {'-'*10} {'-'*8} {'-'*30}")
+    for evt_type, key, val, ts in change_log:
+        detail = f"→ {val}" if evt_type == "PUT" else "(removed)"
+        print(f"  {ts:10s} {evt_type:8s} {key:20s} {detail}")
+
     print(f"""
-  Service Discovery patterns:
-  ┌────────────────────────────────────────────────────────────┐
-  │ Client-side  │ Client queries registry, picks instance     │
-  │              │ + No single point of failure                │
-  │              │ - Client must have discovery logic          │
-  │──────────────│─────────────────────────────────────────────│
-  │ Server-side  │ Load balancer queries registry transparently│
-  │              │ + Simple clients                            │
-  │              │ - LB is a single point of failure           │
-  └────────────────────────────────────────────────────────────┘
+  Service Registry Comparison:
+  ┌──────────────┬────────────┬─────────────────────────┬──────────────────┐
+  │ Registry     │ Model      │ Health Checks           │ Key Use Case     │
+  ├──────────────┼────────────┼─────────────────────────┼──────────────────┤
+  │ etcd         │ CP (Raft)  │ App-level TTL heartbeat │ Kubernetes, k/v  │
+  │ Consul       │ CP + AP    │ Built-in HTTP/TCP/script│ Service mesh, DC │
+  │ ZooKeeper    │ CP (ZAB)   │ Session timeout (manual)│ Kafka, Hadoop    │
+  │ Eureka       │ AP         │ Client self-report       │ Netflix, spring  │
+  └──────────────┴────────────┴─────────────────────────┴──────────────────┘
 
-  Registry comparison:
-    etcd    → CP (Raft), low latency, watches, used in Kubernetes
-    Consul  → CP + health checks built in, DNS interface, ACLs
-    Zookeeper → CP (ZAB), mature, complex, used in Kafka/Hadoop
+  Operational gotchas (staff-level knowledge):
+    1. TTL too short  → false deregistrations during transient network issues
+    2. No watch compaction handling → silent event loss on reconnect (ErrCompacted)
+    3. No jitter on re-election → thundering herd saturates etcd on leader death
+    4. No client-side cache → service discovery outage = full traffic blackout
+    5. Zombie leaders → must use fencing tokens; the registry alone is not enough
 
-  Key insight: etcd is CP — during a network partition, the minority
-  partition rejects writes (and may reject reads). Services in the
-  minority partition won't be discoverable until partition heals.
-
-  Leader election pattern:
-    1. Candidates race to write a key (with their name) + lease
-    2. Only one wins (atomic compare-and-swap)
-    3. Winner heartbeats the lease to stay leader
-    4. On crash: lease expires, key deleted, others detect via watch
-    5. New election happens automatically
-
-  Distributed locks (Redlock controversy):
-    Redis Redlock: acquire lock on N/2+1 Redis nodes simultaneously
-    Martin Kleppmann (2016): Redlock is unsafe under clock skew / GC pauses
-    Antirez (Redis author) disagreed — debate is still active
-    Safe alternative: use etcd (fencing tokens) for strong guarantees
-
-  Next: ../14-idempotency-exactly-once/
+  Next: ../15-idempotency-exactly-once/
 """)
 
 

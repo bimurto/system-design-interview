@@ -175,30 +175,41 @@ Example: 1MB file, 50ms RTT, 10Mbps link:
 
 **TCP connection storms on service restart:** When a heavily loaded service restarts, all clients attempt to reconnect simultaneously. Thousands of TCP handshakes + TLS handshakes + application-level authentication hit the server at once while it is still warming up. This can trigger the server to crash again immediately (thundering herd). Mitigations: exponential backoff with jitter in clients, connection pools that reconnect gradually, or health-check gates that hold traffic until the service is ready.
 
+**TCP TIME_WAIT accumulation and port exhaustion:** When a TCP connection is closed, the active closer holds the socket in TIME_WAIT for 2×MSL (typically 60–120 seconds) to ensure any delayed packets are absorbed. A service making 1,000 new connections per second accumulates up to 60,000–120,000 TIME_WAIT sockets. The default Linux ephemeral port range (~28,000 ports: 32768–60999) is smaller — the result is port exhaustion and `EADDRNOTAVAIL` errors on new connection attempts. Primary mitigation: connection pooling (keep-alive). Secondary: `SO_REUSEADDR`, `net.ipv4.tcp_tw_reuse=1`. Never use `net.ipv4.tcp_tw_recycle` — it is broken under NAT and was removed in Linux 4.12.
+
+**Kubernetes ndots:5 DNS amplification:** By default, Kubernetes sets `ndots: 5` in pod resolv.conf. A hostname with fewer than 5 dots (e.g. `redis`, `api`) triggers up to 5 search-domain suffix lookups before the absolute name is tried — multiplying DNS query volume by up to 5x per connection. On microservice meshes with hundreds of services making thousands of calls per second, this becomes a meaningful CoreDNS load spike. Mitigation: use FQDNs (trailing dot: `redis.default.svc.cluster.local.`) or reduce `ndots` in your pod spec.
+
 ---
 
 ## Interview Talking Points
 
-- "A CDN reduces latency by moving content closer to users — the speed of light is the limit. You can't reduce the propagation delay between New York and Tokyo no matter how fast your servers are."
-- "HTTP/2 multiplexing solves head-of-line blocking at the application layer but not at the TCP layer — HTTP/3/QUIC solves it at transport by running independent streams over UDP."
-- "WebSockets for bidirectional real-time communication, SSE for server-to-client push (simpler, HTTP-native), long polling only as a fallback for legacy/firewall-constrained environments."
-- "DNS TTL is a cache — during incidents, high TTL means slow cutover. Always check your TTL before a migration."
-- "Bandwidth is cheap; latency is physics — you can buy more bandwidth but you can't move servers closer to users for free. The solution to latency is geographic distribution, not better hardware."
+- "A CDN reduces latency by moving content closer to users — the speed of light is the limit. You can't reduce the propagation delay between New York and Tokyo no matter how fast your servers are. The only lever is geographic distribution."
+- "HTTP/2 multiplexing solves head-of-line blocking at the application layer but not at the TCP layer — a single lost TCP segment still blocks all multiplexed streams. HTTP/3/QUIC solves it at transport: each QUIC stream handles its own retransmission independently."
+- "WebSockets for bidirectional real-time communication, SSE for server-to-client push (simpler, HTTP-native, auto-reconnect, works through proxies), long polling only as a fallback for legacy/firewall-constrained environments."
+- "DNS TTL is a cache — during incidents, high TTL means slow cutover. Always check (and pre-lower) your TTL before a planned migration. A TTL of 3600s means clients will hit an old IP for up to an hour after a change."
+- "Bandwidth is cheap; latency is physics — you can buy more bandwidth but you can't move servers closer to users for free. The solution to latency is geographic distribution, not better hardware or bigger pipes."
+- "Connection pooling solves two problems at once: it eliminates TCP handshake overhead on every request AND prevents TIME_WAIT port exhaustion at high connection churn rates. Any service hitting a database or upstream API without connection pooling is leaving performance on the table."
+- "TCP slow-start means a brand-new connection transmits conservatively (initial cwnd ≈ 10 segments ≈ 14KB) and ramps up. Short-lived connections never leave slow-start — which is why HTTP/1.1's one-request-per-connection model was so costly, and why keep-alive / HTTP/2 multiplexing matter."
+- "Kubernetes ndots:5 means a short hostname triggers up to 5 DNS lookups before resolving. On a high-traffic service mesh this is a meaningful CoreDNS load multiplier. Use FQDNs or reduce ndots in production."
 
 ---
 
 ## Hands-on Lab
 
-**Time:** ~20–30 minutes
-**Services:** nginx (HTTP server)
+**Time:** ~25–35 minutes
+**Services:** nginx (HTTP server serving static payloads of 1KB, 100KB, 1MB, 10MB)
 
 ### Setup
 
 ```bash
+# Generate static payload files (idempotent — safe to run multiple times)
+python create_static.py
+
+# Start nginx
 docker compose up -d
 ```
 
-Wait ~5 seconds for nginx to be ready.
+Wait ~10 seconds for the nginx health check to pass (the compose file polls `/health` before marking the service ready).
 
 ### Experiment
 
@@ -206,28 +217,30 @@ Wait ~5 seconds for nginx to be ready.
 python experiment.py
 ```
 
-The experiment runs four phases:
+The experiment runs five phases:
 
-1. **Latency baseline** — measures raw TCP connection time vs first-byte time to quantify handshake overhead
-2. **New connection vs keep-alive** — opens a new TCP connection for each request vs reusing one connection, demonstrating the cost of repeated handshakes
-3. **Payload size vs transfer time** — sends requests for payloads of varying sizes to show the crossover point from latency-dominated to bandwidth-dominated transfer
-4. **DNS resolution timing** — times the resolver lookup separately from the TCP connect to isolate DNS overhead
+1. **Latency numbers** — reference table of canonical latency figures with design implications
+2. **New connection vs keep-alive** — 20 requests each, per-request timing printed so you can see variance; computes speedup ratio and total time saved
+3. **Bandwidth vs latency crossover** — 1KB, 100KB, 1MB, 10MB payloads; reports avg, min/max, and throughput in Mbps so the crossover from latency-dominated to bandwidth-dominated is visible
+4. **DNS resolution timing** — measures IP literal vs `/etc/hosts` lookup; explains what the same test would show for an uncached external hostname
+5. **TCP TIME_WAIT accumulation** — creates 40 rapid short-lived connections, then queries `netstat`/`ss` to count TIME_WAIT sockets and explain port exhaustion risk
 
 ### Break It
 
-Stop nginx mid-experiment to observe connection refused errors:
+Stop nginx mid-experiment to observe connection-refused errors:
 
 ```bash
 docker compose stop nginx
 ```
 
-Re-run `python experiment.py` and observe that new-connection attempts fail immediately with `ConnectionRefusedError` while the keep-alive path shows the connection was already closed.
+Re-run `python experiment.py`. New-connection attempts in Phase 2 fail immediately with `ConnectionRefusedError`. The keep-alive connection in Phase 2 raises `RemoteDisconnected` (the server closed the already-established socket). This mirrors what happens during a rolling deploy with no graceful drain.
 
 ### Observe
 
-- Compare new-connection timing vs keep-alive timing — keep-alive should be consistently faster by ~1 RTT
-- Watch the latency numbers table: small payloads show nearly constant time (latency-bound); large payloads show time growing linearly with size (bandwidth-bound)
-- DNS resolution time appears once and is then cached — subsequent requests pay zero DNS cost
+- Keep-alive speedup should be 2–5× on localhost; on a WAN link with 20ms RTT the ratio is larger
+- The 10MB payload should show a visibly higher transfer time than 1MB, making the bandwidth-dominated regime clear even on loopback
+- TIME_WAIT socket count correlates with how many connections were opened; watch it decay over 60 seconds if you re-run the netstat query manually
+- The throughput column in Phase 3 shows Mbps achieved on loopback; on a 10Mbps WAN link that number would cap out at ~10 Mbps and the transfer times would be 100–1000× larger
 
 ### Teardown
 

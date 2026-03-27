@@ -28,11 +28,15 @@ The simplest replication model is **leader-follower** (also called primary-repli
 6. Replica replays the WAL entries against its local data copy, advancing its Log Sequence Number (LSN)
 7. The gap between the primary's current LSN and the replica's replayed LSN is the **replication lag** — the key health metric to monitor
 
-**PostgreSQL streaming replication** works via the Write-Ahead Log (WAL). Every write operation is first durably written to the WAL (a sequential log on disk). The WAL is then streamed to replicas via a persistent TCP connection. Replicas apply WAL entries in order, keeping their state exactly synchronized with the primary. Because the WAL contains every state transition, replicas are byte-for-byte identical to the primary at a given LSN (Log Sequence Number). The `pg_replication_slots` mechanism ensures replicas don't fall too far behind by blocking WAL cleanup on the primary.
+**Replication lag** is the gap between the primary's current LSN and the replica's applied LSN, expressed as bytes or time. Monitoring this is critical: a replica with 10 minutes of lag cannot be promoted without data loss during a primary failure. `pg_stat_replication` exposes `write_lag`, `flush_lag`, and `replay_lag` for each replica. Use `pg_wal_lsn_diff(sent_lsn, replay_lsn)` for byte-level lag.
 
-**Replication lag** is the gap between the primary's current LSN and the replica's applied LSN, expressed as bytes or time. Monitoring this is critical: a replica with 10 minutes of lag cannot be promoted without data loss during a primary failure. pg's `pg_stat_replication` view exposes `write_lag`, `flush_lag`, and `replay_lag` for each replica.
+**`synchronous_commit` vs. synchronous replication** are frequently confused. `synchronous_commit` is a *session-level* parameter controlling whether a `COMMIT` waits for the WAL to be flushed to the *primary's* local disk. Setting it to `off` defers the local fsync by up to `wal_writer_delay` (200ms default) — a small durability risk on primary crash only, with a significant latency gain. Replication to replicas proceeds independently regardless of `synchronous_commit`. Synchronous *replication* (where the primary waits for a *replica* to confirm) is controlled by `synchronous_standby_names`. The two are orthogonal and commonly misunderstood in interviews.
 
 **The split-brain problem** occurs when a primary fails and a new leader is elected while the old primary is still running (it's merely unreachable, not crashed). Both nodes believe they are the primary and accept writes. When connectivity is restored, the two histories must be reconciled, and one side's writes must be discarded. **Fencing tokens** prevent this: the old primary receives a token during its tenure; the new primary uses a higher token. Storage systems reject writes with stale tokens, preventing the zombie primary from accepting any writes.
+
+**Read-your-own-writes (RYOW) consistency** is broken when a client writes to the primary and then reads from an async replica before the WAL has been applied. The client just created a record, but the replica returns "not found." This is a correctness issue, not a performance issue. Common mitigations: (1) route reads-after-writes to the primary for the remainder of that session, (2) compare the client's last write LSN against `pg_last_wal_replay_lsn()` on the replica before routing the read there, or (3) use a sync replica for reads that require monotonic guarantees.
+
+**Physical vs. logical replication:** Physical (WAL-level) replication copies raw block changes — replicas are byte-for-byte identical and cannot serve a different PostgreSQL major version or replicate a subset of tables. Logical replication (introduced in PostgreSQL 10) replicates SQL-level row changes and supports: partial replication (select tables), cross-version upgrades, and fan-out to heterogeneous subscribers (e.g., a data warehouse). The trade-off is higher CPU overhead and no support for DDL changes automatically.
 
 **Write amplification** in replication: a single logical write to the primary becomes N writes (primary + N replicas). For write-heavy workloads, this can be a significant overhead. Optimized replication (e.g., compression, batching WAL entries) reduces the overhead.
 
@@ -56,11 +60,13 @@ The simplest replication model is **leader-follower** (also called primary-repli
 
 ## Interview Talking Points
 
-- "Async replication is fast but has a durability window — data acknowledged to the client may not be on any replica yet. Sync replication eliminates that window at the cost of latency"
-- "Replication lag is the key operational metric for replica health — monitor write_lag, flush_lag, replay_lag in pg_stat_replication"
-- "The split-brain problem requires a fencing mechanism — either a quorum-based leader election (Raft/Paxos) or external coordination (ZooKeeper)"
-- "Multi-leader solves geo-distributed write latency but introduces write conflicts — LWW discards data, CRDTs merge it without coordination"
-- "WAL shipping in PostgreSQL means replicas are physically identical to the primary at a given LSN — logical replication (by contrast) replicates SQL-level changes and allows partial replication"
+- "Async replication is fast but has a durability window — data acknowledged to the client may not be on any replica yet. Sync replication eliminates that window at the cost of latency. In PostgreSQL, `synchronous_standby_names` controls this at the replication level, while `synchronous_commit=off` is a separate per-session setting that only defers WAL fsync on the *primary's* local disk — they are orthogonal knobs."
+- "Replication lag is the key operational metric for replica health — monitor `write_lag`, `flush_lag`, `replay_lag` in `pg_stat_replication`, or use `pg_wal_lsn_diff(sent_lsn, replay_lsn)` for byte-level lag per replica."
+- "The split-brain problem requires a fencing mechanism — either a quorum-based leader election (Raft/Paxos) or external coordination (ZooKeeper/etcd). Patroni uses etcd; AWS RDS uses its own distributed lease mechanism."
+- "Multi-leader solves geo-distributed write latency but introduces write conflicts — LWW (last-write-wins) silently discards data, CRDTs merge without coordination but only work for commutative operations, application-level merging is correct but expensive."
+- "Physical WAL replication makes replicas byte-for-byte identical but can only replicate the entire cluster to the same major version. Logical replication (pg 10+) is row-level and enables cross-version upgrades, partial replication, and heterogeneous subscribers — useful for live migrations and ETL fan-out."
+- "Read-your-own-writes is broken by default with async replicas — a client that writes to primary then reads from an async replica may see a stale snapshot. Solutions: sticky-primary routing for that session, LSN-based read routing (`pg_last_wal_replay_lsn()`), or a synchronous standby for read traffic that requires monotonic guarantees."
+- "Replication slot bloat is a silent killer: an unused slot holds WAL on the primary indefinitely. Set `max_slot_wal_keep_size` and alert on `pg_replication_slots` where `inactive = true`."
 
 ## Hands-on Lab
 
@@ -81,7 +87,7 @@ docker compose up -d
 python experiment.py
 ```
 
-The script installs `psycopg2-binary` if needed, then runs five phases: schema setup, write throughput measurement, async replication lag simulation (replica lags behind primary by a batch), read scaling comparison (primary-only vs distributed), and graceful degradation when replica2 is stopped.
+The script installs `psycopg2-binary` if needed, then runs eight phases: schema setup, live `pg_stat_replication` output, write throughput comparing `synchronous_commit=ON` vs `OFF`, real replication lag measurement (sentinel-row probe), a read-your-own-writes violation demonstration, concurrent read throughput scaling across all nodes, replica failure with graceful degradation, and replica reconnection with WAL catchup.
 
 ### Break It
 
@@ -116,7 +122,11 @@ docker compose start postgres-primary
 
 ### Observe
 
-The read scaling phase shows throughput improvement from distributing reads. The replication lag phase shows the primary having more rows than the replica for a brief window — the core practical consequence of async replication.
+- **Phase 3** shows `synchronous_commit=OFF` is typically 1.5–3x faster than `ON` on a local Docker setup (the gap is larger on real storage). Note that this is purely a primary-local durability trade-off; it does not change how replication works.
+- **Phase 4** shows real WAL streaming latency — typically sub-millisecond on localhost, which illustrates how fast async replication can be under low load.
+- **Phase 5** demonstrates the read-your-own-writes hazard: the row written to primary may not yet be visible on a replica queried immediately after.
+- **Phase 6** shows concurrent read throughput scaling — threads against primary+replicas achieve close to N× the single-primary throughput.
+- **Phases 7–8** show `pg_stat_replication` drop from 2 connected replicas to 1, then return to 2 with zero lag after WAL replay.
 
 ### Teardown
 
@@ -132,7 +142,9 @@ docker compose down -v
 
 ## Common Mistakes
 
+- **Confusing `synchronous_commit` with synchronous replication.** `synchronous_commit=off` only defers WAL fsync on the *primary's local disk*; it has nothing to do with whether replicas are synchronous or asynchronous. Many engineers think "I turned off synchronous_commit so replication is async now" — it was already async. The actual knob for replica synchrony is `synchronous_standby_names`.
 - **Not monitoring replication lag.** A replica that is 30 minutes behind is useless for real-time reads and dangerous for failover. Set alerts at meaningful thresholds (e.g., > 30s lag = warning, > 5 min = critical).
 - **Assuming replica promotion is instantaneous.** In async replication, promoting a replica means accepting that some writes may be lost. The application must handle this (retry, re-read, inform the user). Automatic failover tools like Patroni or Orchestrator handle the mechanics, but the data loss window is not zero.
-- **Replication slots left dangling.** When a replica is decommissioned, its replication slot must be dropped. Otherwise the primary accumulates WAL indefinitely. This is a common cause of primary disk exhaustion in PostgreSQL deployments.
+- **Ignoring read-your-own-writes violations.** Routing reads to replicas without session-level monotonic guarantees breaks the most basic user expectation: "I just created it, why is it missing?" Implement sticky-primary routing or LSN-based read routing before deploying read replicas in production.
+- **Replication slots left dangling.** When a replica is decommissioned, its replication slot must be dropped. Otherwise the primary accumulates WAL indefinitely. This is a common cause of primary disk exhaustion in PostgreSQL deployments. Always set `max_slot_wal_keep_size` as a safety cap.
 - **Treating multi-leader as a solution to everything.** Multi-leader replication is complex and conflicts are hard to resolve correctly. Use it only when geo-distributed write latency is a real business requirement, not as a premature optimization.

@@ -109,6 +109,12 @@ Configuration management is a natural extension of service registries. etcd and 
 
 **Leader liveness false positive — GC pauses and the Redlock problem:** A leader holds a lease with a 10-second TTL. A JVM GC pause causes the leader process to freeze for 12 seconds. The lease expires; another node wins the election. The GC resumes; the old leader thinks it is still leader and continues writing. Both nodes believe they are the leader simultaneously. Mitigation: use fencing tokens (etcd's revision-based approach) so storage systems can reject writes from the old leader.
 
+**Thundering herd on leader failure:** In a large cluster with hundreds of services watching the leader key, a leader failure causes every watcher to simultaneously fire a DELETE event, and every candidate immediately campaigns. The resulting transaction storm can overwhelm etcd. Mitigation: add randomised jitter before campaigning (e.g., `sleep(random(0, 500ms))`) so candidates stagger their campaign attempts. Most distributed coordination libraries implement this automatically.
+
+**Watch history compaction:** etcd compacts its event history periodically (controlled by `--auto-compaction-retention`). A watcher that was disconnected (network blip, client restart) and attempts to resume watching from an old revision may receive an `ErrCompacted` error — events in the gap are gone. The client must detect this error, perform a full GET to re-sync the current state, and then re-establish the watch from the current revision. Failing to handle compaction errors causes a watcher to silently miss registration or deregistration events.
+
+**Service mesh as an alternative to client-side registry queries:** Envoy/Istio and similar sidecar proxies intercept all outbound traffic and perform discovery internally, communicating with a control plane (xDS API) rather than querying etcd or Consul directly. The application code is completely unaware of service discovery. This eliminates the discovery client library from every service but adds operational complexity (the sidecar itself must be healthy).
+
 ## Interview Talking Points
 
 - "Service discovery solves the problem of locating service instances in a dynamic environment where IPs and ports change. The registry is a live directory; services register with TTL leases and heartbeat to stay registered."
@@ -117,6 +123,10 @@ Configuration management is a natural extension of service registries. etcd and 
 - "Consul has built-in health checks (HTTP, TCP, script) unlike etcd which requires application-level TTL heartbeats. For service discovery specifically, Consul's health check model is more operationally convenient."
 - "Distributed locks are harder than they look — the Redlock controversy (Kleppmann vs Antirez, 2016) shows that clock skew and GC pauses can cause two processes to simultaneously believe they hold a lock. Fencing tokens solve this by making storage systems reject stale writes."
 - "Kubernetes stores all cluster state in etcd. Every pod spec, service definition, and ConfigMap is an etcd key. This is why etcd availability is critical — an etcd outage means the Kubernetes API server is down and no scheduling decisions can be made."
+- "Fencing tokens are etcd's answer to the zombie leader problem. Every successful write to etcd returns a monotonically increasing revision number. Storage systems that accept writes from the leader can track the highest revision they've seen and reject any write with a lower revision — even if the write comes from a process that believes it is still leader."
+- "Watch compaction is an operational gotcha: etcd periodically deletes old event history. A watcher that reconnects after a network outage and tries to resume from a stale revision will receive ErrCompacted. You must catch this, do a full GET to re-sync, and re-subscribe from the current revision. Missing this causes silent event loss."
+- "For modern microservices, service mesh sidecars (Envoy, Linkerd) push discovery entirely out of application code. The sidecar intercepts all traffic and talks to a control plane that watches the registry. Applications have zero discovery logic — but you've traded code complexity for infrastructure complexity."
+- "TTL sizing is a real trade-off: a short TTL (2s) means dead services are removed quickly but a brief network hiccup causes healthy services to disappear from the registry. A long TTL (60s) tolerates network noise but means dead services stay registered for up to 60 seconds, causing client errors. Rule of thumb: TTL = 3-5x heartbeat interval, and handle 503s with retries rather than relying solely on the registry to be perfectly current."
 
 ## Hands-on Lab
 
@@ -126,20 +136,21 @@ Configuration management is a natural extension of service registries. etcd and 
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/13-service-discovery-coordination/
+cd system-design-interview/02-advanced/14-service-discovery-coordination/
 docker compose up
 ```
 
 ### Experiment
 
-The script runs six phases automatically:
+The script runs seven phases automatically:
 
 1. Registers 3 services (`api-server-1`, `-2`, `-3`) with TTL=8s leases. Services 1 and 2 start heartbeat threads; service 3 does not.
 2. Sets up a prefix watcher on `/services/api/` that prints events as they arrive. Immediately deregisters service 3 (lease revoked).
 3. Stops heartbeat for service 2 and waits 10 seconds — the lease expires naturally and the watch fires a DELETE event.
-4. Three election candidates race to write `/election/leader` using an atomic etcd transaction. Exactly one wins; the others see the key already set.
+4. Three election candidates race concurrently (each in its own thread) to write `/election/leader` using an atomic etcd transaction. Exactly one wins; the others see the key already set.
 5. The current leader revokes its lease. The other two candidates are watching the key — one detects the DELETE and wins the new election.
-6. Prints a summary table comparing etcd, Consul, and ZooKeeper, and explains the Redlock controversy.
+6. Demonstrates fencing tokens: shows how etcd's monotonically increasing revision number prevents a "zombie" old leader from overwriting the new leader's data.
+7. Prints a summary table comparing etcd, Consul, and ZooKeeper, and explains the Redlock controversy.
 
 ### Break It
 
@@ -185,3 +196,6 @@ docker compose down
 - **Not handling the discovery service going down.** If your service discovery layer is unavailable, services must still be able to route requests using a cached copy of the last known service list. Always cache discovered addresses locally and fall back to the cache on registry unavailability.
 - **Using ZooKeeper for new projects.** ZooKeeper is mature but complex to operate — it requires a separate JVM process, uses a custom binary protocol, and has complex failure semantics. For new systems, etcd (simpler, Kubernetes-native) or Consul (richer features) are better choices.
 - **Conflating service discovery with load balancing.** Service discovery tells you which instances exist and are healthy. Load balancing decides which instance to send a given request to. These are separate concerns — discovery gives you the pool, load balancing picks from the pool using round-robin, least-connections, or weighted policies.
+- **Not handling watch compaction errors.** A watcher that disconnects and reconnects with a stale revision receives `ErrCompacted` from etcd. If the code doesn't explicitly handle this error by re-syncing the current state with a GET and re-subscribing, the watcher silently misses all events that occurred during the gap — including registrations and deregistrations. This is one of the most common production bugs in etcd-based service discovery.
+- **No jitter in leader election campaigns.** When a leader dies and 50 candidates simultaneously detect the DELETE event and campaign at the same instant, the resulting transaction storm can saturate etcd. Add randomised sleep jitter (0–500ms) before each campaign attempt to spread the load. Production-grade coordination libraries (etcd's own concurrency package, Curator for ZooKeeper) handle this automatically.
+- **Treating the service registry as a real-time oracle.** Even with watches, there is a propagation delay between a service crashing and all clients removing it from their routing tables. Clients must be built to retry on failure and handle 503s gracefully — the registry is eventually consistent from the client's perspective even when the registry itself is strongly consistent.

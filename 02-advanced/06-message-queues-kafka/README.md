@@ -67,6 +67,31 @@ Consumer groups provide horizontal scalability for consumption. Each consumer in
 - Followers asynchronously replicate from the leader.
 - ISR (In-Sync Replicas): the set of replicas that are fully caught up. When `acks=all`, the producer waits for all ISR replicas to acknowledge.
 - If the leader fails, the Kafka controller elects a new leader from the ISR set.
+- **Unclean leader election:** if `unclean.leader.election.enable=true` (default: false since Kafka 0.11), Kafka may elect an out-of-sync replica as leader during ISR exhaustion — trading data loss for availability. This is a durability vs. availability trade-off you must explicitly decide at topic creation.
+
+**KRaft mode (Zookeeper replacement):**
+Kafka 3.3+ (Confluent 7.3+) introduced KRaft (Kafka Raft) as a production-ready replacement for Zookeeper. In KRaft mode, a set of Kafka brokers themselves act as the metadata quorum (using a Raft-based protocol), eliminating Zookeeper as an operational dependency.
+- **Why it matters in interviews:** Zookeeper was the most common ops complaint about Kafka — separate JVM cluster, separate monitoring, separate failure domain. KRaft removes all of that.
+- KRaft reduces partition leader election time from minutes (Zookeeper) to seconds.
+- Supports up to 10x more partitions per cluster than Zookeeper-based Kafka.
+- This lab uses the Zookeeper-based stack for compatibility, but note KRaft is now the standard for new deployments.
+
+**Consumer lag and offset management:**
+Consumer lag is the difference between the partition's latest offset (log-end offset) and the consumer group's committed offset for that partition. It is the primary operational metric for Kafka consumer health.
+```
+  Log-end offset:           offset 1000
+  Consumer committed:       offset 850
+  Lag:                      150 messages
+```
+- Monitor with `kafka-consumer-groups.sh --describe --group <group>` or the `kafka.consumer.consumer-fetch-manager-metrics` JMX metrics.
+- Alert on lag *growth rate*, not absolute lag. A stable lag of 10,000 messages is fine; a lag growing at 1,000 messages/minute will eventually exhaust retention.
+- **Dead letter topic pattern:** when a consumer cannot process a message (deserialization error, schema mismatch, downstream failure), retrying indefinitely blocks progress on that partition. The solution is to route poison-pill messages to a dead letter topic (e.g., `orders.DLT`) after N retries, allowing the consumer to advance its offset and continue. The DLT is monitored separately for manual remediation or reprocessing.
+```
+  Normal flow:  orders → Consumer → process → commit offset
+  Failure flow: orders → Consumer → fail 3x → orders.DLT → commit offset
+                                                     ↓
+                                             Alert + manual fix
+```
 
 ### Trade-offs
 
@@ -89,14 +114,23 @@ Consumer groups provide horizontal scalability for consumption. Each consumer in
 
 **Log compaction race:** for compacted topics (used for change-data capture), the compaction lag (time between original write and compaction) can be large. A consumer that reads rarely may see many old versions of a key before the compacted "latest" version. Compaction also requires careful configuration of `min.cleanable.dirty.ratio` and `segment.ms` to run frequently enough.
 
+**Unclean leader election causing silent data loss:** if all ISR replicas go down simultaneously (e.g., a rack failure) and `unclean.leader.election.enable=true`, Kafka may elect a stale out-of-sync replica as the new leader. This replica may be missing messages that were committed to the previous leader's ISR. Producers that got `acks=all` acknowledgements for those messages will never know they were lost — this is the worst failure mode in Kafka because it is silent. Mitigation: set `unclean.leader.election.enable=false` (default since 0.11) and `min.insync.replicas=2` for critical topics.
+
+**Producer retry storms creating duplicate messages:** when a broker is slow (GC pause, disk saturation), producers time out and retry. With `acks=all` and a retry budget, the same batch may be written twice if the first write succeeded but the acknowledgement was lost. This is why idempotent producers (`enable.idempotence=true`) are essential — they attach a producer epoch and sequence number so the broker can deduplicate exact retries. Without idempotence, retries silently create duplicates.
+
+**Consumer offset commit timing and at-least-once delivery:** `enable.auto.commit=true` commits offsets on a timer (`auto.commit.interval.ms=5000` by default), not after processing. If the consumer crashes between processing a message and the next auto-commit tick, it will re-read and re-process those messages on restart. This is the source of at-least-once delivery. For exactly-once processing, commit offsets manually only after the downstream write succeeds, and make the downstream write idempotent.
+
 ## Interview Talking Points
 
-- "Kafka is a distributed commit log, not a traditional queue. Messages are retained after consumption, consumers track their own offsets, and multiple consumer groups independently read the same topic. This is fundamentally different from RabbitMQ or SQS."
-- "Partition count determines max parallelism. With 12 partitions, you can have at most 12 active consumers in a group. More consumers than partitions means idle consumers. Choose partition count at topic creation — decreasing partitions later breaks key-based ordering."
-- "Kafka achieves high throughput through sequential writes (append-only log), zero-copy sendfile, batching, and OS page cache. 1 million messages/second is achievable on commodity hardware."
-- "Exactly-once semantics require both an idempotent producer (deduplicates retries) and transactional API (atomic multi-partition writes). Most systems use at-least-once with idempotent consumers (deduplicate by message key/offset)."
-- "Consumer group rebalancing is Kafka's Achilles' heel at scale: during a rebalance, all consumers in the group pause. Cooperative (incremental) rebalancing in Kafka 2.4+ reduces this by only reassigning the moved partitions."
-- "Log compaction is an alternative to time-based retention: instead of deleting old messages, compact the log to keep only the last message for each key. Useful for materializing a changelog into a key-value store."
+- "Kafka is a distributed commit log, not a traditional queue. Messages are retained after consumption, consumers track their own offsets, and multiple consumer groups independently read the same topic. This is fundamentally different from RabbitMQ or SQS where messages are deleted after acknowledgement."
+- "Partition count is the most consequential topic configuration decision. With 12 partitions, you can have at most 12 active consumers in a group — extra consumers sit idle. You cannot decrease partitions without recreating the topic and migrating data, and increasing partitions breaks key-based ordering for existing keys. A rule of thumb: partition count = (target throughput) / (throughput of one consumer). Overprovision, because adding partitions later is painful."
+- "Kafka achieves high throughput through four mechanisms: sequential disk writes (append-only, no random I/O), zero-copy sendfile(2) for reads, producer/consumer batching, and OS page cache. A single broker can sustain 500MB/s+ write throughput. 1 million messages/second on commodity hardware is real, not marketing."
+- "Exactly-once semantics have two independent layers: idempotent producer (`enable.idempotence=true`) deduplicates retries within a producer session using producer epoch + sequence number. The transactional API (`transactional.id`) allows atomic writes across multiple partitions and topics in a single transaction. Most production systems opt for at-least-once delivery and make consumers idempotent via deduplication on a natural key (order_id, event_id, etc.)."
+- "Consumer group rebalancing is Kafka's primary scalability pain point at high consumer counts. During an eager (classic) rebalance, all consumers in the group pause and renegotiate assignments — even consumers whose partitions didn't change. In a 200-consumer group, a single consumer dying causes all 200 to pause. Cooperative (incremental) rebalancing in Kafka 2.4+ fixes this by only revoking and reassigning the specific partitions that moved."
+- "Log compaction is an alternative retention strategy: instead of deleting messages older than N days, compact the log to keep only the latest value per key. Essential for change-data-capture (CDC) — a new consumer can read the compacted log to reconstruct the current state of all entities without processing every historical event. Downside: compaction can lag behind writes, so consumers may see stale intermediate values."
+- "Consumer lag is the key operational health metric. A consumer group with stable, bounded lag is fine. A group with lag growing faster than the consume rate will eventually fall off the retention window — at that point messages are gone and you have a data loss incident. Alert on lag growth rate, not absolute lag."
+- "The dead letter topic pattern is essential for production systems. If a consumer can't process a message (bad schema, downstream unavailable, bug), retrying forever blocks the entire partition. Route poison pills to a DLT after N retries, advance the offset, and alert for manual remediation. This decouples partition progress from individual message failures."
+- "KRaft (Kafka Raft, introduced in Kafka 2.8, production-ready in 3.3) eliminates Zookeeper as a dependency. In KRaft mode, a set of Kafka brokers form the metadata quorum themselves using Raft consensus. This removes an entire operational component, enables 10x more partitions per cluster, and reduces leader election time from minutes to seconds. New Kafka deployments should use KRaft."
 
 ## Hands-on Lab
 
@@ -106,7 +140,7 @@ Consumer groups provide horizontal scalability for consumption. Each consumer in
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/05-message-queues-kafka/
+cd system-design-interview/02-advanced/06-message-queues-kafka/
 docker compose up -d
 # Wait ~30 seconds for Kafka to be ready
 ```
@@ -186,4 +220,6 @@ docker compose down -v
 - **Using Kafka as a traditional task queue.** Kafka's consumer-group model means that once a message is consumed by a group, it's marked at an offset — but it's still in the log. If you want "process-once-and-delete" semantics, use RabbitMQ or SQS. Kafka shines when multiple consumers need the same data, when replay is needed, or when data volume is high.
 - **Not planning partition count.** You cannot decrease partitions without recreating the topic. If you start with 3 partitions and later need 30 consumers for high throughput, you're stuck unless you recreate the topic (which requires data migration). Plan partition count for your expected consumer scale.
 - **Treating consumer group rebalancing as free.** Every time a consumer joins or leaves the group, all consumers pause. In a 100-consumer group, a single consumer dying causes all 99 others to pause while partitions are reassigned. Use Kafka 2.4+ cooperative rebalancing and tune session timeouts to minimize impact.
-- **Ignoring ISR configuration.** `acks=1` (default) means the producer only waits for the leader to write — a leader failure before replication means data loss. `acks=all` (or `-1`) waits for all ISR replicas. For critical data, always use `acks=all` and `min.insync.replicas=2`.
+- **Ignoring ISR configuration.** `acks=1` (default) means the producer only waits for the leader to write — a leader failure before replication means data loss. `acks=all` (or `-1`) waits for all ISR replicas. For critical data, always use `acks=all` and `min.insync.replicas=2`. Also set `unclean.leader.election.enable=false` to prevent silent data loss when all ISR replicas fail simultaneously.
+- **Using `enable.auto.commit=true` and calling it "exactly-once".** Auto-commit offsets on a timer, not on successful processing. If your consumer crashes between processing a message and the next auto-commit tick, you'll reprocess those messages. True at-least-once requires manual offset commits after successful downstream writes. Exactly-once additionally requires idempotent downstream operations or Kafka transactions.
+- **Choosing a key with low cardinality.** If you partition by a key with few distinct values (e.g., `country_code` for a global service), all traffic for large countries concentrates on a single partition. This creates a hot partition that exceeds the throughput of a single consumer and cannot be parallelized. Choose a high-cardinality key (user_id, order_id) or add a random suffix for workloads where per-entity ordering isn't required.

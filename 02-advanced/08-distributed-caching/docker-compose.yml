@@ -11,6 +11,12 @@ services:
       --cluster-node-timeout 5000
       --cluster-require-full-coverage no
       --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 384M
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7001", "ping"]
       interval: 5s
@@ -29,6 +35,12 @@ services:
       --cluster-node-timeout 5000
       --cluster-require-full-coverage no
       --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 384M
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7002", "ping"]
       interval: 5s
@@ -47,6 +59,12 @@ services:
       --cluster-node-timeout 5000
       --cluster-require-full-coverage no
       --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 384M
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7003", "ping"]
       interval: 5s
@@ -62,13 +80,16 @@ services:
         condition: service_healthy
       redis-node-3:
         condition: service_healthy
+    # Use 127.0.0.1 via the host network so that redis-cli resolves nodes
+    # the same way the Python client does (localhost:7001-7003).
+    network_mode: host
     command: >
       bash -c "
         sleep 2 &&
         redis-cli --cluster create
-          redis-node-1:7001
-          redis-node-2:7002
-          redis-node-3:7003
+          127.0.0.1:7001
+          127.0.0.1:7002
+          127.0.0.1:7003
           --cluster-replicas 0 --cluster-yes
       "
     restart: "no"

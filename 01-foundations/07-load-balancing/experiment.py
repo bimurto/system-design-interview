@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-Load Balancing Lab — Round-Robin vs Least-Connections vs IP Hash
+Load Balancing Lab — Round-Robin vs Weighted RR vs Least-Connections vs IP Hash
 
 Prerequisites: docker compose up -d (wait ~60s for all backends to start)
 
 What this demonstrates:
   1. Round-robin: equal distribution regardless of backend speed
-  2. Tail latency problem: slow backend (app4 at 500ms) receives equal traffic
-  3. Least-connections: routes to the backend with fewest active connections
-  4. IP-hash: same source IP always routes to same backend (session affinity)
-  5. Health check behavior: removing a backend from the pool
+  2. The tail latency problem: a slow backend (app4 at 500ms) drives p95 for the whole pool
+  3. Least-connections (concurrent): fast backends self-select for more traffic
+  4. Weighted round-robin: explicitly bias traffic toward higher-capacity backends
+  5. IP-hash: same source IP always routes to same backend (session affinity)
+  6. Passive health check: Nginx retries on a different backend after failure
+
+Upstreams (configured in nginx.conf):
+  /          → round-robin
+  /lc/       → least_conn
+  /wrr/      → weighted round-robin (app1×3, app2×2, app3×3, app4×1)
+  /iphash/   → ip_hash
 """
 
 import json
@@ -22,13 +29,15 @@ from collections import Counter, defaultdict
 BASE_URL = "http://localhost:8080"
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
 def section(title):
-    print(f"\n{'=' * 64}")
+    print(f"\n{'=' * 70}")
     print(f"  {title}")
-    print("=" * 64)
+    print("=" * 70)
 
 
-def fetch(path="/", timeout=5):
+def fetch(path="/", timeout=6):
     """Fetch a URL, return (data_dict, elapsed_ms) or (None, elapsed_ms) on error."""
     url = f"{BASE_URL}{path}"
     start = time.perf_counter()
@@ -37,270 +46,317 @@ def fetch(path="/", timeout=5):
             elapsed = (time.perf_counter() - start) * 1000
             data = json.loads(resp.read().decode())
             return data, elapsed
-    except Exception as e:
+    except Exception:
         elapsed = (time.perf_counter() - start) * 1000
         return None, elapsed
 
 
 def check_ready():
     """Verify Nginx is up before running experiments."""
-    for attempt in range(10):
+    for attempt in range(15):
         try:
             with urllib.request.urlopen(f"{BASE_URL}/health", timeout=3) as r:
                 if r.status == 200:
                     return True
         except Exception:
             pass
-        print(f"  Waiting for Nginx... (attempt {attempt + 1}/10)")
+        print(f"  Waiting for Nginx... (attempt {attempt + 1}/15)")
         time.sleep(3)
     return False
 
 
-def run_sequential(path, count, label):
-    """Run `count` sequential requests, return (distribution, latencies)."""
+def run_sequential(path, count):
+    """Run `count` sequential requests, return (distribution, latencies_by_host)."""
     dist = Counter()
-    latencies = []
+    latencies_by_host = defaultdict(list)
     for _ in range(count):
         data, ms = fetch(path)
-        if data:
-            dist[data["host"]] += 1
-            latencies.append((data["host"], ms))
-        else:
-            dist["error"] += 1
-            latencies.append(("error", ms))
-    return dist, latencies
+        host = data["host"] if data else "error"
+        dist[host] += 1
+        latencies_by_host[host].append(ms)
+    return dist, latencies_by_host
+
+
+def run_concurrent(path, count):
+    """Run `count` concurrent requests, return (distribution, latencies_by_host, wall_ms)."""
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        data, ms = fetch(path)
+        host = data["host"] if data else "error"
+        with lock:
+            results.append((host, ms))
+
+    threads = [threading.Thread(target=worker) for _ in range(count)]
+    wall_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall_ms = (time.perf_counter() - wall_start) * 1000
+
+    dist = Counter(h for h, _ in results)
+    latencies_by_host = defaultdict(list)
+    for h, ms in results:
+        latencies_by_host[h].append(ms)
+    return dist, latencies_by_host, wall_ms
+
+
+DECLARED_LATENCY = {"app1": 50, "app2": 200, "app3": 50, "app4": 500}
+BACKEND_ORDER = ["app1", "app2", "app3", "app4", "error"]
 
 
 def print_distribution(dist, latencies_by_host, total):
-    backends = ["app1", "app2", "app3", "app4", "error"]
-    declared_latency = {"app1": 50, "app2": 200, "app3": 50, "app4": 500}
-    for b in backends:
+    for b in BACKEND_ORDER:
         count = dist.get(b, 0)
         if count == 0:
             continue
         bar = "#" * count
         pct = count / total * 100
-        avg_ms = sum(latencies_by_host.get(b, [0])) / max(len(latencies_by_host.get(b, [1])), 1)
-        declared = declared_latency.get(b, "?")
-        print(f"    {b}  ({declared:>3}ms backend)  {bar:<25} {count:>3} reqs  ({pct:.0f}%)  avg {avg_ms:.0f}ms")
+        lats = latencies_by_host.get(b, [0])
+        avg_ms = sum(lats) / len(lats)
+        declared = DECLARED_LATENCY.get(b, "?")
+        print(f"    {b}  ({declared:>3}ms declared)  {bar:<30} {count:>3} reqs  ({pct:4.0f}%)  avg {avg_ms:.0f}ms")
 
+
+def percentile(sorted_values, p):
+    """Return the p-th percentile of a pre-sorted list (0 < p <= 100)."""
+    if not sorted_values:
+        return 0
+    # Linear interpolation (same method as numpy.percentile default)
+    idx = (p / 100) * (len(sorted_values) - 1)
+    lower = int(idx)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    frac = idx - lower
+    return sorted_values[lower] * (1 - frac) + sorted_values[upper] * frac
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     section("LOAD BALANCING LAB")
     print("""
   Architecture:
     Nginx (port 8080)
-      ├─ app1: 50ms artificial latency
-      ├─ app2: 200ms artificial latency
-      ├─ app3: 50ms artificial latency
-      └─ app4: 500ms artificial latency  ← simulates degraded node
+      ├─ app1:  50ms latency   (healthy)
+      ├─ app2: 200ms latency   (healthy, moderate)
+      ├─ app3:  50ms latency   (healthy)
+      └─ app4: 500ms latency   (degraded — simulates a GC-paused or I/O-saturated node)
 
-  Nginx upstreams configured:
-    /          → round-robin (default)
-    /lc/       → least_conn
-    /iphash/   → ip_hash
+  Nginx upstreams:
+    /          → round-robin       (equal distribution)
+    /wrr/      → weighted RR       (app1×3, app2×2, app3×3, app4×1)
+    /lc/       → least_conn        (fewest active connections wins)
+    /iphash/   → ip_hash           (client IP hashed to a fixed backend)
 """)
 
     if not check_ready():
         print("  ERROR: Nginx is not responding. Run: docker compose up -d")
         return
 
-    # ── Phase 1: Round-Robin ───────────────────────────────────────
-    section("Phase 1: Round-Robin (20 sequential requests)")
+    # ── Phase 1: Round-Robin (sequential) ─────────────────────────────────────
+    section("Phase 1: Round-Robin — 40 Sequential Requests")
     print("""
   Round-robin sends each request to the next backend in order:
-  req1→app1, req2→app2, req3→app3, req4→app4, req5→app1, ...
+    req1→app1, req2→app2, req3→app3, req4→app4, req5→app1, ...
 
-  Every backend gets equal traffic regardless of its speed.
-  This means slow backends (app4 at 500ms) receive the same load as fast ones.
+  With sequential requests (one at a time), every backend gets exactly 25%.
+  The total wall time is the sum of all backend latencies — the slow backend
+  app4 (500ms) contributes equally to the total time budget.
 """)
-    dist, latencies = run_sequential("/", 20, "round-robin")
-    latencies_by_host = defaultdict(list)
-    for host, ms in latencies:
-        latencies_by_host[host].append(ms)
+    dist_rr, lat_rr = run_sequential("/", 40)
+    print_distribution(dist_rr, lat_rr, 40)
 
-    print_distribution(dist, latencies_by_host, 20)
+    all_rr = sorted(ms for lats in lat_rr.values() for ms in lats)
+    avg_rr = sum(all_rr) / len(all_rr)
+    p50_rr = percentile(all_rr, 50)
+    p95_rr = percentile(all_rr, 95)
+    total_rr = sum(all_rr)
+    print(f"\n  Sequential stats (40 requests): avg={avg_rr:.0f}ms  p50={p50_rr:.0f}ms  p95={p95_rr:.0f}ms")
+    print(f"  Total accumulated latency: {total_rr:.0f}ms")
+    print(f"""
+  Intuition: avg ≈ (50 + 200 + 50 + 500) / 4 = {(50+200+50+500)//4}ms.
+  app4 is 10x slower than app1/app3 but receives identical traffic.
+""")
 
-    all_latencies = [ms for _, ms in latencies]
-    all_latencies.sort()
-    p50 = all_latencies[len(all_latencies) // 2]
-    p99 = all_latencies[int(len(all_latencies) * 0.99)]
-    avg = sum(all_latencies) / len(all_latencies)
-    total_time = sum(all_latencies)
-    print(f"\n  Overall: avg={avg:.0f}ms  p50={p50:.0f}ms  p99={p99:.0f}ms")
-    print(f"  Total wall time for 20 requests (sequential): {total_time:.0f}ms")
-
-    # ── Phase 2: The Tail Latency Problem ─────────────────────────
-    section("Phase 2: The Tail Latency Problem")
+    # ── Phase 2: The Tail Latency Problem (concurrent) ────────────────────────
+    section("Phase 2: Tail Latency Under Concurrent Round-Robin Load")
     print("""
-  With round-robin, app4 (500ms) gets 25% of requests.
-  In a sequential client, one slow backend slows everything.
-  In a concurrent system, slow backends accumulate connections.
-
-  Consider: a page makes 4 parallel API calls routed round-robin.
-  The slowest call (hitting app4) determines the page load time.
-  This is "tail latency" — the 95th/99th percentile request time.
+  With concurrent requests, the wall time is bounded by the SLOWEST backend.
+  Even if only 25% of requests hit app4, the entire batch waits for it.
 
   Real-world impact:
-    If 1% of backends are slow and you make 100 requests,
-    the probability of hitting the slow backend at least once = 1-(0.99^100) ≈ 63%.
+    A page loading 4 parallel API calls routes round-robin.
+    Whichever call lands on app4 delays the entire page render.
+    At scale: if 1% of backends are slow and you fan out to 100 backends,
+    P(hitting the slow one at least once) = 1 - 0.99^100 ≈ 63%.
+    You almost certainly pay the slow backend's penalty on every fan-out.
 """)
-    # Show that with concurrent requests, some threads will always hit app4
-    results = []
-    lock = threading.Lock()
+    print("  Sending 40 concurrent requests via round-robin...")
+    dist_rr_c, lat_rr_c, wall_rr = run_concurrent("/", 40)
+    print_distribution(dist_rr_c, lat_rr_c, 40)
 
-    def concurrent_fetch():
-        data, ms = fetch("/")
-        with lock:
-            results.append((data["host"] if data else "error", ms))
-
-    print("  Sending 20 concurrent requests (round-robin)...")
-    threads = [threading.Thread(target=concurrent_fetch) for _ in range(20)]
-    wall_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    wall_elapsed = (time.perf_counter() - wall_start) * 1000
-
-    concurrent_dist = Counter(h for h, _ in results)
-    concurrent_latencies = defaultdict(list)
-    for h, ms in results:
-        concurrent_latencies[h].append(ms)
-
-    print_distribution(concurrent_dist, concurrent_latencies, 20)
-    all_conc = sorted(ms for _, ms in results)
-    p99_conc = all_conc[int(len(all_conc) * 0.95)]
-    print(f"\n  Wall time (all 20 in parallel): {wall_elapsed:.0f}ms")
-    print(f"  p95 individual latency: {p99_conc:.0f}ms  ← driven by app4")
-    print("""
-  The wall time is bounded by the slowest backend (app4 at ~500ms).
-  Even though 75% of backends are fast, the slow one sets the ceiling.
+    all_rr_c = sorted(ms for lats in lat_rr_c.values() for ms in lats)
+    p50_rr_c = percentile(all_rr_c, 50)
+    p95_rr_c = percentile(all_rr_c, 95)
+    print(f"\n  Wall time (40 concurrent, round-robin): {wall_rr:.0f}ms")
+    print(f"  p50={p50_rr_c:.0f}ms  p95={p95_rr_c:.0f}ms  ← p95 is driven by app4")
+    print(f"""
+  The wall time approaches app4's latency (~500ms) even though 75% of
+  backends are fast. One slow node poisons the entire concurrent batch.
 """)
 
-    # ── Phase 3: Least Connections ─────────────────────────────────
-    section("Phase 3: Least Connections (least_conn)")
+    # ── Phase 3: Weighted Round-Robin ─────────────────────────────────────────
+    section("Phase 3: Weighted Round-Robin — Traffic Proportional to Capacity")
     print("""
-  least_conn routes each new request to the backend with the
-  FEWEST active connections. Fast backends complete requests quickly
-  and become available sooner, so they naturally receive more traffic.
+  Weighted round-robin lets you control traffic share per backend:
+    app1: weight=3  →  ~33% of requests
+    app2: weight=2  →  ~22% of requests
+    app3: weight=3  →  ~33% of requests
+    app4: weight=1  →  ~11% of requests  (canary / degraded node)
 
-  Slow backends (app4) accumulate connections and receive fewer new ones.
-  This is much better for variable-latency workloads.
+  Use cases:
+    - Backends with different hardware specs (2x CPU → weight=2)
+    - Canary deployments: send 10% of traffic to the new version
+    - Gradual traffic migration during blue/green deployments
+
+  Compared to equal round-robin, weighted RR reduces how much traffic
+  the slow backend receives, but it is still static — it does not adapt
+  to real-time backend speed. Least-conn does that dynamically.
 """)
-    dist_lc, latencies_lc = run_sequential("/lc/", 20, "least_conn")
-    lc_by_host = defaultdict(list)
-    for host, ms in latencies_lc:
-        lc_by_host[host].append(ms)
+    print("  Sending 40 sequential requests via weighted round-robin...")
+    dist_wrr, lat_wrr = run_sequential("/wrr/", 40)
+    print_distribution(dist_wrr, lat_wrr, 40)
 
-    print_distribution(dist_lc, lc_by_host, 20)
-
-    all_lc = sorted(ms for _, ms in latencies_lc)
-    avg_lc = sum(all_lc) / len(all_lc)
-    p99_lc = all_lc[int(len(all_lc) * 0.99)]
-    print(f"\n  least_conn: avg={avg_lc:.0f}ms  p99={p99_lc:.0f}ms")
-    print("""
-  Note: with sequential requests, least_conn behaves like round-robin
-  because each request completes before the next starts (0 active connections).
-  The benefit of least_conn is most visible under concurrent load.
-
-  Concurrent least_conn demonstration:
-""")
-    lc_results = []
-    lock2 = threading.Lock()
-
-    def concurrent_lc_fetch():
-        data, ms = fetch("/lc/")
-        with lock2:
-            lc_results.append((data["host"] if data else "error", ms))
-
-    threads = [threading.Thread(target=concurrent_lc_fetch) for _ in range(20)]
-    wall_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    lc_wall = (time.perf_counter() - wall_start) * 1000
-
-    lc_conc_dist = Counter(h for h, _ in lc_results)
-    lc_conc_lat = defaultdict(list)
-    for h, ms in lc_results:
-        lc_conc_lat[h].append(ms)
-
-    print_distribution(lc_conc_dist, lc_conc_lat, 20)
-    print(f"\n  Wall time (20 concurrent, least_conn): {lc_wall:.0f}ms")
-    print(f"  Compare to round-robin wall time: {wall_elapsed:.0f}ms")
-    print("""
-  With least_conn, fast backends (app1, app3 at 50ms) handle more
-  requests because they free up faster. App4 at 500ms gets fewer
-  new connections once it accumulates pending ones.
+    all_wrr = sorted(ms for lats in lat_wrr.values() for ms in lats)
+    avg_wrr = sum(all_wrr) / len(all_wrr)
+    p95_wrr = percentile(all_wrr, 95)
+    print(f"\n  Weighted RR stats: avg={avg_wrr:.0f}ms  p95={p95_wrr:.0f}ms")
+    print(f"  Compare to equal RR: avg={avg_rr:.0f}ms  p95={p95_rr:.0f}ms")
+    print(f"""
+  Weighted RR lowered average latency by steering fewer requests to app4.
+  But the distribution is still static — if app4 degrades further, you
+  need to manually adjust weights. Least-conn adapts automatically.
 """)
 
-    # ── Phase 4: IP Hash (Session Affinity) ────────────────────────
-    section("Phase 4: IP Hash (Session Affinity / Sticky Sessions)")
+    # ── Phase 4: Least Connections (concurrent) ────────────────────────────────
+    section("Phase 4: Least-Connections — Dynamic Routing Under Concurrent Load")
     print("""
-  ip_hash computes a hash of the client IP address and always routes
-  that client to the same backend. This ensures session affinity:
-  the same client always reaches the same server.
+  least_conn routes each new request to the backend with the fewest currently
+  ACTIVE connections. Fast backends complete requests quickly, freeing their
+  connection slot and pulling in more new requests. Slow backends accumulate
+  connections and receive fewer new ones.
+
+  Critical distinction:
+    Sequential requests (one at a time): least_conn behaves like round-robin.
+    Each request finishes before the next starts, so all backends have 0
+    active connections at the moment of each new request — the tie is broken
+    round-robin-style. The benefit is only visible under concurrent load.
+
+  Sequential least_conn (expect round-robin distribution):
+""")
+    dist_lc_s, lat_lc_s = run_sequential("/lc/", 20)
+    print_distribution(dist_lc_s, lat_lc_s, 20)
+
+    print("""
+  Concurrent least_conn (expect fast backends to self-select):
+""")
+    print("  Sending 40 concurrent requests via least_conn...")
+    dist_lc_c, lat_lc_c, wall_lc = run_concurrent("/lc/", 40)
+    print_distribution(dist_lc_c, lat_lc_c, 40)
+
+    all_lc_c = sorted(ms for lats in lat_lc_c.values() for ms in lats)
+    p50_lc = percentile(all_lc_c, 50)
+    p95_lc = percentile(all_lc_c, 95)
+    print(f"\n  Wall time (40 concurrent, least_conn):   {wall_lc:.0f}ms")
+    print(f"  Wall time (40 concurrent, round-robin):  {wall_rr:.0f}ms")
+    print(f"  least_conn p50={p50_lc:.0f}ms  p95={p95_lc:.0f}ms")
+    print(f"  round-robin p50={p50_rr_c:.0f}ms  p95={p95_rr_c:.0f}ms")
+    print("""
+  With least_conn, fast backends (app1, app3 at 50ms) accumulate fewer
+  connections and pull in more traffic. App4 at 500ms gets very few new
+  connections once it has pending ones queued up.
+
+  Gotcha — thundering herd on backend recovery:
+    When app4 recovers (comes back up), it briefly shows 0 active connections.
+    Under least_conn, all new requests flood to it until it accumulates load,
+    potentially re-crashing a fragile backend. Nginx Plus's `slow_start`
+    directive ramps traffic gradually after recovery. Open-source Nginx does
+    not support slow_start — use upstream health checks + connection limits
+    in application-level circuit breakers (e.g., resilience4j, Hystrix).
+""")
+
+    # ── Phase 5: IP Hash (Session Affinity) ───────────────────────────────────
+    section("Phase 5: IP Hash — Session Affinity (Sticky Sessions)")
+    print("""
+  ip_hash hashes the client source IP and consistently maps it to one backend.
+  The same client IP always reaches the same backend — even across restarts,
+  as long as the backend pool size doesn't change.
 
   When you need it:
-    - Server-side sessions stored in memory (not externalized to Redis)
-    - Stateful protocols that require the same server (WebSocket upgrades)
-    - Shopping cart stored in server memory (legacy apps)
+    - Server-side sessions stored in memory (not Redis) — legacy apps
+    - WebSocket connections that must reconnect to the same node
+    - Local disk cache that must be on a specific server
 
-  When you DON'T need it (the right answer in interviews):
-    - Stateless services (sessions in Redis, JWT tokens)
-    - Microservices with externalized state
-    - Any modern 12-factor app
+  When you do NOT need it (correct interview answer):
+    - Stateless services where sessions are in Redis / JWT tokens
+    - Any 12-factor app — design for statelessness, then any algorithm works
 
-  Since all our requests come from the same IP (localhost),
-  all requests will go to the same backend:
+  Problem: when a sticky backend goes down, that user loses their session.
+  The fix is to externalize session state so that backend choice is irrelevant.
+
+  Since all requests come from the same IP (localhost → 127.0.0.1),
+  all requests will route to the same backend:
 """)
-    dist_ip, latencies_ip = run_sequential("/iphash/", 8, "ip_hash")
-    ip_by_host = defaultdict(list)
-    for host, ms in latencies_ip:
-        ip_by_host[host].append(ms)
-
-    print_distribution(dist_ip, ip_by_host, 8)
+    dist_ip, lat_ip = run_sequential("/iphash/", 12)
+    print_distribution(dist_ip, lat_ip, 12)
     unique_backends = set(dist_ip.keys()) - {"error"}
-    print(f"\n  All 8 requests went to: {unique_backends}")
-    print("  Same source IP = same backend every time.")
+    print(f"\n  All 12 requests routed to: {unique_backends}")
+    print("  Same source IP = same backend every time (deterministic hashing).")
     print("""
-  The downside: if your sticky backend goes down, that user's session is lost.
-  The fix: externalize session state to Redis, then you don't need ip_hash at all.
+  Uneven distribution risk: if 50,000 users share one corporate NAT IP,
+  they all hash to the same backend, overloading it while others sit idle.
+  This is the silent failure mode of ip_hash in enterprise environments.
 """)
 
-    # ── Phase 5: Latency Numbers Reference ────────────────────────
-    section("Phase 5: Load Balancer Algorithm Comparison")
-    print("""
-  ┌─────────────────────┬──────────────────────────────┬──────────────────────────────┐
-  │ Algorithm           │ Best for                     │ Avoid when                   │
-  ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
-  │ Round-robin         │ Identical backends, equal    │ Backends have variable       │
-  │                     │ request durations            │ latency or capacity          │
-  ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
-  │ Weighted round-robin│ Different-capacity backends  │ Request durations vary       │
-  │                     │ (2x CPU → weight=2)          │ significantly                │
-  ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
-  │ Least connections   │ Variable request durations   │ Backends have very different │
-  │                     │ (long-polling, file upload)  │ per-request overhead         │
-  ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
-  │ IP hash             │ Sticky sessions (legacy)     │ Stateless services (always   │
-  │                     │                              │ prefer stateless design)     │
-  ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
-  │ Random              │ Simple, no state tracking    │ Backend capacities differ    │
-  ├─────────────────────┼──────────────────────────────┼──────────────────────────────┤
-  │ Power of two choices│ Large clusters, low overhead │ Small clusters (overkill)    │
-  └─────────────────────┴──────────────────────────────┴──────────────────────────────┘
+    # ── Phase 6: Algorithm Comparison Summary ─────────────────────────────────
+    section("Phase 6: Algorithm Comparison — When to Use What")
+    print(f"""
+  Results from this lab:
 
-  Key insight from this lab:
-    - Round-robin gave equal traffic to app4 (500ms) as to app1 (50ms)
-    - Least-conn under concurrent load naturally avoids slow backends
-    - IP-hash provides sticky sessions but breaks if backend fails
+    Round-robin (sequential 40 req):   avg={avg_rr:.0f}ms   p95={p95_rr:.0f}ms
+    Weighted RR (sequential 40 req):   avg={avg_wrr:.0f}ms   p95={p95_wrr:.0f}ms
+    Round-robin (concurrent 40 req):   wall={wall_rr:.0f}ms   p95={p95_rr_c:.0f}ms
+    Least-conn  (concurrent 40 req):   wall={wall_lc:.0f}ms   p95={p95_lc:.0f}ms
 
-  Interview answer: "I would design stateless services so that sticky sessions
-  are not needed. Any instance can handle any request. Load balancer uses
-  least-conn to handle variable-latency backends gracefully."
+  ┌────────────────────────┬─────────────────────────────┬─────────────────────────────┐
+  │ Algorithm              │ Best for                    │ Avoid when                  │
+  ├────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+  │ Round-robin            │ Identical backends, uniform │ Backends have variable      │
+  │                        │ request durations           │ latency or capacity         │
+  ├────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+  │ Weighted round-robin   │ Different capacity backends │ Latency is highly variable; │
+  │                        │ Canary / blue-green deploy  │ weights are hard to tune    │
+  ├────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+  │ Least connections      │ Variable request durations  │ Sequential workloads (acts  │
+  │                        │ File upload, long-polling   │ same as RR with no concurr) │
+  ├────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+  │ IP hash                │ Sticky sessions (legacy)    │ Stateless services — always │
+  │                        │                             │ prefer stateless design     │
+  ├────────────────────────┼─────────────────────────────┼─────────────────────────────┤
+  │ Random / power-of-two  │ Large clusters, minimal     │ Backend capacities differ   │
+  │ random choices         │ coordination overhead       │ significantly               │
+  └────────────────────────┴─────────────────────────────┴─────────────────────────────┘
+
+  Key interview insight:
+    "I would design services to be stateless — sessions externalized to Redis,
+     no local disk state — so that sticky sessions are unnecessary. With stateless
+     backends, I can use least-conn to automatically route around slow or degraded
+     nodes without any manual weight tuning. I would add passive health checks
+     (proxy_next_upstream) to retry failed requests on another backend, and
+     circuit breakers at the application level to shed load from backends that
+     are repeatedly erroring."
 
   Next: ../08-databases-sql-vs-nosql/
 """)

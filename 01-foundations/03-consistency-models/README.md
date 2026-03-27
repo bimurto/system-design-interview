@@ -7,70 +7,134 @@
 
 ## Concept
 
-Consistency models define the rules a distributed system makes to clients about what they will observe when reading data. They form a spectrum from the strongest guarantees (linearizability, where the system appears to be a single machine) to the weakest (eventual consistency, where nodes merely agree to converge "at some point"). Choosing the right consistency model is one of the central design decisions for any distributed system because stronger consistency costs more in latency and availability.
+Consistency models define the contract a distributed system makes with clients about what they will observe when reading data. They form a spectrum from the strongest guarantee (linearizability, where the system appears to be a single machine) to the weakest (eventual consistency, where replicas merely agree to converge "at some point"). Choosing the right model is one of the central design decisions for any distributed system: stronger consistency costs more in latency and availability, but weaker consistency requires more complexity in the application.
 
-The confusion starts because "consistency" is overloaded. ACID consistency (in SQL databases) means constraints are upheld across a transaction. CAP consistency means linearizability — every read reflects the most recent write across all nodes. These are different concepts. This topic covers the CAP/distributed systems definition and everything below it on the consistency spectrum.
+The word "consistency" is dangerously overloaded across the industry:
 
-**Linearizability** (also called strong consistency or atomic consistency) is the gold standard. Every operation appears to take effect instantaneously at a single point in time, and once a write completes, every subsequent read — from any node, by any client — returns that value or a later one. The system behaves identically to a single-machine system. Achieving this across multiple nodes requires coordination on every read and write (e.g., two-phase commit, Paxos, Raft), which adds latency and reduces availability.
+- **ACID consistency** (SQL databases): constraints and invariants are upheld after every transaction (e.g., foreign-key integrity, balance never goes negative). This is an application-level guarantee, not a distributed systems concept.
+- **CAP consistency** (distributed systems): linearizability — every read reflects the most recent write across all nodes. This is a replication guarantee.
 
-**Sequential consistency** relaxes real-time ordering. All nodes agree on a single global order of operations, but that order doesn't have to match wall-clock time. A write that completes at time T=5 might appear to a distant node as if it happened at T=3 in the global order, as long as all nodes see the same order. This is weaker than linearizability but stronger than causal consistency, and it underpins many CPU memory models.
+This topic covers the distributed systems definition and the full spectrum below it.
 
-**Eventual consistency** is the baseline for most large-scale distributed systems. The guarantee is only that if no new writes occur, all replicas will eventually converge to the same value. There is no bound on when convergence occurs, and during the convergence period, different clients may see different values. This enables high availability and low latency at the cost of stale reads and conflict potential.
+---
 
-## How It Works
+## The Consistency Spectrum
 
-**Linearizable (Strong Consistency) Read:**
-1. Client writes `key=X, value=5` to the primary
-2. Primary replicates the write to all replicas synchronously (or via Raft/Paxos consensus) before acknowledging
-3. Write is acknowledged to the client only after quorum confirms the value is durable
-4. Any subsequent read — from any node — is guaranteed to return `value=5` or a newer value; stale reads are impossible
+### Linearizability (Strong Consistency)
 
-**Eventually Consistent Read:**
-1. Client writes `key=X, value=5` to the primary
-2. Primary acknowledges the write immediately; replication to other nodes happens asynchronously in the background
-3. Client (or another client) reads `key=X` from a replica that has not yet received the update — returns stale value (e.g., `value=3`)
-4. After replication catches up, all replicas converge to `value=5`; the window of staleness depends on replication lag
+Every operation appears to take effect instantaneously at a single point in real time between its invocation and response. Once a write completes, every subsequent read — from any node, by any client — returns that value or a newer one. The system is indistinguishable from a single-machine system.
 
-Between the extremes lie several important client-side consistency guarantees that are composable with any of the above:
+Achieving this across multiple nodes requires every read and write to go through coordination (Paxos, Raft, two-phase commit), which adds round-trip latency and reduces availability under network partitions.
 
-**Read-your-writes** (also called read-your-own-writes): after a client writes a value, all subsequent reads by that same client return that value or a newer one. This is violated when the client writes to a primary and then reads from a replica that hasn't caught up. Solutions: always read from primary after a write, use sticky routing (always route a user to the same replica), or use WAIT (Redis) / synchronous replication.
+**How it works:**
+1. Client writes `key=X, value=5` to the leader
+2. Leader replicates to a quorum of followers synchronously via Raft; entry is committed only after quorum confirms
+3. Write is acknowledged to the client only after commit
+4. Any subsequent read from any node that checks the commit index is guaranteed to return `value=5` or newer — stale reads are impossible
 
-**Monotonic reads**: a client never sees an older version of data than it has already seen. This is violated when a load balancer routes a client to different replicas in round-robin order and one replica is lagging. A client might see value V=5, then V=3 on the next request (to a lagging replica). Solution: stick a client to one replica per session.
+**Systems:** etcd, ZooKeeper, Google Spanner (for linearizable reads), Redis WAIT + acked-replica reads.
 
-**Causal consistency**: if operation A causally precedes operation B (A "happened before" B, e.g., A is a write that B reads), all nodes must see A before B. Unrelated operations can appear in any order. MongoDB's causal sessions and Amazon's Dynamo use vector clocks to track causal ordering.
+### Sequential Consistency
 
-Redis's `WAIT numreplicas timeout` command is a practical tool for upgrading eventual consistency to strong consistency: it blocks the client until the specified number of replicas have acknowledged all pending writes. Setting `WAIT 1 0` means "block until at least 1 replica has all my writes" — after that, reading from that replica is linearizable with respect to this client's writes.
+All nodes agree on a single global order of operations, but that order is not required to match wall-clock time. A write that completes at T=10 might appear "logically before" an operation that started at T=8 in the global order, as long as every node sees the same sequence. This is weaker than linearizability but stronger than causal consistency, and it underpins many CPU memory models (x86 Total Store Order, Java `volatile`).
 
-### Trade-offs
+### Causal Consistency
 
-| Model | Latency | Availability | Use Cases |
-|-------|---------|--------------|-----------|
-| Linearizability | Highest | Lowest | Leader election, distributed locks, counters |
-| Sequential consistency | High | Low-medium | Some CPU memory models |
-| Causal consistency | Medium | Medium | Social feeds, collaboration tools |
-| Read-your-writes | Low | High | User profile reads after update |
-| Monotonic reads | Low | High | Timelines, logs |
-| Eventual consistency | Lowest | Highest | DNS, caching, shopping cart |
+If operation A causally precedes operation B (A "happened before" B — e.g., A is a post and B is a reply that references A), then all nodes must see A before B. Causally unrelated operations can appear in any order across nodes.
 
-### Failure Modes
+Causality is tracked using **vector clocks** or **version vectors**: each write carries a vector of logical timestamps, one per node. A node only applies write B if all writes that B depends on (per the vector) have already been applied.
 
-**Stale reads causing incorrect decisions:** a system that routes reads to replicas without any consistency guarantee may return values that lead to incorrect business logic — double charges, oversold inventory, outdated permissions. The fix is to identify which reads require stronger guarantees and route those to the primary or use WAIT.
+**Systems:** MongoDB causal sessions (using cluster time), Amazon Dynamo (version vectors), Bayou.
 
-**Monotonic read violations in sticky sessions:** if a replica restarts and its session state is lost, the load balancer may route the client to a different (potentially lagging) replica, causing a regression. Use server-side session tokens that include a minimum replication offset.
+**Critical failure mode — reply before post:** Alice writes a post to replica1; Bob reads the post from replica1 and writes a reply to master; Carol reads from replica2, which has received the reply but not yet the post. Carol sees a reply to a non-existent post. Vector clocks prevent this by refusing to serve the reply until the causal dependency (the post) has arrived.
 
-**Causal consistency violations with parallel writes:** if two clients concurrently write causally unrelated values, a third client reading from different replicas may see them in different orders. This is only a problem if the application treats these as causally related. Solution: vector clocks or version vectors.
+### Eventual Consistency
+
+The weakest useful guarantee: if no new writes occur, all replicas will eventually converge to the same value. There is no bound on when convergence occurs, and during the convergence window different clients may see different values, and the same client reading from different replicas may see values out of order.
+
+**Conflict resolution:** when two replicas independently accept conflicting writes, eventual consistency systems need a strategy:
+- **Last-Write-Wins (LWW):** the write with the highest timestamp wins. Simple but loses data when clocks are skewed.
+- **CRDTs (Conflict-free Replicated Data Types):** data structures (counters, sets, maps) mathematically guaranteed to merge without conflict. Used by Redis CRDT Enterprise and Riak.
+- **Application-level merge:** the application receives all conflicting versions and resolves them (Dynamo's shopping cart approach). Most flexible, most complex.
+
+**Systems:** Cassandra/DynamoDB default read mode, DNS, CDN caches.
+
+---
+
+## Client-Side Session Guarantees
+
+These four guarantees are orthogonal to the server-side consistency model. They describe what a single client session observes, and can be layered on top of an eventually consistent system:
+
+| Guarantee | Definition | Common Violation | Fix |
+|-----------|-----------|-----------------|-----|
+| **Read-your-writes** | After writing V, all your subsequent reads return V or newer | Write to master, read from lagging replica | Sticky routing, WAIT, or always read from master post-write |
+| **Monotonic reads** | You never see a version older than one you've already seen | Load balancer routes you to replicas at different offsets | Pin client to one replica per session; session offset tokens |
+| **Monotonic writes** | Your writes are applied in the order you issued them | Async replication with out-of-order delivery | Single-stream replication, sequence numbers on writes |
+| **Writes-follow-reads** | A write that follows a read is ordered after that read's version | Write based on stale read appears to precede the read causally | Include read version in write request; causal sessions |
+
+All four together constitute **session consistency**, which is the minimum bar for most user-facing applications.
+
+---
+
+## Linearizability vs. Serializability — A Classic Interview Trap
+
+These terms are frequently conflated. They are distinct:
+
+**Serializability** is a database transaction guarantee. Multiple concurrent transactions produce the same result as if they had been executed one at a time in some serial order. The key word is "some" — the serial order does not have to match wall-clock time. It is concerned with multi-object, multi-operation transactions.
+
+**Linearizability** is a distributed systems guarantee for single-object operations. Every operation appears to take effect at a single point in real time between invocation and completion. The serial order is constrained by real-time ordering.
+
+**Strict serializability** = serializability + linearizability. Transactions are both serializable (multi-object atomicity) and linearizable (real-time ordering). This is what Google Spanner and CockroachDB provide using TrueTime/hybrid logical clocks.
+
+Most ACID databases (PostgreSQL Serializable Snapshot Isolation) provide serializability but not linearizability — a transaction that starts at T=8 may read values written at T=10 if the snapshot isolation's version chain allows it.
+
+---
+
+## Trade-offs
+
+| Model | Latency | Availability (under partition) | Staleness | Conflict risk | Typical Use Case |
+|-------|---------|-------------------------------|-----------|---------------|-----------------|
+| Linearizability | Highest | Lowest (CP) | None | None | Leader election, locks, counters, inventory reservations |
+| Sequential consistency | High | Low-medium | None (in order) | None | CPU memory models, some DB engines |
+| Causal consistency | Medium | Medium | Possible for unrelated ops | Low | Social feeds, collaborative editing, comment threads |
+| Session consistency | Low | High | Possible for other sessions | Medium | User profile reads, shopping, feeds |
+| Eventual consistency | Lowest | Highest (AP) | Yes, unbounded | High without CRDTs | DNS, CDN, caches, counters (with CRDTs) |
+
+---
+
+## Failure Modes and Gotchas
+
+**Stale reads causing incorrect business decisions:** routing reads to replicas without a consistency requirement can return values that lead to double charges, oversold inventory, or stale permissions. The fix is to identify which reads are decision-critical (balance checks, reservation gates) and always route those to the primary or use WAIT.
+
+**WAIT return value not checked:** Redis `WAIT n timeout_ms` returns the number of replicas that actually acknowledged, which may be less than `n` if the timeout expired or a replica is down. An application that calls `WAIT 2, 100` but doesn't check that the return value is exactly 2 may falsely believe the write is durable on 2 replicas.
+
+**Monotonic read violation after replica restart:** sticky sessions break when the pinned replica restarts and session state is lost, routing the client to a potentially lagging replica. Fix: store a minimum replication offset in the session token; the new replica refuses to serve reads until it reaches that offset.
+
+**Causal violation with fan-out writes:** if a system writes the "effect" (reply) to a different shard or region from the "cause" (post), the effect can arrive before the cause on replicas in distant regions. Vector clocks or causal session tokens are required.
+
+**Split-brain and linearizability:** if a network partition causes two leaders to accept writes simultaneously (e.g., a misconfigured Paxos/Raft group), linearizability is broken — two different clients may see conflicting "latest" values. Proper leader lease mechanisms (Raft's leader leases, etcd's linearizable reads via Raft log) prevent this.
+
+**LWW and clock skew:** Last-Write-Wins relies on wall-clock timestamps, but NTP skew of even a few milliseconds can cause a logically-earlier write to have a higher timestamp and "win" over a logically-later write. CRDTs or application-level versioning are safer alternatives.
+
+**Confusing replica type with staleness:** a synchronously replicated replica is never stale — the write isn't acknowledged until the replica confirms. Only asynchronously replicated replicas can be stale. The replication mode determines staleness, not the fact that it's a replica.
+
+---
 
 ## Interview Talking Points
 
-- "Linearizability means the system looks like a single machine — every read sees the latest write. It requires coordination on every operation, so it's expensive"
-- "Read-your-writes and monotonic reads are client-side guarantees that are orthogonal to the server-side consistency model — you can have eventual consistency with read-your-writes via sticky routing"
-- "Redis WAIT upgrades eventual to strong consistency by blocking until N replicas acknowledge — useful for critical writes that must be immediately readable from replicas"
-- "Most user-facing applications need read-your-writes (show me my own post after I submit) but can tolerate eventual consistency for other users' data"
-- "Causal consistency is often the sweet spot: stronger than eventual, cheaper than linearizable, and sufficient for most social/collaborative applications"
+- "Linearizability means the system looks like a single machine — every read reflects the latest write, and the ordering respects real time. It requires coordination on every operation via consensus (Raft/Paxos), so it's expensive in both latency and availability."
+- "Don't confuse linearizability with serializability. Linear is about single-object real-time ordering; serial is about multi-object transaction atomicity. Strict serializability gives you both — that's what Spanner provides."
+- "Read-your-writes, monotonic reads, monotonic writes, and writes-follow-reads are client-side session guarantees orthogonal to the server-side model. You can have an eventually consistent system that still provides read-your-writes via sticky routing — they're independent axes."
+- "Redis `WAIT n timeout` upgrades eventual consistency to read-your-writes by blocking until n replicas have acknowledged. Always check the return value — if fewer than n acked, the timeout expired and you have weaker durability than requested."
+- "Causal consistency is often the sweet spot for social/collaborative applications: stronger than eventual (no reply-before-post), cheaper than linearizable, and sufficient when users mainly see content they or their follows produced."
+- "For conflict resolution in eventually consistent systems, LWW is simple but loses data under clock skew. CRDTs are the principled solution — data structures mathematically guaranteed to merge. If you're designing a shopping cart or collaborative document, CRDTs are the right answer."
+- "The practical question in any design is: which operations are decision-critical and need strong consistency, and which can tolerate staleness? Applying linearizability uniformly is expensive and unnecessary. Apply it surgically."
+
+---
 
 ## Hands-on Lab
 
-**Time:** ~20-30 minutes
+**Time:** ~25–35 minutes
 **Services:** redis-master (6379), redis-replica1 (6380), redis-replica2 (6381)
 
 ### Setup
@@ -87,7 +151,14 @@ docker compose up -d
 python experiment.py
 ```
 
-The script runs four phases: demonstrating eventual consistency (write to master, read from replica immediately — may be stale), comparing WAIT 0 / WAIT 1 / WAIT 2 latencies, demonstrating read-your-writes with WAIT, and showing how monotonic read violations can occur with replica alternation.
+The script runs six phases:
+
+1. **Eventual consistency** — write to master, read from replica immediately across 20 trials; counts stale reads
+2. **WAIT latency** — compares average write+read latency for no-WAIT, WAIT 1, and WAIT 2 across 15 iterations
+3. **Read-your-writes** — demonstrates the violation path and WAIT-based fix
+4. **Monotonic reads** — forces replica2 to lag using `DEBUG SLEEP` and alternates reads to produce a visible value regression
+5. **Causal consistency** — simulates the reply-before-post violation with forced replica lag
+6. **Linearizability vs. serializability** — explains the distinction and shows WAIT's scope
 
 ### Break It
 
@@ -100,8 +171,9 @@ import redis
 r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 r.set('x', 42)
 acked = r.wait(2, 200)  # wait for 2 replicas, 200ms timeout
-print(f'Acked by {acked} replicas (expected 2, got fewer because replica2 is down)')
-print('WAIT returns how many actually acked — application must check the return value')
+print(f'WAIT returned: {acked} (expected 2)')
+print('WAIT return value MUST be checked — fewer acks = weaker durability')
+print('Application logic that ignores this silently degrades consistency')
 "
 
 docker compose start redis-replica2
@@ -109,13 +181,15 @@ docker compose start redis-replica2
 
 ### Observe
 
-Look for the WAIT latency numbers in the output. On localhost, the difference is small (sub-millisecond). Across data centers (10–50ms RTT), WAIT 2 would add 50–100ms per write — a significant latency cost for strong consistency.
+Latency numbers from a typical localhost run:
 
 ```
-No WAIT (eventual):  0.05 ms
-WAIT 1 replica:      0.30 ms
-WAIT 2 replicas:     0.45 ms
+No WAIT (eventual):   0.07 ms
+WAIT 1 replica:       0.31 ms
+WAIT 2 replicas:      0.48 ms
 ```
+
+The overhead is the replication round-trip over loopback. Across data centers (50ms RTT), WAIT 1 adds ~50ms and WAIT 2 adds ~50ms (not additive — limited by the slowest replica that acks within the timeout). That is the real latency cost of global strong consistency.
 
 ### Teardown
 
@@ -123,15 +197,23 @@ WAIT 2 replicas:     0.45 ms
 docker compose down -v
 ```
 
+---
+
 ## Real-World Examples
 
-- **Amazon DynamoDB:** Offers two read modes per request: eventually consistent reads (default, cheaper, potentially stale) and strongly consistent reads (costs 2x read capacity, always fresh). Engineers choose per operation — source: AWS DynamoDB Developer Guide, "Read Consistency."
-- **MongoDB:** Implements causal consistency via client sessions and cluster time — a logical clock advanced with each operation. Reads in a session are guaranteed to reflect all previous writes in that session — source: MongoDB Docs, "Causal Consistency and Read and Write Concerns."
-- **Apache Cassandra:** Tunable consistency per operation. `ONE` reads any replica (fastest, potentially stale). `QUORUM` reads from a majority of replicas (strongly consistent if write was also `QUORUM`). `ALL` reads from every replica (most consistent, highest latency) — source: Cassandra Docs, "How Are Cassandra's Consistency Levels Calculated?"
+- **Amazon DynamoDB:** Two read modes per request — eventually consistent (default, cheaper, potentially stale) and strongly consistent (costs 2x read capacity, always reads from the leader, linearizable). Engineers choose per-operation. Source: AWS DynamoDB Developer Guide, "Read Consistency."
+- **MongoDB:** Causal consistency via client sessions and cluster time — a logical Lamport clock advanced with each operation. Reads in a causally consistent session are guaranteed to reflect all writes from that session, regardless of which node is read from. Source: MongoDB Docs, "Causal Consistency and Read and Write Concerns."
+- **Apache Cassandra:** Tunable consistency per operation. `ONE` reads from any replica (fastest, potentially stale). `QUORUM` requires majority (strongly consistent if the write also used `QUORUM` — the read-repair intersection guarantees overlap). `ALL` reads from every replica (highest consistency, lowest availability). Source: Cassandra Docs, "How Are Cassandra's Consistency Levels Calculated?"
+- **Google Spanner:** Uses TrueTime (GPS + atomic clock bounded uncertainty intervals) to provide strict serializability globally. Reads acquire a timestamp, then wait until the clock uncertainty window closes before returning — ensuring the read is globally ordered. Source: Corbett et al., "Spanner: Google's Globally Distributed Database," OSDI 2012.
+- **Redis CRDT (Enterprise):** Uses CRDTs for multi-master replication without conflicts — counters, sets, and maps merge mathematically. No coordination required for writes; convergence is guaranteed by data structure properties rather than consensus protocols.
+
+---
 
 ## Common Mistakes
 
-- **Assuming eventual consistency means "occasionally wrong."** Eventual consistency means "temporarily stale." The system will converge. Applications need to be designed for temporary inconsistency (idempotent operations, UI that shows "last updated" timestamps), not for correctness violations.
-- **Using strong consistency everywhere.** Linearizability on every read is expensive. Most reads in most applications don't need it. Only critical operations (balance checks, inventory reservation, lock acquisition) need strong consistency.
-- **Ignoring client-side guarantees.** A system might be eventually consistent server-side but still need read-your-writes client-side. These are separate concerns. Getting client-side guarantees right (sticky routing, version tokens) is often more impactful than upgrading the server-side model.
-- **Confusing "replica" with "stale."** A synchronously replicated replica is never stale — it has all writes before the primary acknowledged them. Only asynchronously replicated replicas can be stale. The replication mode determines staleness, not the fact that it's a replica.
+- **Treating eventual consistency as "occasionally wrong."** Eventual consistency means "temporarily stale," not incorrect. The system will converge. Design for temporary inconsistency (idempotent operations, UI timestamps, optimistic UI with reconciliation) rather than for permanent corruption.
+- **Applying strong consistency uniformly.** Linearizability on every read is expensive. Identify which operations are decision-critical (balance checks, lock acquisition, inventory reservation) and apply strong consistency only there. Most reads in most applications tolerate staleness.
+- **Ignoring client-side session guarantees.** A system can be eventually consistent server-side but still need read-your-writes client-side. These are orthogonal concerns. Sticky routing and session offset tokens are often cheaper than upgrading the server-side model.
+- **Not checking WAIT return values.** `WAIT n timeout` is not a guarantee — it's a best-effort block. If fewer than n replicas ack, the application silently has weaker consistency than intended. Always assert the return value equals the desired replica count.
+- **Using LWW without understanding clock skew.** NTP drift of even 1–2ms can cause a logically-earlier write to have a higher timestamp and overwrite a logically-later write. Use hybrid logical clocks (HLC), CRDTs, or application-level versioning in systems where data loss is unacceptable.
+- **Confusing causal consistency with read-your-writes.** Read-your-writes is a single-client guarantee about that client's own writes. Causal consistency is a multi-client guarantee about the ordering of causally related operations from different clients. They address different problems.

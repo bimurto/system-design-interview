@@ -7,14 +7,19 @@ services:
       sh -c "pip install flask prometheus_client --quiet && python /flask_app.py"
     ports:
       - "8000:8000"
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 256m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/metrics')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
       timeout: 3s
       retries: 10
 
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v2.51.0
     ports:
       - "9090:9090"
     volumes:
@@ -22,6 +27,10 @@ services:
     depends_on:
       flask-app:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
       interval: 5s
@@ -29,7 +38,7 @@ services:
       retries: 10
 
   grafana:
-    image: grafana/grafana
+    image: grafana/grafana:10.4.0
     ports:
       - "3000:3000"
     volumes:
@@ -40,15 +49,22 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/app.json
     depends_on:
       prometheus:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256m
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 10
 
+  # Run experiment separately: `docker compose run --rm experiment`
+  # or: `python experiment.py` (with docker compose up -d flask-app prometheus grafana)
   experiment:
     image: python:3.11-slim
     volumes:
@@ -61,3 +77,5 @@ services:
     environment:
       - APP_HOST=flask-app
       - PROM_HOST=prometheus
+    profiles:
+      - experiment

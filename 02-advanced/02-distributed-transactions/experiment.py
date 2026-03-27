@@ -8,7 +8,9 @@ What this demonstrates:
   1. Two-Phase Commit (2PC): PREPARE → COMMIT across two databases
   2. 2PC failure: coordinator crash after PREPARE leaves DBs blocked
   3. Saga pattern: choreography-style with compensating transactions
-  4. Why 2PC is blocking and Sagas are preferred for long-lived transactions
+  4. Stuck saga: compensation step itself fails — requires manual intervention
+  5. Idempotent saga steps: why retrying a step without idempotency causes
+     double-charges, double-debits, or duplicate records
 """
 
 import time
@@ -48,11 +50,12 @@ def setup_schemas():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
-                    id         TEXT PRIMARY KEY,
-                    product_id TEXT NOT NULL,
-                    quantity   INT  NOT NULL,
-                    status     TEXT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT now()
+                    id              TEXT PRIMARY KEY,
+                    product_id      TEXT NOT NULL,
+                    quantity        INT  NOT NULL,
+                    status          TEXT NOT NULL,
+                    idempotency_key TEXT UNIQUE,
+                    created_at      TIMESTAMPTZ DEFAULT now()
                 )
             """)
             cur.execute("TRUNCATE orders")
@@ -67,7 +70,16 @@ def setup_schemas():
                     reserved   INT  NOT NULL DEFAULT 0
                 )
             """)
+            # Saga deduplication table: records completed saga step IDs
+            # so retried steps are detected and skipped rather than re-applied.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS saga_completed_steps (
+                    step_key   TEXT PRIMARY KEY,
+                    completed_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
             cur.execute("TRUNCATE inventory")
+            cur.execute("TRUNCATE saga_completed_steps")
             cur.execute("""
                 INSERT INTO inventory (product_id, quantity, reserved)
                 VALUES ('WIDGET-A', 100, 0), ('WIDGET-B', 50, 0)
@@ -452,6 +464,175 @@ def main():
   a central point of coordination.
 """)
 
+    # ── Phase 4: Stuck Saga ─────────────────────────────────────
+    section("Phase 4: Stuck Saga — When Compensation Itself Fails")
+    print("""
+  Scenario: inventory is deducted (step 1 succeeds), order creation fails
+  (step 2 fails), BUT the compensating transaction for step 1 also fails
+  (e.g., the inventory service is down or its table is locked).
+
+  The saga is now "stuck": it cannot move forward (step 2 failed) and
+  cannot move backward (compensation failed). The inventory has been
+  deducted but no order exists — an inconsistent state.
+
+  Recovery options:
+    1. Automated retry: the orchestrator persists the saga state and retries
+       the failed compensation later (requires persistent saga log).
+    2. Dead-letter queue: the failed compensation event is routed to a DLQ
+       for human review and manual intervention.
+    3. Alerting + SRE escalation: PagerDuty alert fires, SRE manually runs
+       the compensation SQL.
+
+  Key insight: ALL compensations must be designed for retry. A compensation
+  that runs twice (e.g., restores inventory twice) creates a worse
+  inconsistency than the original failure. Compensations must be idempotent.
+""")
+
+    stuck_product = "WIDGET-A"
+    stuck_qty = 3
+
+    # Set up: deduct inventory so there's something to compensate
+    with get_inventory_conn() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE inventory SET quantity = quantity - %s WHERE product_id = %s AND quantity >= %s",
+                (stuck_qty, stuck_product, stuck_qty)
+            )
+
+    show_state("After step 1: inventory deducted (step 2 about to fail)")
+
+    # Simulate: compensation fails because a long-running transaction holds a lock
+    print("  Simulating stuck compensation:")
+    print("  A concurrent transaction holds a lock on WIDGET-A rows...")
+
+    # Connection that holds a lock on inventory row
+    lock_conn = get_inventory_conn()
+    lock_conn.autocommit = False
+    with lock_conn.cursor() as cur:
+        cur.execute("SELECT quantity FROM inventory WHERE product_id = %s FOR UPDATE", (stuck_product,))
+
+    print(f"  Lock acquired. Now attempting compensation (will time out after 3s)...")
+
+    # Compensation attempt: will block on the row lock
+    comp_conn = psycopg2.connect(INVENTORY_DSN + " options='-c lock_timeout=3000'")
+    comp_conn.autocommit = False
+    stuck = False
+    try:
+        with comp_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE inventory SET quantity = quantity + %s WHERE product_id = %s",
+                (stuck_qty, stuck_product)
+            )
+        comp_conn.commit()
+        print("  Compensation succeeded (lock was released in time)")
+    except Exception as e:
+        comp_conn.rollback()
+        stuck = True
+        print(f"  Compensation FAILED: {e}")
+        print(f"  Saga is now STUCK: inventory deducted, no order, compensation blocked.")
+        print(f"  This step would be sent to a dead-letter queue for manual resolution.")
+    finally:
+        comp_conn.close()
+        # Release the lock so teardown can proceed
+        lock_conn.rollback()
+        lock_conn.close()
+
+    if stuck:
+        # Manual recovery: what an SRE or automated recovery process would do
+        print(f"\n  Simulating recovery: SRE manually runs the compensation...")
+        with get_inventory_conn() as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE inventory SET quantity = quantity + %s WHERE product_id = %s",
+                    (stuck_qty, stuck_product)
+                )
+        print(f"  Recovery complete. Inventory restored.")
+
+    show_state("After stuck saga recovery")
+
+    # ── Phase 5: Idempotent Saga Steps ────────────────────────────
+    section("Phase 5: Idempotent Saga Steps — Preventing Double-Charges on Retry")
+    print("""
+  Problem: message queues deliver at-least-once. If the inventory service
+  processes a "deduct inventory" message, deducts stock, then crashes before
+  acknowledging the message, the queue will redeliver the message. Without
+  idempotency, the inventory is deducted TWICE.
+
+  Solution: each saga step is keyed by a unique idempotency key. Before
+  acting, the service checks if it has already processed this key. If yes,
+  it returns success without re-applying the operation.
+
+  We demonstrate this using the saga_completed_steps table in db-inventory.
+""")
+
+    idempotency_key = f"saga-{str(uuid.uuid4())[:8]}-deduct-WIDGET-B-5"
+    deduct_product  = "WIDGET-B"
+    deduct_qty      = 5
+
+    def idempotent_deduct(key, product, qty):
+        """Deducts inventory only if this key has not been processed before."""
+        with get_inventory_conn() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                # Check for prior execution
+                cur.execute(
+                    "SELECT step_key FROM saga_completed_steps WHERE step_key = %s",
+                    (key,)
+                )
+                if cur.fetchone():
+                    conn.rollback()
+                    return "SKIPPED (already processed)"
+
+                # First time: apply the operation
+                cur.execute(
+                    "UPDATE inventory SET quantity = quantity - %s "
+                    "WHERE product_id = %s AND quantity >= %s",
+                    (qty, product, qty)
+                )
+                if cur.rowcount == 0:
+                    conn.rollback()
+                    raise Exception(f"Insufficient inventory for {product}")
+
+                # Record that this key was processed — in the same transaction
+                cur.execute(
+                    "INSERT INTO saga_completed_steps (step_key) VALUES (%s)",
+                    (key,)
+                )
+            conn.commit()
+        return "APPLIED"
+
+    print(f"  Idempotency key: {idempotency_key}")
+    print(f"\n  First call (should deduct {deduct_qty} from {deduct_product}):")
+    result1 = idempotent_deduct(idempotency_key, deduct_product, deduct_qty)
+    print(f"    Result: {result1}")
+    show_state("After first call")
+
+    print(f"\n  Second call (simulated retry — same idempotency key):")
+    result2 = idempotent_deduct(idempotency_key, deduct_product, deduct_qty)
+    print(f"    Result: {result2}")
+    show_state("After retry (inventory should be unchanged from first call)")
+
+    print(f"""
+  Idempotency outcome:
+    First call:  {result1} — inventory deducted once
+    Second call: {result2} — no double-deduction
+
+  Without the idempotency check, a retry would deduct {deduct_qty} again.
+  For a payment charge, this would mean a double-charge. For inventory,
+  it would mean stock goes negative. Both are production incidents.
+
+  Implementation pattern:
+    1. Generate a unique idempotency key per logical operation
+       (e.g., saga_id + step_name + attempt_number)
+    2. In the same DB transaction as the business operation,
+       INSERT the key into a completed_steps table
+    3. On retry, check for the key BEFORE acting; if found, return success
+    4. The check + insert + business operation must be in ONE transaction
+       so a crash between them is safe to retry
+""")
+
     # ── Summary ───────────────────────────────────────────────────
     section("Summary")
     print("""
@@ -463,6 +644,8 @@ def main():
     - Blocking: coordinator failure freezes all participants
     - Tight coupling: all services must support XA protocol
     - Low throughput: locks held across network round-trips
+    - Heuristic decisions (self-resolving after timeout) can
+      cause heuristic inconsistencies that require manual fix
 
   Saga
     + Non-blocking: each step commits locally
@@ -471,6 +654,14 @@ def main():
     - Eventual consistency only
     - Compensations must be carefully designed and idempotent
     - Intermediate states are visible to concurrent reads
+    - "Stuck saga" when compensation itself fails — needs retry
+      infrastructure (DLQ) and human escalation path
+
+  Idempotency (required for all saga steps):
+    - Use a unique key per logical operation
+    - Check + mark + act in a single local transaction
+    - Prevents double-charges, double-debits on retry
+    - Standard: idempotency_key column with UNIQUE constraint
 
   When to use 2PC:
     - Single-datacenter, same-org databases
@@ -482,8 +673,21 @@ def main():
     - Long-lived business transactions (minutes to hours)
     - When eventual consistency is acceptable (most of the time)
 
+  TCC (Try-Confirm/Cancel):
+    - Middle ground: reserves resources without DB-level locks
+    - Near-strong consistency without 2PC blocking
+    - Each service implements 3 endpoints + self-cancellation timer
+    - Popular in fintech and booking systems
+
+  Outbox Pattern:
+    - Write event to outbox table in same local transaction
+    - Separate process (Debezium/CDC) publishes to message bus
+    - Solves dual-write: no event is lost on crash between DB write
+      and message bus publish
+
   Real-world: Stripe uses event-driven Sagas for payment flows.
   Temporal.io is a popular saga orchestration framework.
+  Debezium + Kafka is the standard Outbox implementation.
 
   Next: ../03-consensus-paxos-raft/
 """)

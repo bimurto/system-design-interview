@@ -12,14 +12,22 @@ services:
     command: >
       postgres
       -c wal_level=replica
-      -c max_wal_senders=3
-      -c max_replication_slots=3
-      -c wal_keep_size=64
+      -c max_wal_senders=5
+      -c max_replication_slots=5
+      -c wal_keep_size=128
+      -c synchronous_commit=local
+      -c wal_sender_timeout=10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d captest"]
       interval: 5s
       timeout: 5s
-      retries: 10
+      retries: 12
+      start_period: 5s
 
   postgres-replica:
     image: postgres:15
@@ -30,16 +38,30 @@ services:
     depends_on:
       postgres-primary:
         condition: service_healthy
+    # pg_basebackup clones the primary, then writes a standby.signal and
+    # postgresql.auto.conf (via -R) so the replica auto-starts streaming
+    # replication once `postgres` launches. The loop retries if the primary
+    # is not yet ready (race between healthcheck pass and pg_hba reload).
     command: >
       bash -c "
-        until pg_basebackup -h postgres-primary -D /var/lib/postgresql/data -U postgres -Fp -Xs -P -R; do
-          echo 'Waiting for primary...'
-          sleep 2
+        until pg_basebackup -h postgres-primary -U postgres -D /var/lib/postgresql/data -Fp -Xs -P -R --checkpoint=fast; do
+          echo 'pg_basebackup: primary not ready, retrying in 3s...'
+          sleep 3
         done
-        postgres
+        exec postgres
       "
+    restart: on-failure
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # The replica's data directory is only populated after pg_basebackup
+      # completes, so we also verify pg_is_in_recovery() to confirm standby
+      # mode (not a misconfigured standalone instance).
+      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -c 'SELECT pg_is_in_recovery()' | grep -q t"]
       interval: 5s
       timeout: 5s
       retries: 20
+      start_period: 30s

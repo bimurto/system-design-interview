@@ -161,39 +161,51 @@ Common algorithms: token bucket (bursty), fixed window (simple), sliding window 
 
 ### Trade-offs
 
-| Approach  | Pros                                              | Cons                                                     |
-|-----------|---------------------------------------------------|----------------------------------------------------------|
-| REST      | Cacheable, familiar, tooling everywhere           | Over/under-fetching, N+1 risk                           |
-| GraphQL   | Precise data fetching, single request             | Caching hard, complexity attacks, resolver N+1          |
-| gRPC      | Compact binary, streaming, type-safe              | Binary debugging, browser needs proxy                   |
-| Webhooks  | Push-based (no polling), event-driven             | Client must expose endpoint; retry/ordering complexity  |
+| Approach        | Pros                                              | Cons                                                          |
+|-----------------|---------------------------------------------------|---------------------------------------------------------------|
+| REST            | Cacheable, familiar, tooling everywhere           | Over/under-fetching, N+1 risk, rigid field sets              |
+| GraphQL         | Precise data fetching, single HTTP request        | Caching hard, complexity attacks, DB-layer resolver N+1      |
+| gRPC            | Compact binary, streaming, type-safe              | Binary debugging, browser needs grpc-web proxy               |
+| Webhooks        | Push-based (no polling), event-driven             | Client must expose endpoint; retry/ordering/fan-out complexity|
+| WebSockets/SSE  | Real-time bidirectional / server push             | Stateful connections, hard to scale horizontally, load balancer config |
+
+**Choosing between WebSockets and SSE:** SSE is unidirectional (server → client), uses standard HTTP, and reconnects automatically — ideal for live feeds, notifications, dashboards. WebSockets are bidirectional and lower overhead per message — ideal for chat, collaborative editing, gaming. SSE is simpler to deploy (no protocol upgrade, no sticky-session requirement when using event IDs for reconnect).
 
 ### Failure Modes
 
-**N+1 query problem in REST:** A client fetches a list of 5 users, then for each user fetches their posts — 1 + 5 = 6 requests where 1 should suffice. At the database layer, this translates to N separate SQL queries per list response. Fix server-side with eager loading (`JOIN` or `IN` query) and expose compound endpoints or GraphQL where clients can request nested data in one shot.
+**N+1 query problem (HTTP layer — REST):** A client fetches a list of 5 users, then for each user fetches their posts — 1 + 5 = 6 requests where 1 should suffice. Fix server-side with eager loading (`GET /users?include=posts` or a GraphQL query) and expose compound endpoints where clients can request nested data in one shot.
 
-**GraphQL complexity attacks:** A malicious or buggy client can send a deeply nested query — users with posts, each post with comments, each comment with its author, each author with their posts... — that causes exponential database load on a single HTTP request. A single query can DoS your server. Mitigations: query depth limits, query complexity scoring (assign a cost to each field), and rate limiting by complexity score rather than request count.
+**N+1 query problem (DB layer — GraphQL):** GraphQL solves HTTP-layer N+1 but introduces it at the resolver layer. `users { posts { ... } }` triggers N separate SQL `SELECT * FROM posts WHERE user_id = ?` calls — one per user. Fix with the **DataLoader pattern**: batch all user IDs collected in the same event-loop tick into one `WHERE user_id IN (1,2,3...)` query, then fan results back to each waiting resolver. Without DataLoader, a GraphQL server under load will exhaust DB connection pools.
+
+**GraphQL complexity attacks:** A malicious or buggy client sends a deeply nested query — `users { posts { comments { author { posts { comments { ... } } } } } }` — that causes exponential resolver fan-out on a single HTTP request. One query can DoS the DB. Mitigations (apply all three in production):
+- **Query depth limit:** reject queries deeper than N levels (e.g., `max_depth=5`)
+- **Query complexity scoring:** assign a cost to each field; reject queries exceeding a budget (e.g., each list field costs 10, each scalar costs 1)
+- **Persisted queries only:** in production, only allow pre-registered queries by hash; reject ad-hoc query strings entirely (eliminates the attack surface)
 
 **API versioning drift:** Maintaining v1, v2, and v3 in parallel means every bug fix must be applied to all active versions, every new feature must decide which versions receive it, and the test surface triples. Teams often underestimate the long-term maintenance burden. Prefer additive changes (new fields, new optional parameters) that don't require version bumps, and set firm deprecation timelines with migration guides.
 
 **Missing idempotency on payment/charge endpoints:** Networks are unreliable. A client sends a charge request, the network times out, the client retries — but the first request succeeded. Without an idempotency key, the customer is charged twice. This is not a theoretical risk: it happens in production under normal network conditions. Every endpoint with financial or irreversible side effects must accept and honor idempotency keys.
 
+**Webhook delivery failures:** Webhooks invert the connection direction — your server POSTs to the client's endpoint. Failure modes: (1) client endpoint is down → event lost unless you implement a retry queue with exponential backoff; (2) events arrive out of order (network re-ordering, parallel retries) → client must handle idempotent event processing and sequence numbers; (3) fan-out at scale — 1M subscribers for one event means 1M outbound HTTP requests in a burst, requiring a dedicated async delivery queue (Kafka/SQS) and per-subscriber rate limiting. Always include an event ID and timestamp; clients should deduplicate on the ID.
+
 ---
 
 ## Interview Talking Points
 
-- "REST for external/public APIs (familiar, cacheable, browser-native), gRPC for internal service-to-service communication (efficient binary protocol, streaming, compile-time type safety)."
-- "Cursor pagination for any real-time feed — offset pagination breaks when data is inserted between pages, causing users to skip or see duplicate items."
-- "Every mutating endpoint that clients might retry needs an idempotency key — especially payments. The network is unreliable; retries are normal; duplicates are not acceptable."
-- "GraphQL solves over-fetching but makes HTTP caching harder — REST GET responses are cacheable by default by CDNs and browsers. GraphQL requires persisted queries or client-side caching to compensate."
-- "URL versioning (/v1/) for external APIs (visible, easy to route, survives copy-pasted URLs), header versioning for internal APIs (cleaner URLs, fine since clients are controlled)."
+- "REST for external/public APIs (familiar, cacheable, browser-native), gRPC for internal service-to-service communication (efficient binary protocol, streaming, compile-time type safety). GraphQL for mobile or multi-client scenarios where different clients need different data shapes without backend changes."
+- "GraphQL solves HTTP-layer N+1 but introduces resolver-layer N+1 at the DB. You must pair GraphQL with DataLoader: it batches all concurrent resolver calls in the same event-loop tick into one `WHERE id IN (...)` query. Without it, a 100-user query fires 100 separate DB queries."
+- "Cursor pagination for any real-time feed — offset pagination breaks when data is inserted between pages, causing users to skip or see duplicate items. Cursor = opaque token encoding the last-seen position; the client can't jump to page 5, but feeds don't need to."
+- "Every mutating endpoint that clients might retry needs an idempotency key — especially payments. Cache the response in Redis for 24h keyed by the idempotency UUID. If the same key arrives again, return the cached result; skip processing. This turns unreliable networks into a correctness guarantee."
+- "GraphQL solves over-fetching but makes HTTP caching harder — REST GET responses are cacheable by default by CDNs and browsers. GraphQL uses POST with dynamic bodies; fix with persisted queries (hash → GET /graphql?queryId=abc) to make responses CDN-cacheable."
+- "URL versioning (/v1/) for external APIs (visible, easy to route, survives copy-pasted URLs), header versioning for internal APIs (cleaner URLs, fine since clients are controlled). In both cases: never remove fields without a major version bump; prefer additive changes."
+- "GraphQL in production requires query depth limits AND complexity scoring — a single deeply nested query can DoS the DB. At Facebook/GitHub scale, only persisted queries are allowed in production; ad-hoc query strings are rejected entirely, eliminating the attack surface."
 
 ---
 
 ## Hands-on Lab
 
-**Time:** ~20–30 minutes
-**Services:** rest-api (Flask), graphql-api (Strawberry/Flask), redis (idempotency store)
+**Time:** ~25–35 minutes
+**Services:** rest-api (Flask + Redis), graphql-api (Strawberry/Flask), redis (idempotency store)
 
 ### Setup
 
@@ -209,11 +221,15 @@ Wait ~30 seconds for pip installs inside containers to complete before running t
 python experiment.py
 ```
 
-The experiment runs three phases demonstrating core API design tradeoffs:
+The experiment runs seven phases demonstrating core API design tradeoffs:
 
-1. **N+1 demo (REST)** — fetches 5 users then their posts individually: 6 total HTTP requests, showing the N+1 pattern explicitly with timing
-2. **GraphQL comparison** — fetches the same users+posts data in a single GraphQL query: 1 request, demonstrating the reduction in round trips
-3. **Over-fetching demo** — compares full REST user object payload vs a GraphQL query selecting only `{id, name}`, showing payload size difference
+1. **N+1 demo (REST)** — fetches 5 users then their posts individually: 6 total HTTP requests, showing the N+1 pattern with explicit timing
+2. **GraphQL single request** — same data in 1 GraphQL query; also surfaces the server-side resolver call count
+3. **GraphQL resolver N+1** — explains that GraphQL solves HTTP-layer N+1 but the DB layer still fires N resolver calls without DataLoader
+4. **Over-fetching** — compares full REST user object payload vs a GraphQL query selecting only `{name}`, showing payload size and bandwidth difference
+5. **Idempotency keys** — sends a payment request twice with the same `Idempotency-Key` (safe retry), then twice without (double-charge)
+6. **REST eager-loading** — `GET /users?include=posts` solves N+1 server-side in 1 HTTP request; compares tradeoffs with GraphQL
+7. **Comparison table** — REST vs GraphQL across caching, versioning, error handling, complexity attacks, real-time, and use-case selection
 
 ### Break It
 
@@ -223,13 +239,14 @@ Stop the GraphQL service while the experiment is running to observe graceful deg
 docker compose stop graphql-api
 ```
 
-Re-run `python experiment.py`. Phase 2 (GraphQL) will fail with a connection error while Phase 1 (REST) continues to work, demonstrating why service isolation matters.
+Re-run `python experiment.py`. Phases 2–4 (GraphQL) will fail with a connection error while Phase 1 (REST) continues to work, demonstrating why service isolation and graceful fallback matter.
 
 ### Observe
 
-- Request counts: REST makes 6 requests to retrieve 5 users with posts; GraphQL makes 1
-- Payload size: REST over-fetches full user objects; GraphQL returns only requested fields
-- Timing: GraphQL single request is not always faster per se — the win is fewer round trips and less client-side waterfall
+- **Request counts:** REST N+1 makes 6 requests; GraphQL makes 1; REST eager-loading also makes 1
+- **Resolver calls:** Phase 3 shows GraphQL fires N `posts` resolver calls server-side — the DB-layer N+1
+- **Idempotency:** Phase 5 shows same `payment_id` returned on retry (safe), vs two different `payment_id` values without a key (double-charge)
+- **Payload size:** REST over-fetches; GraphQL returns only requested fields — visible in MB/s calculation at scale
 
 ### Teardown
 

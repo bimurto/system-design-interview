@@ -15,6 +15,15 @@ services:
 
   redis:
     image: redis:7
+    # maxmemory + allkeys-lru makes Redis behave as a proper bounded cache:
+    # once the 32 MB limit is hit, it evicts the least-recently-used key.
+    # This lets the experiment demonstrate real eviction behaviour.
+    # allkeys-lru is the recommended policy for pure caching workloads.
+    command: >
+      redis-server
+      --maxmemory 32mb
+      --maxmemory-policy allkeys-lru
+      --save ""
     ports:
       - "6379:6379"
     healthcheck:

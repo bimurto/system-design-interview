@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Indexes Lab — B-tree, composite, partial indexes in PostgreSQL
+Indexes Lab — B-tree, composite, partial, covering, and functional indexes in PostgreSQL
 
 Prerequisites: docker compose up -d (wait ~10s)
 
@@ -8,8 +8,10 @@ What this demonstrates:
   1. Sequential scan (no index) vs B-tree index on a single column
   2. Composite index: wrong column order (unused prefix) vs correct order
   3. Partial index: index only the subset of rows you query
-  4. Write overhead: INSERT timing with 0 indexes vs 4 indexes
-  5. EXPLAIN ANALYZE output: understanding cost, rows, actual time
+  4. Covering index (Index Only Scan): eliminate heap fetch entirely
+  5. Functional index: index on an expression, not a raw column
+  6. Write overhead: INSERT timing with 0 indexes vs 4 indexes
+  7. EXPLAIN ANALYZE output: understanding cost, rows, actual time
 """
 
 import re
@@ -60,12 +62,23 @@ def extract_timing(explain_output):
 
 
 def extract_plan_type(explain_output):
-    """Extract the top-level scan type from EXPLAIN output."""
+    """Extract the top-level scan type from EXPLAIN output.
+
+    Precedence: Index Only Scan > Index Scan > Bitmap Heap Scan > Seq Scan
+    so that composite plan names (Bitmap Heap Scan → Bitmap Index Scan) are
+    reported at the heap level (the outermost node the planner emits first).
+    """
+    found = set()
     for line in explain_output:
         text = line[0]
-        for scan in ["Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Index Scan", "Bitmap Heap Scan"]:
+        for scan in ["Index Only Scan", "Index Scan", "Bitmap Heap Scan",
+                     "Bitmap Index Scan", "Seq Scan"]:
             if scan in text:
-                return scan
+                found.add(scan)
+    for preferred in ["Index Only Scan", "Index Scan", "Bitmap Heap Scan",
+                      "Bitmap Index Scan", "Seq Scan"]:
+        if preferred in found:
+            return preferred
     return "Unknown"
 
 
@@ -216,11 +229,14 @@ def main():
     print(f"\n  Speedup over sequential scan: {speedup:.0f}x")
     print("""
   B-tree internals:
-    - Root node → internal nodes → leaf nodes (contain actual row pointers)
-    - Tree depth is O(log n): 500k rows = ~19 levels deep
-    - Each level is typically one disk page (8KB) read
-    - Equality lookup: traverse ~4 levels, fetch 1 heap page
-    - Maintenance: INSERT/UPDATE/DELETE must update the tree (write overhead)
+    - Root node → internal nodes → leaf nodes (contain row heap pointers)
+    - Each Postgres B-tree NODE is one 8KB page — each page holds many keys
+      (not a binary tree where each node holds one key). A 500k-row B-tree
+      is only 3-4 levels deep, not log2(500k)=~19 levels.
+    - Equality lookup: traverse ~3-4 levels (3-4 page reads), fetch 1 heap page
+    - Range lookup: traverse to first leaf, then scan leaf siblings (linked list)
+    - Maintenance: INSERT/UPDATE/DELETE must update the tree → write overhead
+    - Page splits: when a leaf is full, it splits into two pages (write amplification)
 """)
 
     # ── Phase 3: Composite Index — Wrong Order ────────────────────
@@ -340,8 +356,125 @@ def main():
     - High-value rows: CREATE INDEX ON orders(customer_id) WHERE total > 1000
 """)
 
-    # ── Phase 6: Write Overhead ────────────────────────────────────
-    section("Phase 6: Write Overhead — 0 Indexes vs 4 Indexes")
+    # ── Phase 6: Covering Index (Index Only Scan) ─────────────────
+    section("Phase 6: Covering Index — Index Only Scan")
+    print("""
+  A covering index stores all columns the query needs inside the index
+  itself. The database never touches the heap (table data pages) at all.
+
+  Regular index scan:  index leaf → heap page fetch → return row
+  Index Only Scan:     index leaf → return row  (heap skipped entirely)
+
+  CREATE INDEX ON users(city) INCLUDE (name, email);
+  Query: SELECT name, email FROM users WHERE city = 'Chicago'
+
+  The INCLUDE columns are stored in leaf nodes but not sorted on —
+  they are payload, not search keys. Postgres 11+ supports INCLUDE.
+
+  Visibility Map requirement: Index Only Scan still checks the
+  visibility map (a 1-bit-per-page bitmap) to confirm pages are
+  fully visible (no dead tuples requiring heap check). VACUUM keeps
+  the visibility map current. On a freshly vacuumed table the
+  Index Only Scan is as fast as possible.
+""")
+    drop_all_indexes(conn)
+    with conn.cursor() as cur:
+        # After drop_all_indexes the table has no non-PK indexes.
+        # VACUUM ensures visibility map is current so Index Only Scan fires.
+        cur.execute("VACUUM users")
+        cur.execute("CREATE INDEX idx_city_covering ON users(city) INCLUDE (name, email)")
+
+    # Regular index scan: SELECT * (requires heap for all columns)
+    rows_heap = run_explain(conn,
+        "SELECT * FROM users WHERE city = %s", ("Chicago",), buffers=True)
+    heap_time = extract_timing(rows_heap)
+    heap_scan = extract_plan_type(rows_heap)
+
+    # Index Only Scan: SELECT only covered columns
+    rows_ios = run_explain(conn,
+        "SELECT name, email FROM users WHERE city = %s", ("Chicago",), buffers=True)
+    ios_time = extract_timing(rows_ios)
+    ios_scan = extract_plan_type(rows_ios)
+
+    print(f"  SELECT * FROM users WHERE city='Chicago'        (needs heap)")
+    print(f"  Scan type : {heap_scan}")
+    print(f"  Exec time : {heap_time:.2f} ms")
+    print()
+    print(f"  SELECT name, email FROM users WHERE city='Chicago'  (all in index)")
+    print(f"  Scan type : {ios_scan}")
+    print(f"  Exec time : {ios_time:.2f} ms")
+
+    if ios_time and ios_time > 0 and heap_time and heap_time > 0:
+        ios_speedup = heap_time / ios_time
+        print(f"\n  Heap-fetch elimination speedup: {ios_speedup:.1f}x")
+
+    print("""
+  When to use covering indexes:
+    - High-frequency queries that SELECT only a handful of columns
+    - COUNT(*) or aggregate queries on indexed columns
+    - Hot lookup paths where heap I/O is the bottleneck
+
+  Trade-off: INCLUDE columns increase index size and write overhead.
+  Use EXPLAIN (ANALYZE, BUFFERS) and look for 'Heap Fetches: 0' in
+  the Index Only Scan node to confirm the heap is truly skipped.
+""")
+
+    # ── Phase 7: Functional Index — Expression on a Column ────────
+    section("Phase 7: Functional Index — Indexing an Expression")
+    print("""
+  A common mistake: indexing email but querying with LOWER(email).
+
+  WHERE LOWER(email) = 'user42@...'
+    → The index on email stores original values, not LOWER() values.
+    → Postgres CANNOT use the index. Full sequential scan results.
+
+  Fix: CREATE INDEX ON users(LOWER(email));
+    → The index stores pre-computed LOWER(email) values.
+    → The query matches the index expression and uses it.
+
+  This is a functional (expression) index. Any deterministic
+  expression can be indexed: LOWER(), UPPER(), EXTRACT(), jsonb->>'key'.
+""")
+    drop_all_indexes(conn)
+
+    # Query without functional index — must seq scan
+    rows_no_func = run_explain(conn,
+        "SELECT * FROM users WHERE LOWER(email) = LOWER(%s)", (target_email,))
+    no_func_time = extract_timing(rows_no_func)
+    no_func_scan = extract_plan_type(rows_no_func)
+    print(f"  Query LOWER(email) = ... — no functional index:")
+    print(f"  Scan type : {no_func_scan}")
+    print(f"  Exec time : {no_func_time:.2f} ms")
+
+    # Create functional index on LOWER(email)
+    with conn.cursor() as cur:
+        cur.execute("CREATE INDEX idx_email_lower ON users(LOWER(email))")
+    with conn.cursor() as cur:
+        cur.execute("ANALYZE users")
+
+    rows_func = run_explain(conn,
+        "SELECT * FROM users WHERE LOWER(email) = LOWER(%s)", (target_email,))
+    func_time = extract_timing(rows_func)
+    func_scan = extract_plan_type(rows_func)
+    print(f"\n  Query LOWER(email) = ... — WITH functional index on LOWER(email):")
+    print(f"  Scan type : {func_scan}")
+    print(f"  Exec time : {func_time:.2f} ms")
+
+    if func_time and func_time > 0 and no_func_time:
+        func_speedup = no_func_time / func_time
+        print(f"\n  Speedup: {func_speedup:.0f}x (seq scan eliminated)")
+
+    print("""
+  Key point for interviews:
+    Any transformation in WHERE (LOWER, UPPER, EXTRACT, arithmetic,
+    type casts) breaks the index unless you create a matching
+    functional index. This is one of the most common index bugs in
+    production — found via EXPLAIN ANALYZE showing Seq Scan despite
+    an index existing on the column.
+""")
+
+    # ── Phase 8: Write Overhead ────────────────────────────────────
+    section("Phase 8: Write Overhead — 0 Indexes vs 4 Indexes")
     print("""
   Every index slows down INSERT/UPDATE/DELETE because the index
   B-tree must be updated alongside the heap (table data).
@@ -410,37 +543,62 @@ def main():
 """)
 
     # ── Summary ────────────────────────────────────────────────────
+    def _t(val):
+        """Format timing value, handling None gracefully."""
+        return f"{val:>8.2f}" if val is not None else "     N/A"
+
     section("Summary: Index Types and When to Use Each")
     print(f"""
   Results:
-  ┌─────────────────────────────────────┬───────────────┬──────────────┐
-  │ Experiment                          │ Scan Type     │ Time (ms)    │
-  ├─────────────────────────────────────┼───────────────┼──────────────┤
-  │ email lookup — no index             │ Seq Scan      │ {seq_time:>8.2f}     │
-  │ email lookup — B-tree index         │ Index Scan    │ {btree_time:>8.2f}     │
-  │ (city, age) — age-only query        │ Seq Scan      │ {age_only_time:>8.2f}     │
-  │ (city, age) — city+age query        │ {correct_scan:<13s} │ {correct_time:>8.2f}     │
-  │ partial (age>30) — matching query   │ {partial_scan:<13s} │ {partial_time:>8.2f}     │
-  │ partial (age>30) — outside range    │ Seq Scan      │ {no_partial_time:>8.2f}     │
-  └─────────────────────────────────────┴───────────────┴──────────────┘
+  ┌──────────────────────────────────────────┬──────────────────┬────────────┐
+  │ Experiment                               │ Scan Type        │ Time (ms)  │
+  ├──────────────────────────────────────────┼──────────────────┼────────────┤
+  │ email lookup — no index                  │ Seq Scan         │ {_t(seq_time)}   │
+  │ email lookup — B-tree index              │ Index Scan       │ {_t(btree_time)}   │
+  │ (city, age) — age-only query             │ Seq Scan         │ {_t(age_only_time)}   │
+  │ (city, age) — city+age query             │ {correct_scan:<16s} │ {_t(correct_time)}   │
+  │ partial (age>30) — matching query        │ {partial_scan:<16s} │ {_t(partial_time)}   │
+  │ partial (age>30) — outside range         │ Seq Scan         │ {_t(no_partial_time)}   │
+  │ covering index — SELECT *                │ {heap_scan:<16s} │ {_t(heap_time)}   │
+  │ covering index — SELECT name,email       │ {ios_scan:<16s} │ {_t(ios_time)}   │
+  │ LOWER(email) — no functional index       │ Seq Scan         │ {_t(no_func_time)}   │
+  │ LOWER(email) — functional index          │ {func_scan:<16s} │ {_t(func_time)}   │
+  └──────────────────────────────────────────┴──────────────────┴────────────┘
 
   Index Types Cheat Sheet:
-    B-tree   — equality, range, ORDER BY. Default. Use for almost everything.
+    B-tree   — equality, range, ORDER BY, prefix LIKE. Default. Almost everything.
     Hash     — equality only. Rarely better than B-tree in Postgres.
-    GIN      — full-text search, JSONB, arrays. "Contains" queries.
-    BRIN     — block range index. Huge tables with correlated physical order
-               (e.g., time-series). Very small index, approximate.
-    GiST     — geometric types, full-text. Flexible operator classes.
+    GIN      — full-text search, JSONB @>, arrays. "Contains" queries.
+    BRIN     — block range index. Huge append-only tables (time-series).
+               Tiny overhead, approximate: only useful when physical row order
+               correlates with query order (e.g., created_at for events table).
+    GiST     — geometric types, full-text, nearest-neighbor. Flexible operators.
+    Partial  — index on a filtered subset. Small, fast, low write cost.
+    Covering — INCLUDE extra columns in leaf nodes. Eliminates heap fetch.
+    Functional — index on an expression: LOWER(col), EXTRACT(year FROM ts).
 
   Index Selectivity:
-    High selectivity (few matching rows) → index is fast.
-    Low selectivity (many matching rows, e.g., boolean column) → seq scan faster.
-    Rule of thumb: index pays off when < 5-10% of rows match the query.
+    High selectivity (few matching rows) → index is worthwhile.
+    Low selectivity (e.g., boolean column, 95% true) → seq scan cheaper.
+    Rule of thumb: index pays off when < 5-10% of rows match the predicate.
+
+  B-tree Depth Reality Check:
+    A Postgres B-tree node = one 8KB page holding ~hundreds of keys.
+    500k-row table → ~3-4 levels deep (not log2(500k)=19 levels).
+    Each level = one page read. Indexed lookup = 3-4 I/Os vs thousands for seq scan.
 
   Covering Index (Index Only Scan):
     CREATE INDEX ON users(city) INCLUDE (name, email);
-    → Fetches data directly from index without touching heap.
-    → Eliminates heap page fetch, fastest possible scan.
+    → Returns data directly from index leaf nodes without touching the heap.
+    → Check 'Heap Fetches: 0' in EXPLAIN ANALYZE to confirm.
+    → Requires up-to-date visibility map (run VACUUM regularly).
+
+  Monitoring:
+    SELECT indexname, idx_scan, idx_tup_read
+    FROM pg_stat_user_indexes
+    WHERE tablename = 'users'
+    ORDER BY idx_scan;
+    → Zero-scan indexes are candidates for removal.
 
   Next: ../10-networking-basics/
 """)

@@ -20,12 +20,39 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+
+      # Two listeners: INTERNAL for container-to-container, EXTERNAL for host access.
+      # Without this split, the advertised address for host clients (localhost:9092)
+      # would also be used by internal Docker services, breaking inter-broker comms
+      # in multi-broker setups.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # Replication factor of 1 is appropriate for a single-broker lab.
+      # In production, use 3 replicas + min.insync.replicas=2.
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Disable rebalance delay so consumer groups form immediately in the lab.
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Allow the experiment script to auto-create topics.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_NUM_PARTITIONS: 3
+
+      # Retention: keep 1 hour of data (default is 7 days).
+      # Explicitly set here so the lab teardown is clean and the value
+      # is visible — in production this is a critical durability knob.
+      KAFKA_LOG_RETENTION_HOURS: 1
+      KAFKA_LOG_RETENTION_BYTES: -1          # no size cap; time-based only
+      KAFKA_LOG_SEGMENT_BYTES: 104857600     # 100 MB segment files
+
+      # Idempotent producer support requires this on the broker side.
+      KAFKA_ENABLE_IDEMPOTENCE: "true"
+
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s

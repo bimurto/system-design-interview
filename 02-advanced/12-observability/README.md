@@ -1,7 +1,7 @@
 # Observability
 
 **Prerequisites:** `../10-cdn-and-edge/`
-**Next:** `../12-security-at-scale/`
+**Next:** `../13-security-at-scale/`
 
 ---
 
@@ -67,6 +67,60 @@ SLO (Service Level Objective) is a target for a measurable SLI (Service Level In
     Errors      = disk errors, packet drops, hardware faults
 ```
 
+**Multi-window burn rate alerting (Google SRE chapter 5):**
+
+```
+  Problem: a single-window alert (rate(errors[1h]) > threshold) either
+  fires too slowly (misses short spikes) or fires too often (false positives).
+
+  Solution: burn rate = actual error rate / SLO error rate
+  If SLO is 99.9% (error budget = 0.1%):
+    burn rate 1 = consuming budget at exactly 1x speed (use it in 30 days)
+    burn rate 14.4 = budget exhausted in 2 hours → page immediately
+
+  Multi-window: alert only when both a fast window AND slow window fire.
+  Fast window catches the spike; slow window confirms it's not a blip.
+
+  Google's recommended thresholds (for 99.9% SLO, 30-day window):
+  ┌──────────────────┬────────────┬────────────┬───────────────────┐
+  │ Severity         │ Burn Rate  │ Fast Window│ Slow Window       │
+  ├──────────────────┼────────────┼────────────┼───────────────────┤
+  │ Page (critical)  │ 14.4×      │ 1h         │ 5m                │
+  │ Page (high)      │ 6×         │ 6h         │ 30m               │
+  │ Ticket (medium)  │ 3×         │ 3d         │ 6h                │
+  └──────────────────┴────────────┴────────────┴───────────────────┘
+
+  PromQL for 14.4× burn rate alert:
+    (
+      rate(http_requests_total{status!~"5.."}[1h]) /
+      rate(http_requests_total[1h]) < 0.999 - 14.4 * (1 - 0.999)
+    ) AND (
+      rate(http_requests_total{status!~"5.."}[5m]) /
+      rate(http_requests_total[5m]) < 0.999 - 14.4 * (1 - 0.999)
+    )
+```
+
+**OpenTelemetry — the unified instrumentation standard:**
+
+```
+  OpenTelemetry (OTel) is the CNCF standard for emitting metrics, traces,
+  and logs from any language/framework, sending to any backend.
+
+  Architecture:
+    App code → OTel SDK → OTel Collector → Prometheus / Jaeger / Loki
+
+  Key advantage: vendor-neutral instrumentation. Change backend (Datadog →
+  Grafana Cloud) without re-instrumenting every service.
+
+  Auto-instrumentation: OTel agents instrument HTTP, DB, gRPC calls
+  automatically — no manual span creation needed for standard libraries.
+
+  Trace context propagation:
+    W3C Trace Context header: traceparent: 00-{traceId}-{spanId}-{flags}
+    Baggage header:           tracestate: vendor-specific key=value pairs
+  Both headers flow through every HTTP call, linking spans across services.
+```
+
 **Distributed tracing (span model):**
 
 ```
@@ -102,14 +156,22 @@ SLO (Service Level Objective) is a target for a measurable SLI (Service Level In
 
 **Histogram bucket misalignment:** If your latency histogram buckets are `[0.1, 0.5, 1.0, 5.0]` seconds but your SLO is `p99 < 200ms`, Prometheus cannot accurately compute whether the SLO is met — it can only say "between 100ms and 500ms." Align histogram buckets to your SLO thresholds.
 
+**Cardinality budget exhaustion:** A healthy Prometheus installation supports roughly 1–10M active time series before memory pressure causes OOM kills. Compute cardinality before labelling: a metric with labels `{endpoint, status_code, region, version}` with 50 endpoints × 10 status codes × 5 regions × 20 versions = 50,000 series per metric. A fleet of 50 such metrics = 2.5M series — already near the limit. Audit cardinality with `count by (__name__)({__name__=~".+"})`.
+
+**Missing the "long tail" in tracing sampling:** Distributed tracing commonly uses head-based sampling (e.g., keep 1% of traces) to reduce storage costs. This discards 99% of traces, including many slow or erroring ones. Tail-based sampling (decide whether to keep a trace *after* it completes, based on its outcome) captures the interesting traces. Tools like Grafana Tempo and AWS X-Ray support tail-based sampling. For FAANG interviews: mention that "always sample errors and slow traces" is a common policy.
+
+**Metrics without context:** Knowing your p99 is 500ms tells you something is wrong; knowing *which* endpoint, *which* downstream service, and *which* deployment caused it requires correlated signals. Exemplars bridge this gap — a Prometheus exemplar attaches a trace ID to a histogram observation, so you can jump from a slow bucket in Grafana directly to the Jaeger trace. Native histograms (Prometheus 2.40+) support exemplars natively.
+
 ## Interview Talking Points
 
-- "The three pillars are metrics (aggregates, cheap, alertable), traces (per-request causality, expensive), and logs (full context, most expensive). Use metrics for dashboards and alerts, traces for latency debugging, logs for error context."
-- "RED method for services: Rate, Errors, Duration. These three metrics answer 'is my service healthy?' for any user-facing endpoint."
-- "Prometheus histograms store bucket counts, not raw values. `histogram_quantile()` interpolates percentiles from buckets. This is why you must define buckets around your SLO thresholds."
-- "SLI is what you measure, SLO is your target, SLA is the contract. Error budget = 1 - SLO. Use error budgets to balance reliability vs feature velocity."
-- "Never use high-cardinality values as Prometheus label values — user IDs, request IDs, URLs with path parameters. Each unique label combination is a separate time series in memory."
-- "Distributed tracing propagates a trace ID across service boundaries via headers (`traceparent` in W3C Trace Context). Each service creates a span, reports to a central collector (Jaeger, Zipkin). The trace shows the full latency breakdown across all services."
+- "The three pillars are metrics (aggregates, cheap, alertable), traces (per-request causality, expensive), and logs (full context, most expensive). Use metrics for dashboards and alerts, traces for latency debugging, logs for error context. A fourth signal — continuous profiling — is increasingly common at scale (Google's pprof, Pyroscope)."
+- "RED method for services: Rate, Errors, Duration. These three metrics answer 'is my service healthy?' for any user-facing endpoint. USE method for infrastructure: Utilization, Saturation, Errors. Together they cover both user experience and resource health."
+- "Prometheus histograms store bucket counts, not raw values. `histogram_quantile()` interpolates percentiles from buckets — it's an approximation, not exact. Accuracy depends on bucket placement: put buckets at your SLO thresholds (e.g., 0.100, 0.200, 0.500 seconds for a 200ms SLO)."
+- "SLI is what you measure, SLO is your target, SLA is the contract. Error budget = 1 - SLO. Use error budgets to balance reliability vs feature velocity — healthy budget means ship faster, depleted budget means freeze deployments."
+- "Never use high-cardinality values as Prometheus label values — user IDs, request IDs, URLs with path parameters. Each unique label combination is a separate time series in memory. Audit cardinality with `count by (__name__)({__name__=~\".+\"})` before labelling a metric."
+- "Distributed tracing propagates a trace ID across service boundaries via headers (`traceparent` in W3C Trace Context). Each service creates a span, reports to a central collector (Jaeger, Zipkin). The trace shows the full latency breakdown across all services. OpenTelemetry is the vendor-neutral SDK standard — instrument once, switch backends without code changes."
+- "Multi-window burn rate alerting solves the alert latency vs noise trade-off. A 14.4× burn rate with both a 1h and 5m window fires within 5 minutes of a critical outage while ignoring brief transient spikes. This is the Google SRE recommended pattern for 30-day SLO windows."
+- "Tail-based sampling in distributed tracing is superior to head-based for debugging: decide whether to keep a trace *after* it completes so you always sample errors and slow traces. Head-based sampling (flip a coin at trace start) discards most of the interesting data."
 
 ## Hands-on Lab
 
@@ -119,39 +181,52 @@ SLO (Service Level Objective) is a target for a measurable SLI (Service Level In
 ### Setup
 
 ```bash
-cd system-design-interview/02-advanced/11-observability/
-docker compose up
+cd system-design-interview/02-advanced/12-observability/
+docker compose up -d flask-app prometheus grafana
 ```
 
 ### Experiment
 
-The script runs four phases automatically:
+```bash
+python experiment.py
+```
 
-1. Sends 500 requests across three endpoints — `/api/fast` (5-20ms), `/api/slow` (10% at 500ms), `/api/flaky` (5% errors). Prints client-side latency percentiles.
-2. Waits 15 seconds for Prometheus to scrape, then queries the Prometheus HTTP API using PromQL to retrieve request rate, error rate, and p50/p95/p99 latency from histogram buckets.
+The script runs five phases automatically:
+
+1. Sends 500 requests across four endpoints — `/api/fast` (5–20ms), `/api/slow` (10% at 500ms tail), `/api/flaky` (5% errors), `/api/db-call` (DB dependency instrumentation). Prints client-side latency percentiles.
+2. Waits 15 seconds for Prometheus to scrape, then queries the Prometheus HTTP API using PromQL to retrieve request rate, error rate, and p50/p95/p99 latency from histogram buckets. Shows per-endpoint p99 breakdown and dependency vs service latency comparison.
 3. Evaluates three SLOs against the measured values: p99 < 200ms, error rate < 1%, throughput > 5 req/s. Prints VIOLATED or OK for each.
-4. Prints a full RED method summary and explains metric types (Counter, Gauge, Histogram).
+4. Computes error budget burn rate and maps it to alert severity (critical ≥ 14.4×, high ≥ 6×, medium ≥ 3×). Shows the multi-window burn rate PromQL pattern.
+5. Prints a full RED + USE method summary, metric type guide, cardinality math, and OpenTelemetry context.
 
 ### Break It
 
 Add a high-cardinality label to trigger Prometheus memory pressure:
 
 ```python
-# In flask_app.py, add user_id as a label:
-REQUEST_COUNT.labels(method="GET", endpoint="/api/fast", status_code="200", user_id="user_12345")
-# With 1M users this creates 1M time series — watch Prometheus RSS grow
+# In flask_app.py, add user_id as a label to REQUEST_COUNT:
+REQUEST_COUNT = Counter("http_requests_total", "...", ["method", "endpoint", "status_code", "user_id"])
+# Then pass a unique user_id per request — with 1M users this creates 1M time series.
+# Watch Prometheus RSS in `docker stats` as series accumulate.
 ```
 
-Or deliberately violate the SLO:
+Or deliberately violate the p99 SLO:
 
 ```python
-# Change /api/slow to always sleep 300ms (will push p99 > 200ms):
-time.sleep(0.3)
+# In flask_app.py, change /api/slow to always sleep 300ms:
+time.sleep(0.3)   # p99 will be ~300ms, well above the 200ms SLO
+```
+
+Or trigger a high burn rate:
+
+```python
+# Change flaky error rate from 5% to 50%:
+if random.random() < 0.50:   # 50% error rate = 500× burn rate on a 99.9% SLO
 ```
 
 ### Observe
 
-With the `/api/slow` endpoint having 10% at 500ms, the p99 should be around 450-500ms — well above the 200ms SLO threshold. The experiment will print "VIOLATED" for the p99 SLO. Open Grafana at `http://localhost:3000` to see the pre-provisioned RED method dashboard with live-updating panels.
+With the `/api/slow` endpoint having 10% of requests at 400–600ms, the aggregate p99 across all endpoints will be around 200–500ms depending on traffic distribution. The experiment will print "VIOLATED" or "OK" for each SLO. Open Grafana at `http://localhost:3000` to see the pre-provisioned RED method dashboard with live-updating panels.
 
 ### Teardown
 

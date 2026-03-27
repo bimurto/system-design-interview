@@ -10,14 +10,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   cache:
     image: redis:7
+    # Configure Redis to demonstrate the LRU eviction policy discussed in
+    # the README Interview Checklist Q8. maxmemory is set low (64mb) so the
+    # experiment can actually observe eviction behaviour locally.
+    # In production, tune maxmemory to leave ~20% headroom on the host.
+    command: >
+      redis-server
+      --maxmemory 64mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   web:
     image: python:3.11-slim
@@ -43,3 +56,4 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    restart: unless-stopped

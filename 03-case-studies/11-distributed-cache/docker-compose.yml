@@ -4,12 +4,22 @@ services:
     ports:
       - "7001:7001"
     command: >
-      redis-server --port 7001
+      redis-server
+        --port 7001
+        --bind 0.0.0.0
+        --protected-mode no
         --cluster-enabled yes
         --cluster-config-file nodes.conf
         --cluster-node-timeout 5000
-        --appendonly yes
         --cluster-require-full-coverage no
+        --cluster-announce-ip redis-1
+        --cluster-announce-port 7001
+        --appendonly yes
+        --appendfsync everysec
+        --save 60 1
+        --maxmemory 100mb
+        --maxmemory-policy allkeys-lru
+        --loglevel notice
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7001", "ping"]
       interval: 5s
@@ -21,12 +31,22 @@ services:
     ports:
       - "7002:7002"
     command: >
-      redis-server --port 7002
+      redis-server
+        --port 7002
+        --bind 0.0.0.0
+        --protected-mode no
         --cluster-enabled yes
         --cluster-config-file nodes.conf
         --cluster-node-timeout 5000
-        --appendonly yes
         --cluster-require-full-coverage no
+        --cluster-announce-ip redis-2
+        --cluster-announce-port 7002
+        --appendonly yes
+        --appendfsync everysec
+        --save 60 1
+        --maxmemory 100mb
+        --maxmemory-policy allkeys-lru
+        --loglevel notice
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7002", "ping"]
       interval: 5s
@@ -38,12 +58,22 @@ services:
     ports:
       - "7003:7003"
     command: >
-      redis-server --port 7003
+      redis-server
+        --port 7003
+        --bind 0.0.0.0
+        --protected-mode no
         --cluster-enabled yes
         --cluster-config-file nodes.conf
         --cluster-node-timeout 5000
-        --appendonly yes
         --cluster-require-full-coverage no
+        --cluster-announce-ip redis-3
+        --cluster-announce-port 7003
+        --appendonly yes
+        --appendfsync everysec
+        --save 60 1
+        --maxmemory 100mb
+        --maxmemory-policy allkeys-lru
+        --loglevel notice
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "7003", "ping"]
       interval: 5s
@@ -63,6 +93,7 @@ services:
       bash -c "
         sleep 2 &&
         redis-cli --cluster create redis-1:7001 redis-2:7002 redis-3:7003
-          --cluster-replicas 0 --cluster-yes
+          --cluster-replicas 0 --cluster-yes &&
+        echo 'Cluster init complete — all 16384 slots covered'
       "
     restart: "no"

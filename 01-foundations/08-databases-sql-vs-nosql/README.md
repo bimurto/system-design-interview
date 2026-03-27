@@ -64,25 +64,73 @@ NewSQL databases (CockroachDB, Google Spanner, YugabyteDB) attempt to provide SQ
 
 ### Failure Modes
 
-**N+1 query problem:** fetching 100 users and then querying posts for each user separately results in 101 queries instead of 1. This is the most common performance problem in relational systems. Solution: JOIN or batch query. In document databases, embedding prevents N+1, but deep nesting creates oversized documents.
+**N+1 query problem:** fetching 100 users and then querying posts for each user separately results in 101 queries instead of 1. This is the most common performance problem in relational systems. Solution: JOIN or batch query with `WHERE user_id = ANY(array)`. In document databases, embedding prevents N+1, but deep nesting creates oversized documents.
 
-**Eventual consistency surprises:** writing a document to MongoDB and immediately reading it back may return the old value if the read goes to a replica that hasn't caught up. Applications must either read from the primary or tolerate briefly stale data. Most NoSQL databases let you tune the consistency level per operation (Cassandra's `QUORUM` read, DynamoDB's `ConsistentRead`).
+**Eventual consistency surprises (read-your-writes):** writing a document to MongoDB or Cassandra and immediately reading it back may return the old value if the read goes to a replica that hasn't caught up. This happens even when the write returned "success" — because success means the write reached the required quorum, not all replicas. Applications must either read from the primary/use QUORUM reads, or be designed to tolerate briefly stale data.
 
-**Schema migration on large tables:** adding a non-nullable column to a 500M-row Postgres table can lock the table for minutes. Production zero-downtime migrations require: add column as nullable → deploy new code that writes both old and new format → backfill in batches → add NOT NULL constraint. Tools like pglogical and pt-online-schema-change handle this.
+**Cassandra tombstone accumulation:** deleting rows in Cassandra does not immediately remove data — it writes a tombstone marker that is replicated. Reads must scan through tombstones until a compaction removes them. A table with high delete rates accumulates millions of tombstones, causing read latency to spike orders of magnitude. Solution: TTL-based expiry instead of explicit deletes where possible; tune `gc_grace_seconds` and compaction strategy.
+
+**Schema migration on large tables:** adding a non-nullable column to a 500M-row Postgres table can lock the table for minutes. Production zero-downtime migrations require: add column as nullable → deploy new code that writes both old and new format → backfill in batches → add NOT NULL constraint. On Postgres 12+, use `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` followed by `VALIDATE CONSTRAINT` to avoid holding an exclusive lock during the validation scan.
+
+**Postgres connection exhaustion:** one OS process per connection means max_connections=100 is exhausted by 10 app servers with a 10-connection pool each. New connections beyond the limit get `FATAL: sorry, too many clients already`. Fix: PgBouncer in transaction-pooling mode multiplexes thousands of client connections over a small Postgres connection pool.
 
 **Document growth:** embedded arrays that grow without bound (a user's entire message history embedded in the user document) eventually hit the 16MB document size limit in MongoDB. Design for bounded document size by switching to a referenced model when arrays can grow large.
+
+### CAP Theorem Placement
+
+Every distributed database makes a trade-off between Consistency and Availability when a network partition occurs.
+
+| Database Type | CAP Classification | What is sacrificed |
+|---------------|-------------------|-------------------|
+| Postgres (single node) | CA | Partition tolerance (not distributed) |
+| CockroachDB / Spanner | CP | Availability (pauses writes during partition to maintain consistency) |
+| Cassandra / DynamoDB | AP | Consistency (serves stale reads during partition to stay available) |
+| MongoDB (with majority concern) | CP | Availability (primary steps down if it loses quorum) |
+| Redis Cluster | AP | Consistency (may split-brain and diverge during partition) |
+
+The CA column is only meaningful for single-node deployments — any distributed database must choose between C and A during a partition.
+
+### Quorum Reads and Writes (Cassandra / DynamoDB)
+
+Cassandra uses a replication factor (RF) and a configurable consistency level (CL). For RF=3:
+- `QUORUM` read/write requires ⌈RF/2⌉ + 1 = 2 nodes to respond
+- Write QUORUM + Read QUORUM guarantees at least one node has the latest write (W + R > RF)
+- `ONE` (write to 1 node, read from 1 node): maximum throughput, highest staleness risk
+- `ALL` (write to all 3, read from all 3): linearizable but unavailable if any node is down
+
+The math: if W + R > RF, reads are guaranteed to see the latest write. This is why `QUORUM` read + `QUORUM` write is the safe default at the cost of double the latency of `ONE`.
+
+### Read-Your-Writes Consistency
+
+A common surprise in eventually consistent systems: write a record, immediately read it back, get the old value. This happens when:
+1. A Cassandra write goes to node A (acknowledged as QUORUM success)
+2. The subsequent read happens to route to node B, which hasn't received the replication yet
+3. Result: the read returns the pre-write value — even though the write "succeeded"
+
+Solutions:
+- Use `LOCAL_QUORUM` or `QUORUM` for reads on the critical path
+- Route reads for the same user to the same node (session consistency)
+- Build the application to tolerate briefly stale reads (e.g., show cached data, then refresh)
+
+### Connection Pooling (Postgres Critical Gotcha)
+
+Postgres uses one OS process per connection. At 100 connections, Postgres holds 100 processes in memory. The default `max_connections=100` means with 20 app servers each opening a 10-connection pool, you exhaust the limit entirely. Beyond that, new connections get `FATAL: sorry, too many clients already`.
+
+**PgBouncer** is the industry-standard solution: it sits between the app and Postgres, multiplexing thousands of application connections over a small number of real Postgres connections. In transaction-pooling mode, a Postgres connection is borrowed only for the duration of a single transaction, then returned to the pool. At FAANG scale, PgBouncer (or its successor pgcat) is effectively mandatory.
 
 ## Interview Talking Points
 
 - "SQL vs NoSQL is the wrong question. The right question is: what are the access patterns, consistency requirements, and scale of this problem? Financial transactions need ACID → Postgres. Session storage needs speed → Redis. Time-series metrics need write throughput → InfluxDB or Cassandra."
-- "Document databases don't eliminate the JOIN problem — they move it to write time (denormalization) vs read time (JOIN). Embedding means no JOIN on read, but expensive writes when embedded data changes."
-- "BASE is a trade-off, not a bug. Cassandra's eventual consistency means a write that succeeds on one replica will propagate, but a read might briefly see old data. For most social app features (like counts), this is acceptable. For bank balances, it is not."
+- "Document databases don't eliminate the JOIN problem — they move it to write time (denormalization) vs read time (JOIN). Embedding means no JOIN on read, but expensive writes when embedded data changes. MongoDB's $lookup re-introduces the JOIN at the aggregation pipeline layer."
+- "BASE is a trade-off, not a bug. Cassandra's eventual consistency means a write that succeeds on one replica will propagate, but a read might briefly see old data. For most social app features (like counts), this is acceptable. For bank balances, it is not. Tune per-operation with QUORUM vs ONE."
 - "Polyglot persistence is the norm at scale. A production system uses Postgres for user accounts (ACID), Redis for sessions (speed), S3 for file storage (durability), and Elasticsearch for search (full-text). Use the right tool for each job."
-- "NewSQL (CockroachDB, Spanner) provides ACID at horizontal scale, but at higher latency than eventual-consistent NoSQL. The latency cost comes from consensus protocol overhead (Raft/Paxos)."
+- "NewSQL (CockroachDB, Spanner) provides ACID at horizontal scale, but at higher latency than eventual-consistent NoSQL. The latency cost comes from consensus protocol overhead (Raft/Paxos). Spanner uses TrueTime (atomic clocks) to bound clock skew and enable globally consistent reads."
+- "Postgres connection pooling is a gotcha that bites teams at scale. One process per connection means max_connections=100 is exhausted by 10 app servers with 10-connection pools each. PgBouncer in transaction-pooling mode is effectively mandatory for any production Postgres deployment."
+- "Read-your-writes consistency is not free in eventually consistent systems. After a successful Cassandra QUORUM write, a subsequent ONE read to a different replica may return the pre-write value. Applications must either use QUORUM reads on the critical path or be designed to tolerate brief staleness."
 
 ## Hands-on Lab
 
-**Time:** ~20-30 minutes
+**Time:** ~25-35 minutes
 **Services:** postgres (5432), redis (6379), mongodb (27017)
 
 ### Setup
@@ -91,6 +139,7 @@ NewSQL databases (CockroachDB, Google Spanner, YugabyteDB) attempt to provide SQ
 cd system-design-interview/01-foundations/08-databases-sql-vs-nosql/
 docker compose up -d
 # Wait ~15 seconds for all three databases to initialize
+pip install psycopg2-binary redis pymongo -q
 ```
 
 ### Experiment
@@ -99,61 +148,39 @@ docker compose up -d
 python experiment.py
 ```
 
-The script seeds 100 users with 5 posts each in all three databases, benchmarks read/write latency, and demonstrates schema evolution trade-offs.
-
-### Break It
-
-Demonstrate the N+1 problem in Postgres:
-
-```bash
-python -c "
-import psycopg2, time
-
-conn = psycopg2.connect('host=localhost port=5432 dbname=dbtest user=postgres password=postgres')
-conn.autocommit = True
-
-# Bad: N+1 queries — one per user
-start = time.perf_counter()
-with conn.cursor() as cur:
-    cur.execute('SELECT id FROM users LIMIT 20')
-    user_ids = [r[0] for r in cur.fetchall()]
-    for uid in user_ids:
-        cur.execute('SELECT COUNT(*) FROM posts WHERE user_id = %s', (uid,))
-        cur.fetchone()
-n1_ms = (time.perf_counter() - start) * 1000
-
-# Good: one JOIN query
-start = time.perf_counter()
-with conn.cursor() as cur:
-    cur.execute('''
-        SELECT u.id, COUNT(p.id) as post_count
-        FROM users u LEFT JOIN posts p ON p.user_id = u.id
-        GROUP BY u.id LIMIT 20
-    ''')
-    cur.fetchall()
-join_ms = (time.perf_counter() - start) * 1000
-
-print(f'N+1 queries (21 round-trips): {n1_ms:.1f}ms')
-print(f'JOIN query  (1 round-trip):   {join_ms:.1f}ms')
-print(f'JOIN is {n1_ms/join_ms:.1f}x faster')
-conn.close()
-"
-```
+The script runs eight lab sections:
+1. **PostgreSQL write + read benchmark** — normalized schema, FK enforcement, JOIN query
+2. **MongoDB write + read benchmark** — embedded document model, no JOIN
+3. **Redis write + read benchmark** — Hash + List, pipeline batching
+4. **Benchmark comparison table** — side-by-side latency numbers
+5. **N+1 query anti-pattern** — measures 21 round-trips vs 1 JOIN, shows the speedup
+6. **Schema evolution** — ALTER TABLE (Postgres zero-downtime recipe) vs MongoDB $set vs Redis HSET
+7. **Redis eviction under memory pressure** — writes 50 MB of data into the 64 MB capped instance, shows evicted_keys counter
+8. **Postgres connection pool exhaustion** — opens 55 connections to a max_connections=50 instance, shows the error
 
 ### Observe
 
-Expected benchmark output:
+Expected benchmark output (local Docker, no network latency):
 ```
 PostgreSQL write 100 users + 500 posts: ~50-200ms
 MongoDB    write 100 embedded docs:     ~30-100ms
 Redis      write 100 users + posts:     ~5-30ms
 
-PostgreSQL read (JOIN) x100:     ~10-50ms  (avg ~0.3ms)
-MongoDB    read (no JOIN) x100:  ~10-40ms  (avg ~0.3ms)
-Redis      read (pipeline) x100: ~3-10ms   (avg ~0.05ms)
+PostgreSQL read (JOIN) x100:     ~10-50ms  (avg ~0.1-0.5ms)
+MongoDB    read (no JOIN) x100:  ~10-40ms  (avg ~0.1-0.4ms)
+Redis      read (pipeline) x100: ~2-10ms   (avg ~0.02-0.1ms)
 ```
 
-Redis is fastest because it's in-memory. MongoDB and Postgres perform comparably for simple reads. At scale, query complexity and indexing matter far more than the database choice itself.
+Redis is fastest because it is in-memory. MongoDB and Postgres perform comparably for simple reads on a small dataset. At scale, the gap opens when data exceeds the buffer pool / WiredTiger cache and disk I/O dominates, or when query complexity grows (multi-table JOINs, aggregations, full-text search).
+
+The N+1 section will show something like:
+```
+N+1 pattern (21 round-trips): 8.3ms
+JOIN query  (1 round-trip):   1.1ms
+JOIN is 7.5x faster for 20 users
+```
+
+At 5ms network latency to a remote DB, the same 20-user N+1 pattern would take ~105ms vs ~5ms for the JOIN — a 20x difference.
 
 ### Teardown
 
@@ -171,6 +198,8 @@ docker compose down -v
 
 - **Choosing NoSQL because it's "faster."** Redis is faster than Postgres for key lookups because it's in-memory, not because it's NoSQL. Postgres with proper indexes on an in-memory table (shared_buffers) can match MongoDB for simple lookups. The performance difference is usually the access pattern fit, not the database category.
 - **Using a document database for relational data.** Modeling a "bank account with transactions" in MongoDB leads to either a growing embedded array (document size limit), or separate collections with app-managed foreign keys (losing referential integrity). Data with complex relationships belongs in a relational database.
-- **Ignoring eventual consistency in NoSQL.** Reading from a Cassandra replica immediately after a write may return the old value. Applications must either use tunable consistency (QUORUM reads) for critical paths or be designed to tolerate brief staleness.
+- **Ignoring eventual consistency in NoSQL.** Reading from a Cassandra replica immediately after a successful QUORUM write may still return the old value if the read routes to a replica that hasn't received the replication yet. Use QUORUM reads on the critical path, or design the application to tolerate brief staleness.
 - **Not using transactions in Postgres.** Rolling back on error, referential integrity, and atomic multi-table updates are free with Postgres transactions. Developers who write separate INSERT statements without wrapping them in a transaction create partial-write bugs that are hard to diagnose.
-- **Storing everything in Redis.** Redis is an in-memory data structure store. Using it as your primary database means all data must fit in RAM, and you lose the durability of disk-backed databases unless you configure AOF persistence with `appendfsync always` — which eliminates the performance advantage.
+- **Storing everything in Redis.** Redis is an in-memory data structure store. Using it as your primary database means all data must fit in RAM, and you lose the durability of disk-backed databases unless you configure AOF persistence with `appendfsync always` — which significantly reduces write throughput.
+- **Skipping connection pooling on Postgres.** Postgres spawns one OS process per connection. Without PgBouncer, 20 app servers × 10-connection pools = 200 connections, which easily exhausts the default `max_connections=100`. Add PgBouncer in transaction-pooling mode before your first load spike — not after.
+- **High Cassandra delete rates without TTL.** Deletes in Cassandra write tombstone markers that accumulate until compaction. A table with high delete rates will see read latency spike as scans must process millions of tombstones. Use TTL (`INSERT INTO ... USING TTL 86400`) for time-bounded data instead of explicit deletes.

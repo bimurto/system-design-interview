@@ -1,14 +1,25 @@
 services:
   elasticsearch:
-    image: elasticsearch:8.8.0
+    image: elasticsearch:8.13.4
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
+      # Heap: set to half available RAM, max 4g. 512m is fine for local lab.
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      # Disable swapping — ES performance degrades badly if heap is swapped
+      - bootstrap.memory_lock=true
     ports:
       - "9200:9200"
+    ulimits:
+      # ES requires high open-file and memlock limits
+      nofile:
+        soft: 65536
+        hard: 65536
+      memlock:
+        soft: -1
+        hard: -1
     healthcheck:
-      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
       interval: 10s
       timeout: 10s
       retries: 20
@@ -23,7 +34,6 @@ services:
       ES_URL: http://elasticsearch:9200
     volumes:
       - ./experiment.py:/experiment.py
+    # Install deps then run experiment
     command: >
       sh -c "pip install elasticsearch --quiet && python /experiment.py"
-    profiles:
-      - experiment

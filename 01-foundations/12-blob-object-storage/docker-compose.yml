@@ -1,6 +1,6 @@
 services:
   minio:
-    image: minio/minio
+    image: minio/minio:latest
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -8,8 +8,15 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 15
+      start_period: 10s
+
+volumes:
+  minio-data:

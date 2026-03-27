@@ -10,6 +10,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   payment-api:
     image: python:3.11-slim
@@ -27,11 +31,18 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # restart: on-failure ensures the API retries if Postgres isn't fully ready
+    # despite the health check (e.g., first connection attempt during init_db).
+    restart: on-failure
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   experiment:
     image: python:3.11-slim
@@ -48,3 +59,7 @@ services:
       - DB_NAME=payments
       - DB_USER=app
       - DB_PASSWORD=secret
+    deploy:
+      resources:
+        limits:
+          memory: 128M

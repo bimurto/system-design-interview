@@ -77,6 +77,20 @@ SELECT name, email FROM users WHERE city = 'NYC';
 
 This eliminates the heap fetch step — the most expensive part of a regular index scan for queries returning many rows.
 
+**Visibility Map dependency:** Postgres cannot skip the heap entirely unless it can confirm the row is visible to all transactions. It uses the **visibility map** — a 1-bit-per-page bitmap tracking pages where all tuples are visible. `VACUUM` sets these bits. On a freshly vacuumed table, `Heap Fetches: 0` appears in EXPLAIN ANALYZE for an Index Only Scan. On a high-churn table with stale visibility map, the planner may fall back to heap fetches, degrading to a regular index scan. Monitor with: `EXPLAIN (ANALYZE, BUFFERS)` and check the `Heap Fetches` line.
+
+### Functional (Expression) Indexes
+
+A B-tree index on `email` stores original values. A query `WHERE LOWER(email) = 'user@example.com'` cannot use it — the transformation `LOWER()` produces values the index has never seen. Fix by indexing the expression itself:
+
+```sql
+CREATE INDEX ON users(LOWER(email));
+-- Now this query uses the index:
+SELECT * FROM users WHERE LOWER(email) = 'user@example.com';
+```
+
+Any deterministic expression works: `LOWER()`, `UPPER()`, `EXTRACT(year FROM created_at)`, `(data->>'status')` for JSONB. The expression in the WHERE clause must exactly match the expression in the index definition for the planner to use it.
+
 ### Partial Indexes
 
 A partial index only indexes rows satisfying a WHERE condition:
@@ -110,13 +124,19 @@ This index is smaller (only pending orders, not all orders), faster to update (o
 
 **Too many indexes slowing writes:** a table with 15 indexes on it may be acceptable for read-heavy OLAP workloads, but on an OLTP table taking thousands of writes per second, each index adds write latency. Monitor `pg_stat_user_indexes.idx_scan` — indexes with zero scans in the last week can usually be dropped.
 
+**HOT updates broken by indexed column changes:** Postgres implements Heap Only Tuple (HOT) updates — if an UPDATE changes only non-indexed columns and the new tuple fits on the same heap page, Postgres chains old and new tuples without touching any index. This eliminates index write overhead for that update. But any update to a column that is part of any index disables HOT entirely, forcing every index on the table to be updated. Over-indexing not only adds per-write overhead but disables HOT for a wider class of updates, compounding write cost on high-churn columns.
+
+**Concurrent index builds and visibility lag:** `CREATE INDEX CONCURRENTLY` avoids locking the table for writes but requires two full table scans and can take significantly longer than a standard `CREATE INDEX`. The index is not usable by queries until the build finishes and the catalog is committed. If you monitor `pg_indexes` during the build, the index row appears with `indisvalid = false` — queries will not use it until it flips to `true`. Under load, never assume a concurrent index is immediately available.
+
 ## Interview Talking Points
 
-- "A sequential scan is O(n) — reading every row. A B-tree index scan is O(log n) — traversing a balanced tree to the matching leaf. For a 10M-row table, that's the difference between millions of page reads and a handful."
-- "The left-most prefix rule: an index on (city, age) can only be used when the query includes city in the WHERE clause. Queries on age alone get a sequential scan. Always put equality columns before range columns in a composite index."
-- "Indexes have a write cost — every INSERT/UPDATE/DELETE must update every index on the table. On write-heavy workloads, index proliferation kills throughput. Monitor unused indexes with pg_stat_user_indexes and drop them."
-- "Partial indexes are underused: CREATE INDEX ON orders(user_id) WHERE status='pending' creates a small, fast index only for pending orders. Perfect for queries that always include the partial predicate."
-- "EXPLAIN ANALYZE shows the actual execution plan — not what the planner guessed, but what it actually did and how long each step took. Always check 'Rows Removed by Filter' on seq scans — that's the work a missing index would eliminate."
+- "A sequential scan is O(n) — reading every row. A B-tree index scan is O(log n) — traversing a balanced tree to the matching leaf. But 'O(log n)' is misleading without context: a Postgres B-tree node is an 8KB page holding hundreds of keys, so a 500k-row table is only 3-4 levels deep, not log2(500k)=19 levels. An index lookup is 3-4 page reads; a seq scan is thousands."
+- "The left-most prefix rule: an index on (city, age) can only be used when the query includes city in the WHERE clause. Queries on age alone get a sequential scan. Always put equality columns before range columns in a composite index. The query optimizer can reorder AND predicates to match the prefix, but it cannot conjure the leading column if it is absent from the query."
+- "Indexes have a write cost — every INSERT/UPDATE/DELETE must update every index on the table. On write-heavy workloads, index proliferation kills throughput. Additionally, Postgres's HOT (Heap Only Tuple) optimization — which avoids index updates for updates to non-indexed columns — is disabled the moment an updated column is indexed anywhere. Monitor unused indexes with pg_stat_user_indexes and drop them."
+- "Partial indexes are underused: CREATE INDEX ON orders(user_id) WHERE status='pending' creates a small, fast index only for pending orders. Perfect for queries that always include the partial predicate. A soft-delete pattern — WHERE deleted_at IS NULL — is another classic use case; deleted rows are excluded from the index entirely."
+- "Covering indexes (INCLUDE) can eliminate heap fetches entirely for the right queries. The scan type changes from 'Index Scan' to 'Index Only Scan' in EXPLAIN ANALYZE. But this only works if the visibility map is current — stale visibility maps force heap checks even on an Index Only Scan. Regular VACUUM keeps it current."
+- "Functional indexes solve the most common production index bug: WHERE LOWER(email) = '...' cannot use an index on email. The fix is CREATE INDEX ON users(LOWER(email)). Any non-trivial transformation in a WHERE clause breaks index usage unless a matching functional index exists."
+- "EXPLAIN (ANALYZE, BUFFERS) shows the actual execution plan, actual row counts, and I/O page reads. Key things to look for: 'Rows Removed by Filter' (work a missing index would eliminate), 'Heap Fetches' on Index Only Scans (non-zero means visibility map is stale), and 'shared hit/read' buffers (hit = served from cache, read = disk I/O)."
 
 ## Hands-on Lab
 
@@ -137,7 +157,7 @@ docker compose up -d
 python experiment.py
 ```
 
-The script seeds 500,000 rows, then runs EXPLAIN ANALYZE for six scenarios: sequential scan, B-tree index, composite index with wrong-order query, composite index with correct-order query, partial index (inside and outside the predicate), and write overhead comparison (0 vs 4 indexes).
+The script seeds 500,000 rows, then runs EXPLAIN ANALYZE for eight scenarios: sequential scan, B-tree index, composite index with wrong-order query (age-only lookup), composite index with correct-order query (city+age), partial index (inside and outside the predicate), covering index (Index Only Scan vs heap-fetching Index Scan), functional index on LOWER(email) (with and without), and write overhead comparison (0 vs 4 indexes).
 
 ### Break It
 
@@ -187,13 +207,17 @@ with conn.cursor() as cur:
 
 Expected output:
 ```
-Phase 1 (no index):      Seq Scan      ~80-200ms
-Phase 2 (B-tree email):  Index Scan    ~0.1-1ms      (100-1000x speedup)
-Phase 3 (wrong order):   Seq Scan      ~50-150ms
-Phase 4 (correct order): Index Scan    ~0.5-5ms
-Phase 5 (partial, hit):  Index Scan    ~0.5-3ms
-Phase 5 (partial, miss): Seq Scan      ~50-150ms
-Write overhead: 4 indexes adds ~20-60% write latency vs 0 indexes
+Phase 1 (no index):                Seq Scan        ~80-200ms
+Phase 2 (B-tree email):            Index Scan      ~0.1-1ms      (100-1000x speedup)
+Phase 3 (wrong order, age only):   Seq Scan        ~50-150ms
+Phase 4 (correct order, city+age): Index Scan      ~0.5-5ms
+Phase 5 (partial, hit):            Index Scan      ~0.5-3ms
+Phase 5 (partial, miss):           Seq Scan        ~50-150ms
+Phase 6 (covering, SELECT *):      Index Scan      ~5-30ms       (heap fetch required)
+Phase 6 (covering, SELECT 2 cols): Index Only Scan ~3-15ms       (no heap fetch)
+Phase 7 (LOWER, no func index):    Seq Scan        ~80-200ms
+Phase 7 (LOWER, func index):       Index Scan      ~0.1-1ms
+Phase 8 (write overhead):          4 indexes adds ~20-60% write latency vs 0 indexes
 ```
 
 ### Teardown

@@ -17,31 +17,73 @@ Caches are not just for reads. Write patterns also determine cache utility: a wr
 
 ## How It Works
 
-**Cache-aside (lazy loading)** is the most common pattern. The application code is responsible for all cache interactions:
+```
+Cache-aside (most common):
+
+  Client
+    │
+    ▼
+  Application ──► Redis ──► HIT? ──► return cached value
+      │               │
+      │              MISS
+      │               │
+      └──────────► Database ──► store in Redis ──► return value
+```
+
+**Cache-aside (lazy loading)** — the application owns all cache interactions:
 1. Check the cache for the key.
 2. On cache hit: return the cached value.
 3. On cache miss: query the database, store the result in cache (with a TTL), return the result.
 
-The cache is populated lazily — only when data is first requested. This means cold starts have poor hit rates. The cache fills naturally as requests arrive. The application must handle cache misses gracefully (they result in DB reads, which are slower but always correct).
+The cache is populated lazily — only when data is first requested. Cold starts have poor hit rates; the cache warms naturally as requests arrive. The application must handle cache misses gracefully (they result in DB reads, which are slower but always correct). Cache-aside is resilient: if the cache cluster goes down, the application continues to serve from the DB (at degraded performance).
 
-**Write-through** writes to both cache and database synchronously on every write:
-1. Client sends a write request
-2. Application writes the new value to the cache
-3. Application writes the same value to the database (synchronously — both must succeed)
-4. Client is acknowledged only after both writes complete
-5. Subsequent reads always hit the cache and see the latest value
+**Read-through** — the cache layer itself is responsible for fetching from the DB on a miss. The application talks only to the cache:
+1. Application queries the cache.
+2. On hit: cache returns the value.
+3. On miss: the cache (not the application) fetches from the DB, stores the result, and returns it.
 
-The cache is always current with the database. Writes are slower (two round trips), and the cache fills with data that may never be read again.
+The application code is simpler — no explicit miss-handling logic. The downside is that the cache becomes a required dependency; if it fails, the application cannot reach the DB directly. Used in managed caching layers (e.g., AWS ElastiCache DAX for DynamoDB).
 
-**Write-behind (write-back)** prioritizes write speed at the cost of durability:
-1. Client sends a write request
-2. Application writes the new value to the cache and immediately acknowledges the client
-3. A background process asynchronously flushes cached writes to the database in batches
-4. If the cache crashes before flushing, the unacknowledged writes are lost (durability risk)
+**Write-through** — every write goes to cache AND database synchronously:
+1. Client sends a write request.
+2. Application writes to the cache.
+3. Application writes to the database (both must succeed before acknowledging the client).
+4. Subsequent reads always hit the cache and see the latest value.
 
-Used in CPU L1/L2 caches and for non-critical high-write workloads where occasional data loss is acceptable.
+The cache is always current. Writes are slower (two synchronous round trips). The cache fills with data that may never be read again (especially for write-heavy workloads with infrequent re-reads of the same key).
 
-**Eviction policies** determine which keys are removed when the cache is full. LRU (Least Recently Used) evicts the key that was accessed least recently — the assumption is that recently accessed data will be accessed again soon. LFU (Least Frequently Used) evicts the key accessed fewest times — better for skewed access where a small number of keys are extremely hot. TTL eviction simply expires keys after a fixed time regardless of access frequency.
+**Write-behind (write-back)** — prioritises write throughput at the cost of durability:
+1. Client sends a write request.
+2. Application writes to the cache and immediately acknowledges the client.
+3. A background process asynchronously flushes dirty cache entries to the database in batches.
+4. If the cache crashes before flushing, those writes are permanently lost.
+
+Used in CPU L1/L2 caches and for non-critical high-write workloads (analytics counters, view counts) where occasional data loss is acceptable. Never use for financial or transactional data.
+
+**Eviction policies** determine which key is removed when the cache is full:
+
+| Policy | When to Use |
+|--------|-------------|
+| `allkeys-lru` | General-purpose caching; evicts the least-recently-used key across all keys (recommended for most caches) |
+| `volatile-lru` | Mixed workload: some keys have TTL (cache), others do not (session store); evicts only TTL-keyed items |
+| `allkeys-lfu` | Highly skewed access (Zipf distribution); celebrity posts, trending items |
+| `volatile-ttl` | Prefer to evict keys closest to expiry first |
+| `noeviction` | Session stores or rate-limit counters where evicting a key is worse than a write failure |
+
+Redis defaults to `noeviction` — appropriate for session stores, catastrophic for a cache. Always configure `maxmemory` and `maxmemory-policy` explicitly when using Redis as a cache.
+
+**Multi-tier caching** adds a local in-process cache (L1) in front of a shared distributed cache (L2):
+
+```
+  Client → App process → L1 (in-process LRU, ~1 ms) → L2 (Redis cluster, ~1-5 ms) → DB (~10-50 ms)
+```
+
+L1 is typically a small LRU dict or `functools.lru_cache` with a short TTL (1–5 seconds). It absorbs the majority of hot-key traffic before it reaches Redis, reducing both network round trips and Redis CPU. The trade-off is an additional staleness layer: data can be stale for up to L1_TTL + L2_TTL.
+
+**Cache pre-warming** — seeding the cache before traffic arrives:
+- After a deploy that flushes the cache, the first wave of production traffic all misses and hits the DB simultaneously (a form of stampede).
+- Mitigation: replay a sample of recent production request logs against the new cache before switching traffic; or use a background worker that loads the predicted hot working set at startup.
+- Add TTL jitter during warm-up to prevent the entire pre-warmed set from expiring simultaneously later.
 
 ### Trade-offs
 
@@ -62,19 +104,24 @@ Used in CPU L1/L2 caches and for non-critical high-write workloads where occasio
 
 **Stale data after invalidation:** if a key is updated in the database but the cache is not invalidated, reads return the old value until the TTL expires. For data where correctness is critical (financial balances, permissions, feature flags), explicit cache invalidation on write is required. The challenge is consistency between the DB write and the cache delete — if the process crashes between the two, the cache retains stale data. A safe pattern: delete the cache key after the DB write (not before), and retry deletion on failure.
 
+**Hot key (skewed access):** a single cache key receives far more traffic than any other — a celebrity's post, a trending product listing, a global configuration map. Even with 100% cache hit rate, a single Redis node handling millions of requests per second for one key becomes a CPU and network throughput bottleneck. Solutions: (1) local in-process L1 cache — absorbs reads at the application level before they reach Redis; staleness bounded by local TTL. (2) Key sharding — replicate the value under N keys (`config:0` … `config:N-1`) and route readers to `config:hash(client_id) % N`. (3) Redis read replicas — route hot reads to replicas; writes to primary. (4) For public/cacheable content, push to CDN edge nodes (zero Redis involvement).
+
 ## Interview Talking Points
 
-- "Cache-aside (lazy loading) is the most common pattern — check cache, miss → query DB, populate cache. The app is responsible for cache management"
-- "The hardest problem in caching is cache invalidation — knowing when to expire a key. TTL is simple but allows staleness; explicit invalidation is precise but adds complexity"
-- "Cache stampede occurs when a hot key expires and many concurrent requests race to repopulate — use a distributed mutex or probabilistic early expiration"
-- "Cache penetration means every request misses cache AND misses DB — use null caching or a Bloom filter for non-existent keys"
-- "A cache hit rate below 80% often means the working set is larger than the cache — add more cache capacity or accept the DB load"
-- "Write-behind is dangerous — unacknowledged data can be lost on cache failure. Only use it for non-critical data or with a persistent queue"
+- "Cache-aside is the most common pattern — app checks cache, miss → query DB, populate cache with a TTL. Cache-aside is also resilient: if Redis goes down, the app degrades to DB-only, not a full outage."
+- "The hardest problem in caching is invalidation — TTL allows staleness up to TTL seconds; explicit delete-on-write is precise but adds a race condition window between the DB write and the cache delete. The safe order is always: write DB first, then delete cache key."
+- "Cache stampede (thundering herd) occurs when a hot key expires and N concurrent threads all miss and all query the DB simultaneously. Fix: Redis SETNX mutex — only the winner repopulates; losers wait and retry from cache. Or use probabilistic early expiration (XFetch algorithm) to refresh before expiry."
+- "Cache penetration means every request misses cache AND misses DB — the cache provides zero protection. Fix: null caching (store a sentinel value) for the common case; Bloom filter for at-scale defence (1 MB Bloom filter can represent 10 M IDs at 0.1% false-positive rate)."
+- "Cache avalanche is mass simultaneous expiry after a deploy or bulk seeding with uniform TTL — convert a spike of DB queries into a ramp by adding ±20–30% random jitter to every TTL."
+- "Hot key is a single Redis key receiving millions of req/s — even with 100% hit rate, one node becomes the bottleneck. Add an in-process L1 cache (lru_cache with 1–5 s TTL) to absorb the load before it reaches Redis."
+- "Redis maxmemory-policy defaults to `noeviction` — appropriate for session stores, catastrophic for a cache. Always set `allkeys-lru` (or `allkeys-lfu` for skewed workloads) with an explicit `maxmemory` limit."
+- "Write-behind gives the lowest write latency but risks data loss — unacknowledged dirty entries vanish if the cache crashes before the async flush. Only use it for non-critical counters or with a persistent write queue (e.g., Kafka) acting as a crash-safe buffer."
+- "Multi-tier caching (L1 in-process + L2 Redis) dramatically reduces Redis load for hot keys, at the cost of a second staleness layer. Design each tier's TTL independently — L1 can be 1–5 s; L2 can be minutes."
 
 ## Hands-on Lab
 
-**Time:** ~20-30 minutes
-**Services:** postgres (5432), redis (6379)
+**Time:** ~25-35 minutes
+**Services:** postgres (5432), redis (6379) — Redis configured with `maxmemory 32mb` and `allkeys-lru` eviction so it behaves as a real bounded cache.
 
 ### Setup
 
@@ -90,37 +137,25 @@ docker compose up -d
 python experiment.py
 ```
 
-The script installs `redis` and `psycopg2-binary` if needed, then runs five phases: baseline DB-only read timing, cache warming with hit rate tracking over 200 requests with 80/20 access pattern, cache invalidation (stale value after DB update, then explicit delete), cache stampede simulation with/without mutex (showing DB query count difference), and cache penetration demonstration with null caching.
+The script runs eight phases:
 
-### Break It
-
-```bash
-# Simulate cache avalanche: seed the cache with many keys, all same TTL
-python -c "
-import redis, time
-r = redis.Redis(host='localhost', port=6379, decode_responses=True)
-
-# Populate 100 keys with the same TTL (10 seconds)
-print('Setting 100 keys with identical TTL=10s...')
-for i in range(100):
-    r.setex(f'product:{i}', 10, f'data_{i}')
-
-print('Waiting 10 seconds for simultaneous expiry...')
-time.sleep(10)
-
-# Now ALL keys expire at once — every request misses cache
-count = 0
-for i in range(100):
-    if r.get(f'product:{i}') is None:
-        count += 1
-print(f'{count}/100 keys expired simultaneously — this is cache avalanche')
-print('Fix: r.setex(key, base_ttl + random.randint(0, 30), value)')
-"
-```
+| Phase | What it shows |
+|-------|---------------|
+| 1. DB-only baseline | Raw cost of every read hitting Postgres |
+| 2. Cache warming | Hit rate climbing from 0% to 70–80% as the hot working set warms |
+| 3. Cache invalidation | Stale data in cache after a DB update; explicit delete fix |
+| 4. Cache stampede | 10 concurrent threads for one expired key: N DB queries without mutex vs ~1 with mutex |
+| 5. Cache penetration | Non-existent key hammers DB 20× vs 0× with null caching |
+| 6. Cache avalanche | TTL jitter spreads key expiry over time instead of a single burst |
+| 7. Hot key | 1000 reads of the same key: local L1 cache vs Redis-only; Redis call reduction |
+| 8. Summary | Reference table of all patterns, eviction policies, failure modes |
 
 ### Observe
 
-The hit rate table shows 0% initially (all cold misses), climbing to 60-80% as the hot set of 20 users gets cached. The stampede section should show 10 DB queries without mutex vs ~1 DB query with mutex. The penetration section shows significantly fewer DB roundtrips with null caching.
+- Phase 2: hit rate should climb from ~0% to 65–80% as the 20-user hot set gets cached. The bar chart shows the warming curve.
+- Phase 4: without mutex, expect 8–10 DB queries; with mutex, expect 1–2 (only the lock winner + any fallbacks).
+- Phase 6: the expiry timeline shows uniform TTL producing a spike (all keys expiring in one 0.5 s window) vs jittered TTL spreading expiry across several seconds.
+- Phase 7: local L1 cache reduces Redis round trips by 80–95% for hot-key traffic.
 
 ### Teardown
 
@@ -138,6 +173,9 @@ docker compose down -v
 
 - **Caching everything.** Caching data that changes frequently (e.g., a counter that updates on every request) causes constant cache misses or stale reads. Only cache data with a meaningful read-to-write ratio.
 - **Not setting TTLs.** Without TTLs, cache entries live forever. After a DB update, reads will return stale data indefinitely unless explicitly invalidated. Always set a TTL as a safety net, even when using explicit invalidation.
+- **Leaving Redis with the default `noeviction` policy.** Redis defaults to refusing writes when full (`noeviction`). In a caching use case, the correct policy is `allkeys-lru` or `allkeys-lfu`. Without this, a full cache causes write failures rather than graceful eviction of old entries. Always set `maxmemory` and `maxmemory-policy` explicitly.
 - **Ignoring stampede and avalanche.** In low-traffic development environments, these rarely manifest. At scale they can take down the database within seconds of a cache flush. Design stampede and avalanche protection from the start.
+- **Not accounting for the hot key problem.** A single Redis node handling millions of req/s for one key (a trending post, a global config) becomes a CPU and network bottleneck even with 100% hit rate. Add a local in-process L1 cache in front of Redis for keys with extremely skewed access.
 - **Caching financial or permission data without explicit invalidation.** A user whose account is suspended should have their session/permission cache invalidated immediately. Relying on TTL expiry for security-critical data means they retain access for up to TTL seconds after revocation.
+- **Deleting the cache key before the DB write.** If the process crashes after the cache delete but before the DB write, the cache is empty and the DB has the old value. The next read repopulates the cache with stale DB data. Always write the DB first, then delete the cache key.
 - **Using the database as a cache.** Selecting data into a Redis set/hash and then running queries against it re-implements what a database already does, without the query planner, indexes, or ACID guarantees. Use Redis for simple key-value lookups; use the DB for complex queries.

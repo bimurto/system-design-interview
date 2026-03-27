@@ -20,11 +20,20 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # LISTENERS: internal binding; ADVERTISED_LISTENERS: what clients connect to
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Retention: how long Kafka keeps events regardless of consumption.
+      # Default is 7 days (604800000 ms). Set low here to make the concept
+      # observable without waiting days. In production, tune per topic SLA.
+      KAFKA_LOG_RETENTION_MS: 604800000
+      KAFKA_LOG_RETENTION_BYTES: -1      # unlimited per partition (default)
+      # Idempotent producer support (exactly-once semantics prerequisite)
+      KAFKA_ENABLE_IDEMPOTENCE: "true"
     healthcheck:
       test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s

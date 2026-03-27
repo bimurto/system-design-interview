@@ -37,13 +37,22 @@ The core challenge: if each of 100 API servers has its own in-memory counter, a 
 
 ### Capacity Estimation
 
+Baseline: Stripe-scale — 100K API RPS, 1M active API keys, 10s fixed window.
+
 | Metric | Calculation | Result |
 |---|---|---|
-| Redis ops/second | 100K API RPS × 1 INCR each | ~100K ops/s |
-| Redis memory per key | counter (4B) + key overhead (~50B) | ~54B |
-| Active keys in window | 1M API keys × 1 counter each | ~54 MB |
-| Redis throughput needed | 100K ops/s | Single Redis node (max ~500K ops/s) |
-| Redis cluster needed at | > 500K API RPS | ~3 shards |
+| Redis INCR ops/second | 100K API RPS × 1 Lua call per request | ~100K ops/s |
+| Redis memory per key | int64 counter (8B) + key string ~40B + Redis overhead ~50B | ~100B/key |
+| Active keys in window | 1M API keys × 1 counter + 1M IP keys × 1 counter | ~200MB |
+| Sliding window overhead | 2× fixed-window (prev + current counter per key) | ~400MB |
+| Redis throughput headroom | single node handles ~500K ops/s (pipelining, Lua) | fits one node |
+| Redis cluster needed at | > 500K API RPS or > 2GB active key space | 2–3 shards |
+| Network overhead per check | 1 Lua round-trip ≈ 100–200µs intra-DC | adds <0.5ms |
+| 429 response payload | ~200B JSON + headers | negligible |
+
+**Scaling trigger:** Stripe reports ~500M API calls/day ≈ 5,800 RPS average, with peak 3–5× = ~30K RPS — well within a single Redis node. Cloudflare at 55M RPS uses distributed local counting rather than a single Redis, because the network cost of a central INCR per request exceeds the budget.
+
+**Key expiry math:** with a 10s window, each counter TTL is 10s. Redis uses lazy expiry + background sweep. At 1M active keys × 100B = 100MB — comfortably below typical Redis instance RAM (8–64GB). No cleanup job needed.
 
 ---
 

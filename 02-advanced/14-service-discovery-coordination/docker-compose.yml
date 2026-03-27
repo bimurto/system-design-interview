@@ -12,11 +12,20 @@ services:
       - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       - --initial-cluster-token=etcd-cluster-token
       - --initial-cluster-state=new
+      # Compact history every 5 minutes — in production this is tuned to your
+      # watch reconnect window. Experiment Phase 3 stays well within this window.
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=5m
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s
       timeout: 3s
       retries: 15
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
   etcd1:
     image: quay.io/etcd-io/etcd:v3.5.9
@@ -31,11 +40,18 @@ services:
       - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       - --initial-cluster-token=etcd-cluster-token
       - --initial-cluster-state=new
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=5m
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s
       timeout: 3s
       retries: 15
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
   etcd2:
     image: quay.io/etcd-io/etcd:v3.5.9
@@ -50,16 +66,27 @@ services:
       - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
       - --initial-cluster-token=etcd-cluster-token
       - --initial-cluster-state=new
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=5m
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s
       timeout: 3s
       retries: 15
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
   experiment:
     image: python:3.11-slim
     volumes:
       - ./experiment.py:/experiment.py
+    # restart: on-failure ensures the script retries if etcd is not yet ready,
+    # even after the health-check condition is met (health checks can pass
+    # before the Raft cluster fully elects a leader).
+    restart: on-failure
     command: >
       sh -c "pip install etcd3 grpcio grpcio-tools --quiet && python /experiment.py"
     depends_on:
@@ -71,3 +98,8 @@ services:
         condition: service_healthy
     environment:
       - ETCD_HOST=etcd0
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M

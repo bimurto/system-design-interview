@@ -3,6 +3,13 @@ services:
     image: redis:7
     ports:
       - "6379:6379"
+    # 64 MB ceiling — realistic for a dedicated rate-limit Redis instance.
+    # Helps surface OOM behaviour if the sliding-window-log experiment is
+    # run with very high traffic (demonstrating the O(N) memory cost).
+    deploy:
+      resources:
+        limits:
+          memory: 64m
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -20,3 +27,4 @@ services:
         condition: service_healthy
     environment:
       - REDIS_HOST=redis
+    restart: on-failure

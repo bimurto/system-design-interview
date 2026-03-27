@@ -148,6 +148,53 @@ Since December 2020: **strong read-after-write consistency** for all S3 operatio
 
 This eliminated a whole class of bugs in distributed systems built on S3.
 
+**Important scoping:** Strong consistency applies within a single AWS region. Cross-Region Replication (S3 CRR) is still asynchronous — objects replicated to a secondary region can lag by minutes. Do not read from a replica region and expect to see a PUT made to the primary region moments ago.
+
+### Object Immutability and Its Implications
+
+Every S3 PUT replaces the object atomically — there is no append, no partial update, and no in-place modification. This immutability has architectural consequences:
+
+**Implications for data pipelines:**
+- Write to the final key name directly. "Renaming" after the fact is a copy + delete, which is non-atomic, costs double storage transiently, and is expensive for large objects.
+- For ML training datasets: store snapshots as immutable prefixes (e.g., `datasets/v3/`). Never overwrite a dataset version in-place; new versions get new prefixes.
+- For log aggregation (e.g., Kinesis Firehose → S3): small files accumulate. Use S3 Object Lambda or periodic compaction jobs to merge them, since you cannot append to existing objects.
+
+**Implications for data lakes:**
+- Table formats like Apache Iceberg and Delta Lake work by writing new Parquet files and updating a metadata manifest atomically. The immutability of S3 objects is a feature, not a limitation — it enables snapshot isolation and time-travel queries.
+
+### Byte-Range Fetches
+
+S3 supports `Range: bytes=start-end` HTTP headers for partial object retrieval:
+
+```python
+# Fetch only bytes 0-4095 of a large object (first 4KB)
+response = client.get_object(bucket, key, offset=0, length=4096)
+```
+
+**Why this matters for system design:**
+- **Video streaming:** serve only the requested byte range (HTTP 206 Partial Content) rather than downloading the full video file. A 4GB video file can be seeked into without downloading from the beginning.
+- **Parquet/ORC footer reading:** analytics engines (Spark, Athena) read only the file footer (last N bytes) to get the schema and row group metadata, then fetch only the relevant row groups. This turns petabyte-scale queries into small targeted reads.
+- **Distributed ML training:** each training worker fetches a disjoint byte range of a dataset shard, enabling parallel data loading without coordination.
+
+### Cross-Region Replication (CRR)
+
+S3 CRR asynchronously copies objects from a source bucket to one or more destination buckets in different regions:
+
+```
+us-east-1 (primary)  --[async replication, ~minutes lag]--> eu-west-1 (replica)
+```
+
+**Use cases:**
+- Disaster recovery: survive a full region outage with RPO of minutes
+- Latency optimization: serve reads from the nearest replica region
+- Compliance: data residency requirements across jurisdictions
+
+**Trade-offs:**
+- Replication is eventually consistent — reads from the replica may be stale
+- Cost doubles (storage + replication data transfer fees)
+- Only replicates new objects after CRR is enabled; existing objects require a one-time Batch Operations job
+- Deletes are not replicated by default (configurable)
+
 ### CDN Integration Pattern
 
 ```
@@ -178,6 +225,10 @@ Browser ──HTTPS──►  │  CloudFront  │ ◄── Edge PoP (~10ms lat
 | Direct S3 serving               | No proxy server needed                        | Exposes bucket, no access control after link shared  |
 | Presigned URL serving           | Temporary access, no proxy                    | No revocation, URL can be shared beyond intended     |
 | CDN + S3                        | Edge caching, low latency globally             | Cache invalidation complexity, CloudFront costs      |
+| S3 Single-region                | Lower cost, simpler                           | No redundancy across region failure                  |
+| S3 Cross-Region Replication     | Disaster recovery, reduced read latency       | Eventual consistency at replica, 2x storage cost     |
+| Full object fetch               | Simplest client code                          | Wastes bandwidth for video seek, analytics queries   |
+| Byte-range fetch                | Efficient for video streaming, Parquet reads  | More complex client; server must support Range header|
 
 ### Failure Modes
 
@@ -187,17 +238,25 @@ Browser ──HTTPS──►  │  CloudFront  │ ◄── Edge PoP (~10ms lat
 
 **Presigned URL leaks:** A presigned URL is a capability token — anyone who obtains the URL can use it until expiry. If a user shares their presigned download link (in a chat, bug report, screenshot), the recipient gains access to the object. There is no revocation mechanism short of deleting the object or rotating the signing key (which invalidates all outstanding URLs). Design systems to use short expiry times for sensitive content and to generate per-user presigned URLs rather than shared links.
 
-**Hotspot on single prefix:** S3 partitions its internal metadata index by key prefix. If all your writes share the same prefix — for example, `uploads/2024-01-15/` for daily uploads — all writes that day hit the same S3 partition, potentially triggering throttling (S3's default limit is 3,500 PUTs/second per prefix). At high write throughput, add a random hash prefix (`a3f2/uploads/2024-01-15/photo.jpg`) to distribute writes across partitions.
+**Hotspot on single prefix:** S3 partitions its internal metadata index by key prefix. If all your writes share the same prefix — for example, `uploads/2024-01-15/` for daily uploads — all writes that day hit the same S3 partition, potentially triggering throttling (S3's default limit is 3,500 PUTs/second per prefix). At high write throughput, add a random hash prefix (`a3f2/uploads/2024-01-15/photo.jpg`) to distribute writes across partitions. S3 does auto-scale partitions after 15–30 minutes of sustained load, but hash-prefix naming avoids the initial throttle window entirely.
+
+**Cross-region replication lag:** S3 CRR replicates objects asynchronously. An application that writes to us-east-1 and immediately reads from eu-west-1 (replica) may get a 404 or stale version. The replication lag is typically seconds to minutes but has no hard upper bound. Never use a replica region as a strongly consistent read endpoint.
+
+**S3 Object Lock / accidental deletion:** Without versioning, a DELETE is permanent. A misconfigured IAM policy or a runaway cleanup job can silently delete terabytes of data. Enable versioning on buckets containing critical data. For compliance requirements, enable S3 Object Lock (WORM — Write Once, Read Many) which prevents deletion even by bucket owners during the retention period.
+
+**Small-file accumulation in streaming pipelines:** Services like Kinesis Firehose write small objects (default: 128MB or 5 minutes, whichever comes first). Over time, a bucket can accumulate millions of tiny files. Querying them with Athena or Spark incurs high LIST overhead and poor compression ratios. Periodically compact small files into large Parquet files using AWS Glue or a Spark job. S3 cannot merge files in-place — compaction means reading the small files and writing new larger ones.
 
 ---
 
 ## Interview Talking Points
 
-- "Object storage is not a filesystem — there is no rename, no append, and no locking. Rename is copy + delete, which is non-atomic and costs double storage during the operation."
-- "S3 has had strong read-after-write consistency since December 2020 — you no longer need read-after-write workarounds or retry loops for consistency."
-- "For large files, use multipart upload: it enables parallelism (upload parts concurrently), resumability (retry failed parts without restarting), and is required for objects over 5GB."
-- "Presigned URLs let you serve private content without proxying through your servers — the client downloads directly from S3 using a time-limited signed URL, saving your bandwidth and compute."
-- "S3 key prefix determines which partition handles the request — randomize prefixes (add a hash or UUID prefix) to avoid throttling at high write throughput."
+- "Object storage is not a filesystem — there is no rename, no append, and no locking. Rename is copy + delete: non-atomic, costs double storage transiently, and is expensive for large objects. Design pipelines to write directly to the final key."
+- "S3 has had strong read-after-write consistency since December 2020 — within a single region. Cross-Region Replication (CRR) is still asynchronous with minutes-scale lag, so don't read from a replica and expect to see a PUT made to the primary moments ago."
+- "For large files, use multipart upload: it enables parallelism (concurrent part uploads), resumability (retry only the failed part), and is required for objects over 5GB. Set a lifecycle rule to abort incomplete multipart uploads after 7 days to avoid zombie upload cost accumulation."
+- "Presigned URLs let you serve private content without proxying through your servers — the client downloads directly from S3 using a time-limited signed URL. They are capability tokens with no revocation mechanism; a leaked URL grants access until expiry. Use short expiry times and generate per-user URLs."
+- "S3 key prefix determines which partition handles the request — at >3,500 PUTs/sec, add a 4-character hash prefix to distribute writes. S3 auto-scales partitions but takes 15–30 minutes; hash-prefix naming avoids the throttle window entirely."
+- "Byte-range fetches (HTTP Range header) are a critical optimization: video players seek without downloading the full file, analytics engines (Athena, Spark) read only Parquet row group footers, and ML training workers fetch disjoint dataset shards in parallel."
+- "Object immutability is a feature, not a limitation: table formats like Iceberg and Delta Lake leverage it to provide snapshot isolation and time-travel queries by treating S3 as an immutable log of Parquet files managed by a metadata layer."
 
 ---
 
@@ -220,36 +279,42 @@ MinIO Console is available at http://localhost:9001 (credentials: minioadmin / m
 python experiment.py
 ```
 
-The experiment runs five phases:
+The experiment runs seven phases:
 
-1. **Bucket creation** — creates a test bucket, verifies it appears in the bucket list
-2. **Small file upload** — uploads a small text object, downloads it back, verifies content integrity via ETag
-3. **Multipart upload** — uploads a 30MB synthetic file using multipart, uploading parts in parallel; compares timing vs sequential single-part upload
-4. **Presigned URL** — generates a presigned GET URL with 60-second expiry, downloads using the URL without credentials, verifies access
-5. **ETag content-addressability** — uploads the same content twice under different keys; demonstrates both ETags are identical (content-based hashing)
+1. **Bucket creation** — creates a test bucket, explains the flat namespace and DNS naming constraints
+2. **Small file upload** — uploads a small text object, downloads it back, verifies content integrity via ETag and confirms ETag equals local MD5 for single-part objects
+3. **Multipart upload: sequential vs parallel** — uploads a 30MB file twice (sequential parts, then parallel parts) and compares timing; explains part constraints and zombie upload risk
+4. **Presigned URL** — generates a presigned GET URL with 60-second expiry, shows all embedded query parameters, downloads without credentials, confirms no Authorization header was sent
+5. **List objects** — lists all objects with metadata; demonstrates prefix + delimiter listing to simulate directory listing
+6. **ETag content-addressability** — uploads the same content twice under different keys; demonstrates both ETags are identical, and a third upload with different content produces a different ETag
+7. **Key prefix partitioning** — writes 20 objects with a hotspot prefix pattern and 20 with a hash-distributed prefix pattern; explains S3 partition throttle limits and when hash-prefix naming is required
 
 ### Break It
 
-Stop MinIO mid-experiment to simulate an incomplete multipart upload:
+Run the zombie multipart upload demonstration:
 
 ```bash
-docker compose stop minio
-```
-
-Restart it and observe that incomplete multipart upload parts remain:
-
-```bash
-docker compose start minio
 python experiment.py --show-incomplete
 ```
 
-This demonstrates why lifecycle rules for aborting incomplete multipart uploads are necessary.
+This phase simulates an upload that fails mid-stream, then shows that the partially-uploaded object does not appear in normal `list_objects` output — illustrating why zombie parts accumulate invisibly and why every bucket accepting multipart uploads should have a lifecycle rule:
+
+```json
+{
+  "Rules": [{
+    "Status": "Enabled",
+    "Filter": {},
+    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}
+  }]
+}
+```
 
 ### Observe
 
-- Timing difference between sequential single-part upload and parallel multipart upload for the 30MB file (multipart should be significantly faster)
-- ETag values: single-part uploads produce an MD5 of the content; the same content always produces the same ETag (content-addressable)
-- Presigned URL access succeeds without any credentials in the request headers — the authorization is encoded in the URL query string
+- **Sequential vs parallel timing** in Phase 3: on localhost the difference is modest (CPU/memory bound), but in cloud environments with high-bandwidth links the parallel path saturates available bandwidth and achieves 5–10x speedup
+- **Presigned URL query parameters** in Phase 4: note `X-Amz-Expires`, `X-Amz-Credential`, and `X-Amz-Signature` — the entire authorization is in the URL, no headers needed
+- **ETag equality** in Phase 6: same bytes → same MD5 → same ETag regardless of key name; different bytes → different ETag
+- **Prefix listing** in Phase 5: `list_objects` with `delimiter="/"` returns virtual directory entries (`is_dir=True`) for common prefixes rather than listing every object underneath
 
 ### Teardown
 
@@ -273,3 +338,6 @@ docker compose down -v
 - **Not setting lifecycle rules on incomplete multipart uploads** — abandoned multipart uploads accumulate in your bucket silently. They don't appear in normal listings but do appear on your bill. Add a lifecycle rule to abort incomplete multipart uploads after 7 days.
 - **Using sequential keys as S3 key names** — keys like `2024-01-15T10:00:00-image.jpg` cause all writes in a time window to hit the same S3 partition, triggering throttling (HTTP 503) at high write rates. Prepend a random hash: `a3f2/2024-01-15T10:00:00-image.jpg`.
 - **Serving private S3 content by proxying through your application server** — don't pipe S3 GET responses through your app servers to add access control. Use presigned URLs for temporary access or CloudFront signed URLs for CDN-cached content. Proxying wastes your server bandwidth and compute on byte-forwarding.
+- **Assuming CRR replicas are up-to-date** — Cross-Region Replication is asynchronous. A write to the primary region may not be visible in the replica region for seconds to minutes. Never use a CRR replica as a strongly consistent read endpoint for recently-written objects.
+- **Not using byte-range fetches for large objects** — fetching an entire 10GB Parquet file to read 5MB of data is wasteful. Use byte-range requests to read only the footer or specific row groups. This is how Athena and Spark achieve sub-second query latency on petabyte-scale data lakes.
+- **Accumulating millions of small files in streaming pipelines** — Kinesis Firehose and similar services write many small objects. Querying millions of 1MB files in Athena is orders of magnitude slower than querying thousands of 1GB files. Schedule periodic compaction jobs (Glue, Spark) to merge small files into large Parquet files.

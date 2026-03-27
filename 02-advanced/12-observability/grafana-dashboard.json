@@ -2,52 +2,88 @@
   "title": "Flask App — RED Method Dashboard",
   "uid": "flask-red",
   "schemaVersion": 36,
-  "version": 1,
+  "version": 2,
   "refresh": "5s",
   "panels": [
     {
       "id": 1,
       "title": "Request Rate (req/s)",
+      "description": "RED: Rate — how many requests per second across all endpoints",
       "type": "stat",
       "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
       "targets": [{
         "expr": "sum(rate(http_requests_total[1m]))",
         "legendFormat": "req/s"
-      }]
+      }],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
     },
     {
       "id": 2,
       "title": "Error Rate (%)",
+      "description": "RED: Errors — percentage of requests returning HTTP 5xx",
       "type": "stat",
       "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
       "targets": [{
         "expr": "100 * sum(rate(http_requests_total{status_code=~\"5..\"}[1m])) / sum(rate(http_requests_total[1m]))",
         "legendFormat": "error %"
-      }]
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "red", "value": 5}
+            ]
+          },
+          "color": {"mode": "thresholds"}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
     },
     {
       "id": 3,
-      "title": "P99 Latency (seconds)",
+      "title": "P99 Latency (ms)",
+      "description": "RED: Duration — 99th percentile latency across all endpoints. SLO threshold: 200ms.",
       "type": "stat",
       "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
       "targets": [{
-        "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
-        "legendFormat": "p99"
-      }]
+        "expr": "1000 * histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
+        "legendFormat": "p99 ms"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 200}
+            ]
+          },
+          "color": {"mode": "thresholds"}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
     },
     {
       "id": 4,
       "title": "Active Connections",
+      "description": "Gauge metric — shows in-flight requests. Spikes indicate slow endpoints or overload.",
       "type": "stat",
       "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
       "targets": [{
         "expr": "http_active_connections",
         "legendFormat": "active"
-      }]
+      }],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
     },
     {
       "id": 5,
       "title": "Request Rate by Endpoint",
+      "description": "Traffic distribution across endpoints. All four endpoints receive equal load in the experiment.",
       "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
       "targets": [{
@@ -57,9 +93,13 @@
     },
     {
       "id": 6,
-      "title": "Latency Percentiles",
+      "title": "Latency Percentiles (all endpoints)",
+      "description": "p50 vs p95 vs p99 — the gap between p50 and p99 reveals tail latency. A wide gap means some requests are much slower than the median. The 200ms line is the SLO threshold.",
       "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "fieldConfig": {
+        "defaults": {"unit": "s"}
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))",
@@ -74,6 +114,65 @@
           "legendFormat": "p99"
         }
       ]
+    },
+    {
+      "id": 7,
+      "title": "P99 Latency by Endpoint",
+      "description": "Per-endpoint p99 reveals which endpoint is causing the tail. /api/slow shows high p99 despite normal p50. This is why you instrument per-endpoint, not just aggregate.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {
+        "defaults": {"unit": "s"}
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{endpoint=\"/api/fast\"}[1m])) by (le))",
+          "legendFormat": "p99 /api/fast"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{endpoint=\"/api/slow\"}[1m])) by (le))",
+          "legendFormat": "p99 /api/slow"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{endpoint=\"/api/flaky\"}[1m])) by (le))",
+          "legendFormat": "p99 /api/flaky"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{endpoint=\"/api/db-call\"}[1m])) by (le))",
+          "legendFormat": "p99 /api/db-call"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Dependency Instrumentation: Service vs DB Latency",
+      "description": "Compares /api/db-call service p99 vs the DB query p99 measured inside the handler. When DB p99 ≈ service p99, the database is the bottleneck. This is the key insight from per-dependency instrumentation.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {
+        "defaults": {"unit": "s"}
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{endpoint=\"/api/db-call\"}[1m])) by (le))",
+          "legendFormat": "service p99 (/api/db-call)"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(dependency_call_duration_seconds_bucket{dependency=\"postgres\"}[1m])) by (le))",
+          "legendFormat": "postgres query p99"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Error Rate by Endpoint",
+      "description": "Per-endpoint error rate. Only /api/flaky produces errors. A global error rate panel would hide which endpoint is broken — always label by endpoint.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20},
+      "targets": [{
+        "expr": "sum(rate(http_requests_total{status_code=~\"5..\"}[1m])) by (endpoint) / sum(rate(http_requests_total[1m])) by (endpoint)",
+        "legendFormat": "error rate {{endpoint}}"
+      }]
     }
   ]
 }

@@ -1,7 +1,13 @@
 services:
   db-orders:
     image: postgres:15
-    command: postgres -c max_prepared_transactions=10
+    # max_prepared_transactions must be > 0 to enable PREPARE TRANSACTION (XA/2PC).
+    # lock_timeout=5s prevents indefinite blocking in experiment phases.
+    command: >
+      postgres
+        -c max_prepared_transactions=10
+        -c lock_timeout=5000
+        -c log_lock_waits=on
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: orders
@@ -9,14 +15,23 @@ services:
     ports:
       - "5433:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   db-inventory:
     image: postgres:15
-    command: postgres -c max_prepared_transactions=10
+    command: >
+      postgres
+        -c max_prepared_transactions=10
+        -c lock_timeout=5000
+        -c log_lock_waits=on
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: inventory
@@ -24,7 +39,12 @@ services:
     ports:
       - "5434:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d inventory"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M

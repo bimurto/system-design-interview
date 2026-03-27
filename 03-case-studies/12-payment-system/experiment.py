@@ -9,6 +9,8 @@ What this demonstrates:
   4. Failed charge (amount <= 0) → no ledger entry created
   5. Reconciliation: sum all ledger entries → assert sum = 0
   6. Simulate timeout + retry: same key → safe, idempotent
+  7. Refund: reverse original charge, verify ledger still balanced
+  8. Double-refund prevention: second refund on same txn → rejected
 
 Run:
   docker compose up -d
@@ -141,6 +143,7 @@ def phase2_idempotency(idem_key: str, original_txn_id: str):
 
     print(f"  Retrying charge with same key: {idem_key[:20]}...")
 
+    all_match = True
     for attempt in range(1, 4):
         status, result = post_json("/charge", {
             "amount": "100.00",
@@ -149,20 +152,39 @@ def phase2_idempotency(idem_key: str, original_txn_id: str):
             "idempotency_key": idem_key,
             "description": "Lab purchase",
         })
-        txn_id = (result.get("transaction") or result).get("transaction_id", "")
+        # Duplicate responses nest the transaction under "transaction" key
+        txn_obj = result.get("transaction") or result
+        returned_txn_id = txn_obj.get("transaction_id", "")
         is_dup = result.get("status") == "duplicate"
-        print(f"  Attempt {attempt}: HTTP {status}, duplicate={is_dup}, txn_id={txn_id[:8] if txn_id else 'N/A'}...")
+        id_matches = returned_txn_id == original_txn_id
+        if not id_matches:
+            all_match = False
+        print(f"  Attempt {attempt}: HTTP {status}, duplicate={is_dup}, "
+              f"txn_id={'MATCH' if id_matches else 'MISMATCH: ' + returned_txn_id[:8]}...")
 
-    print(f"\n  All retries returned the original transaction_id: {original_txn_id[:8]}...")
-    print(f"  No additional ledger entries created.")
+    # Verify no extra ledger entries were created
+    _, txn_detail = get_json(f"/transaction/{original_txn_id}")
+    entry_count = len(txn_detail.get("ledger_entries", []))
+
+    print(f"\n  All retries returned original transaction_id: {all_match}")
+    print(f"  Ledger entries for original txn: {entry_count} (expected 2 — no extras created)")
+    print(f"  Result: {'CORRECT — idempotent' if all_match and entry_count == 2 else 'ERROR — check above'}")
 
 
 def phase3_concurrent_retries():
     section("Phase 3: Concurrent Retries (10 Threads, Same Key)")
 
+    print("""
+  TOCTOU Race Explained:
+  10 threads all arrive simultaneously with the same idempotency_key.
+  All 10 do a SELECT and see "not found" — the pre-check does NOT stop them.
+  All 10 attempt an INSERT. Postgres's UNIQUE btree index latch ensures only
+  ONE insert commits. The other 9 get UniqueViolation → fetch and return the
+  winner's row. Result: exactly 1 charge, all 10 threads return the same txn_id.
+""")
+
     idem_key = f"concurrent-test-{uuid.uuid4()}"
-    results = []
-    errors = []
+    all_responses = []
     lock = threading.Lock()
 
     def attempt_charge():
@@ -174,39 +196,44 @@ def phase3_concurrent_retries():
             "description": "Concurrent test",
         })
         with lock:
-            if status in (200, 201):
-                results.append(body)
-            else:
-                errors.append((status, body))
+            all_responses.append((status, body))
 
-    print(f"\n  Launching 10 concurrent threads, all with idempotency_key={idem_key[:16]}...")
+    print(f"  Launching 10 concurrent threads, all with idempotency_key={idem_key[:16]}...")
     threads = [threading.Thread(target=attempt_charge) for _ in range(10)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=15)
 
-    print(f"  Threads completed: {len(results) + len(errors)}")
-    print(f"  Successful responses: {len(results)}")
-    print(f"  Error responses:      {len(errors)}")
+    success_responses = [(s, b) for s, b in all_responses if s in (200, 201)]
+    error_responses = [(s, b) for s, b in all_responses if s not in (200, 201)]
 
-    # Count unique transaction IDs
+    print(f"  Threads completed: {len(all_responses)}/10")
+    print(f"  Successful responses (200/201): {len(success_responses)}")
+    print(f"  Error responses (4xx/5xx):      {len(error_responses)}")
+
+    # Collect all transaction IDs from all responses (including duplicate=True ones)
     txn_ids = set()
-    for r in results:
-        if isinstance(r, dict):
-            txn = r.get("transaction") or r
-            tid = txn.get("transaction_id", "")
-            if tid:
-                txn_ids.add(tid)
+    for _, body in success_responses:
+        txn_obj = body.get("transaction") or body
+        tid = txn_obj.get("transaction_id", "")
+        if tid:
+            txn_ids.add(tid)
 
-    print(f"  Unique transaction IDs: {len(txn_ids)}")
-    print(f"\n  Result: {'CORRECT — exactly 1 charge' if len(txn_ids) == 1 else 'ERROR — multiple charges!'}")
+    print(f"  Unique transaction IDs across all responses: {len(txn_ids)}")
 
-    # Verify in ledger
-    _, ledger = get_json("/ledger")
-    entries_for_key = [e for e in ledger.get("entries", [])
-                       if any(tid in e.get("transaction_id", "") for tid in txn_ids)]
-    print(f"  Ledger entries for this transaction: {len(entries_for_key)} (should be 2: 1 debit + 1 credit)")
+    # Ground truth: count ledger entries in the DB for this key
+    if txn_ids:
+        canonical_tid = next(iter(txn_ids))
+        _, txn_detail = get_json(f"/transaction/{canonical_tid}")
+        db_entry_count = len(txn_detail.get("ledger_entries", []))
+        print(f"  Ledger entries in DB for this charge: {db_entry_count} (expected exactly 2)")
+        correct = len(txn_ids) == 1 and db_entry_count == 2
+    else:
+        correct = False
+        print(f"  Could not retrieve transaction details.")
+
+    print(f"\n  Result: {'CORRECT — UNIQUE constraint enforced exactly-once' if correct else 'ERROR — check above'}")
 
 
 def phase4_failed_charge():

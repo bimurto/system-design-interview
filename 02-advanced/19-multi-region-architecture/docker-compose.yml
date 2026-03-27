@@ -1,0 +1,49 @@
+services:
+  region-a:
+    image: redis:7
+    ports:
+      - "6380:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  region-b:
+    image: redis:7
+    ports:
+      - "6381:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # A third Redis instance acts as a tiebreaker/arbiter for quorum-based
+  # failover promotion decisions. In production, this would be a separate
+  # availability zone (AZ) within one of the regions or a dedicated witness
+  # service. The experiment uses it to demonstrate majority-quorum writes.
+  region-arbiter:
+    image: redis:7
+    ports:
+      - "6382:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

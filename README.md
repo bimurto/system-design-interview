@@ -92,20 +92,23 @@ Work through all 39 topics in sequence. Earlier topics build vocabulary and intu
 | 28 | Service Discovery | Advanced | 60 min | etcd, Consul, leader election |
 | 29 | Idempotency & Exactly-Once | Advanced | 60 min | Idempotency keys, Kafka transactions |
 | 30 | Probabilistic Data Structures | Advanced | 60 min | Bloom filter, HyperLogLog |
-| 31 | URL Shortener | Case Studies | 90 min | ID generation, redirect caching |
-| 32 | Twitter Timeline | Case Studies | 90 min | Fan-out on write vs read |
-| 33 | YouTube | Case Studies | 90 min | Video pipeline, adaptive bitrate |
-| 34 | Uber | Case Studies | 90 min | Geo-indexing, real-time matching |
-| 35 | WhatsApp | Case Studies | 90 min | Message delivery guarantees |
-| 36 | Google Drive | Case Studies | 90 min | Delta sync, deduplication |
-| 37 | Web Crawler | Case Studies | 90 min | URL frontier, politeness |
-| 38 | Search Engine | Case Studies | 90 min | Inverted index, ranking pipeline |
-| 39 | Notification System | Case Studies | 90 min | Multi-channel fan-out |
-| 40 | Distributed Rate Limiter | Case Studies | 90 min | Redis-backed enforcement |
-| 41 | Distributed Cache | Case Studies | 90 min | Redis internals, eviction |
-| 42 | Payment System | Case Studies | 90 min | Idempotency, double-entry ledger |
+| 31 | Database Internals | Advanced | 60 min | B-tree, LSM-tree, WAL, MVCC |
+| 32 | Backpressure & Flow Control | Advanced | 60 min | Queue depth, drop, reject, load shedding |
+| 33 | Multi-Region Architecture | Advanced | 60 min | Active-active, conflict resolution, failover |
+| 34 | URL Shortener | Case Studies | 90 min | ID generation, redirect caching |
+| 35 | Twitter Timeline | Case Studies | 90 min | Fan-out on write vs read |
+| 36 | YouTube | Case Studies | 90 min | Video pipeline, adaptive bitrate |
+| 37 | Uber | Case Studies | 90 min | Geo-indexing, real-time matching |
+| 38 | WhatsApp | Case Studies | 90 min | Message delivery guarantees |
+| 39 | Google Drive | Case Studies | 90 min | Delta sync, deduplication |
+| 40 | Web Crawler | Case Studies | 90 min | URL frontier, politeness |
+| 41 | Search Engine | Case Studies | 90 min | Inverted index, ranking pipeline |
+| 42 | Notification System | Case Studies | 90 min | Multi-channel fan-out |
+| 43 | Distributed Rate Limiter | Case Studies | 90 min | Redis-backed enforcement |
+| 44 | Distributed Cache | Case Studies | 90 min | Redis internals, eviction |
+| 45 | Payment System | Case Studies | 90 min | Idempotency, double-entry ledger |
 
-**Total estimated time:** ~41 hours of focused study across all topics.
+**Total estimated time:** ~46 hours of focused study across all topics.
 
 ---
 

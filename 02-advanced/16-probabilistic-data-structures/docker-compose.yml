@@ -8,6 +8,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   experiment:
     image: python:3.11-slim
@@ -20,3 +24,8 @@ services:
         condition: service_healthy
     environment:
       - REDIS_HOST=redis-stack
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    restart: "no"

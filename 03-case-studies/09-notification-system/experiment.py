@@ -4,18 +4,22 @@ Notification System Lab — experiment.py
 
 What this demonstrates:
   1. Produce 100 notification events to Kafka (push/email/sms/in-app)
-  2. Channel workers consume and mock-deliver
-  3. User preference filtering: email disabled for 3 users
+  2. Channel workers consume and mock-deliver (priority: transactional first)
+  3. User preference filtering: email/push disabled for specific users
   4. Deduplication: same idempotency_key delivered only once
-  5. Priority queues: transactional before marketing
-  6. Retry with exponential backoff: 2 failures → retry → succeed on 3rd
+  5. Retry with exponential backoff: 2 failures → retry → succeed on 3rd
+     + DLQ path for notifications that exhaust all retries
+  6. Fan-out simulation: celebrity post triggers 500 push notifications,
+     with early preference suppression at produce time
+  7. Scale math: capacity numbers for 1B notifications/day
+  8. DB summary: delivered count by channel in Postgres
 
 Run:
   docker compose up -d zookeeper kafka db
   # Wait ~40s for Kafka to be healthy
   docker compose run --rm workers
   # Or locally:
-  pip install kafka-python psycopg2-binary
+  pip install kafka-python-ng psycopg2-binary
   KAFKA_BOOTSTRAP=localhost:9092 python experiment.py
 """
 
@@ -179,16 +183,22 @@ def is_duplicate(conn, idempotency_key: str, channel: str) -> bool:
         return cur.fetchone() is not None
 
 
-def mark_delivered(conn, notif: Notification):
+def mark_delivered(conn, notif: Notification) -> bool:
+    """Insert delivery record. Returns True if this call performed the insert,
+    False if a duplicate was detected by the DB unique constraint (race condition
+    between is_duplicate() check and concurrent workers)."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO delivered_notifications
               (notification_id, idempotency_key, user_id, channel, message)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (idempotency_key, channel) DO NOTHING
+            RETURNING id
         """, (notif.notification_id, notif.idempotency_key,
               notif.user_id, notif.channel, notif.message))
+        inserted = cur.fetchone() is not None
     conn.commit()
+    return inserted
 
 
 # ── Mock delivery ─────────────────────────────────────────────────────────────
@@ -238,10 +248,17 @@ class DeliveryWorker:
         for attempt in range(1, max_attempts + 1):
             result = mock_deliver(notif, attempt)
             if result.success:
-                mark_delivered(self.conn, notif)
-                self.stats["delivered"] += 1
-                if attempt > 1:
-                    self.stats["retried"] += 1
+                # mark_delivered uses INSERT ... ON CONFLICT DO NOTHING RETURNING id
+                # so even if two workers race past the is_duplicate() check above,
+                # only one will get inserted = True here.
+                inserted = mark_delivered(self.conn, notif)
+                if inserted:
+                    self.stats["delivered"] += 1
+                    if attempt > 1:
+                        self.stats["retried"] += 1
+                else:
+                    # Lost the race — another worker already recorded this delivery
+                    self.stats["deduplicated"] += 1
                 return
             else:
                 self.stats["failures"] += 1
@@ -443,8 +460,8 @@ def phase4_deduplication(conn):
     print(f"  DB entries for this key: {db_count} (should be 1)")
 
 
-def phase5_retry_backoff():
-    section("Phase 5: Retry with Exponential Backoff")
+def phase5_retry_backoff(conn):
+    section("Phase 5: Retry with Exponential Backoff + DLQ")
 
     print("""
   Delivery simulation: notification IDs ending in '7' fail on attempts 1 and 2,
@@ -453,49 +470,162 @@ def phase5_retry_backoff():
   Pattern:
     attempt 1: fail → wait 50ms
     attempt 2: fail → wait 100ms
-    attempt 3: success → deliver
-    after 3 fails → dead letter queue (DLQ)
+    attempt 3: success → mark delivered
+    If ID ends in '7' AND max_attempts is reduced to 2 → exhausted → DLQ
+
+  The DeliveryWorker handles all of this — same code path as Phase 2.
 """)
 
-    test_cases = [
-        ("transient-7", True,  "ends in 7: 2 failures + retry → succeed"),
-        ("transient-1", True,  "normal: succeed on first attempt"),
-        ("transient-17", True, "ends in 7: 2 failures + retry → succeed"),
+    # Case A: 3 attempts allowed — should succeed despite 2 transient failures
+    # Case B: notification ID does NOT end in 7 — succeeds immediately
+    # Case C: simulate DLQ — use a mock that always fails (patch mock_deliver)
+    test_notifications = [
+        ("retry-ok-7",   "ends in 7: 2 transient failures, succeeds on attempt 3"),
+        ("retry-ok-1",   "normal:    succeeds immediately on attempt 1"),
+        ("retry-ok-17",  "ends in 7: 2 transient failures, succeeds on attempt 3"),
+        ("retry-dlq-7x", "always fails: exhausts 3 retries → DLQ"),
     ]
 
-    print(f"  {'Notification ID':<20} {'Attempts':>9}  {'Final':>8}  Note")
-    print(f"  {'-'*20}  {'-'*9}  {'-'*8}  {'-'*35}")
-    for notif_id, _, note in test_cases:
-        attempts = 0
-        result = None
-        for attempt in range(1, 4):
-            attempts = attempt
-            notif = Notification(
-                notification_id=notif_id,
-                user_id=104, channel="push",
-                type="transactional",
-                message="test",
-                idempotency_key=f"retry-{notif_id}-{uuid.uuid4()}",
-            )
-            result = mock_deliver(notif, attempt)
-            if result.success:
-                break
-            if attempt < 3:
-                backoff = (2 ** (attempt - 1)) * 0.05
-                time.sleep(backoff)
-        status = "DELIVERED" if result and result.success else "DLQ"
-        print(f"  {notif_id:<20}  {attempts:>9}  {status:>8}  {note}")
+    # Temporarily override mock_deliver for the always-fail case
+    original_mock = mock_deliver.__code__
+
+    print(f"  {'Notification ID':<20} {'Delivered':>10}  {'Retried':>8}  {'DLQ':>5}  Note")
+    print(f"  {'-'*20}  {'-'*10}  {'-'*8}  {'-'*5}  {'-'*45}")
+
+    for notif_id, note in test_notifications:
+        local_stats = defaultdict(int)
+        worker = DeliveryWorker(f"retry-worker-{notif_id}", conn, local_stats)
+
+        notif = Notification(
+            notification_id=notif_id,
+            user_id=104,
+            channel="push",
+            type="transactional",
+            message=f"Test retry for {notif_id}",
+            idempotency_key=f"retry-phase5-{notif_id}-{uuid.uuid4()}",
+        )
+
+        if notif_id == "retry-dlq-7x":
+            # Monkey-patch: always fail to demonstrate DLQ path
+            import types
+            def always_fail(n, attempt=1):
+                return DeliveryResult(False, "permanent_error")
+            worker_mock = always_fail
+            # Run the DLQ path manually mirroring DeliveryWorker.process()
+            if is_channel_enabled(conn, notif.user_id, notif.channel):
+                max_attempts = 3
+                for attempt in range(1, max_attempts + 1):
+                    result = worker_mock(notif, attempt)
+                    local_stats["failures"] += 1
+                    if attempt < max_attempts:
+                        time.sleep((2 ** (attempt - 1)) * 0.05)
+                local_stats["dlq"] += 1
+        else:
+            worker.process(notif)
+
+        print(f"  {notif_id:<20}  {local_stats['delivered']:>10}  "
+              f"{local_stats['retried']:>8}  {local_stats['dlq']:>5}  {note}")
 
     print("""
   Dead Letter Queue (DLQ):
-  - Messages that exhaust all retries go to a DLQ Kafka topic
-  - On-call engineers can inspect DLQ messages and re-process manually
-  - Prevents a single bad message from blocking the entire queue
+  - Messages that exhaust all retries are produced to a 'notif-dlq' Kafka topic
+  - On-call engineers monitor DLQ consumer lag as an alerting signal
+  - A spike in DLQ lag = systemic issue (APNs outage, expired credentials)
+  - DLQ messages can be replayed from the beginning of the topic after a fix
+  - For transactional notifications (OTP), the system should also check whether
+    the OTP TTL has expired before re-delivering from the DLQ — a 30-min-delayed
+    password reset code should be dropped, not sent.
 """)
 
 
-def phase6_scale_math():
-    section("Phase 6: Scale Math — 1B Notifications/Day")
+def phase6_fanout_simulation(producer: KafkaProducer, conn):
+    section("Phase 6: Fan-Out — Celebrity Post Triggers Mass Notifications")
+
+    print("""
+  Fan-out problem: a single user action triggers notifications to many users.
+  Example: a celebrity with 1M followers posts → 1M notification events.
+
+  Two strategies:
+    WRITE fan-out (push model): fan out at write time → store per-user inbox
+      + reads are O(1) per user
+      - writes are O(followers) — huge spike for celebrities
+    READ fan-out (pull model): store one event, each user reads on demand
+      + writes are O(1)
+      - reads are O(followed_accounts) per page load — expensive at scale
+
+  Most systems (Facebook, Twitter) use a HYBRID:
+    - Inactive / low-follower users: write fan-out
+    - Celebrity accounts (>1M followers): read fan-out at query time
+  This lab simulates the write fan-out path for a modest 500-follower account.
+""")
+
+    # Simulate a "post" event fan-out to 500 followers
+    ACTOR_ID = 9001
+    FOLLOWER_COUNT = 500
+    EVENT_ID = str(uuid.uuid4())
+
+    print(f"  Actor user_id={ACTOR_ID} posts content (event_id={EVENT_ID[:8]}...)")
+    print(f"  Fanning out to {FOLLOWER_COUNT} followers ...\n")
+
+    # Generate follower IDs — we reuse our 5 seeded preference users for filtering
+    seeded_users = [101, 102, 103, 104, 105]
+    follower_ids = seeded_users * (FOLLOWER_COUNT // len(seeded_users))
+    follower_ids += seeded_users[: FOLLOWER_COUNT % len(seeded_users)]
+
+    produced = 0
+    suppressed_at_fanout = 0
+    for follower_id in follower_ids:
+        # Check push preference before even producing to Kafka (early suppression)
+        # In production this would be a Redis HGET, not a Postgres query
+        if not is_channel_enabled(conn, follower_id, "push"):
+            suppressed_at_fanout += 1
+            continue
+        notif = Notification(
+            notification_id=f"fanout-{follower_id}-{EVENT_ID[:8]}",
+            user_id=follower_id,
+            channel="push",
+            type="social",
+            message=f"User {ACTOR_ID} posted new content",
+            # Idempotency key is deterministic: same event + user + channel
+            idempotency_key=f"fo-{EVENT_ID}-{follower_id}-push",
+            priority="normal",
+        )
+        producer.send(TOPIC_MARKETING, notif.to_json())
+        produced += 1
+
+    producer.flush()
+
+    print(f"  Followers:               {FOLLOWER_COUNT}")
+    print(f"  Suppressed at fan-out:   {suppressed_at_fanout}  (push disabled in preferences)")
+    print(f"  Events produced to Kafka:{produced}")
+
+    # Drain and count deliveries
+    consumer = make_consumer([TOPIC_MARKETING], f"lab-fanout-{uuid.uuid4()}")
+    fanout_stats = defaultdict(int)
+    worker = DeliveryWorker("fanout-worker", conn, fanout_stats)
+    for msg in consumer:
+        notif_recv = Notification.from_json(msg.value)
+        if notif_recv.notification_id.startswith("fanout-"):
+            worker.process(notif_recv)
+    consumer.close()
+
+    print(f"  Delivered:               {fanout_stats['delivered']}")
+    print(f"  Deduped (already sent):  {fanout_stats['deduplicated']}")
+
+    print(f"""
+  At production scale (10M followers):
+    10M events × 200 bytes = 2 GB on Kafka — manageable for a single topic
+    At 1M events/minute fan-out rate → 60s to produce all events
+    APNs batch size = 500 → 20,000 API calls to deliver to 10M devices
+    Per-device token validation required (expired tokens → 410 Gone response)
+
+  Key insight: the Notification Service does NOT wait for delivery to complete.
+  It produces to Kafka and returns. Delivery is async and takes seconds–minutes.
+""")
+
+
+def phase7_scale_math():
+    section("Phase 7: Scale Math — 1B Notifications/Day")
 
     print("""
   System design numbers for 1 billion notifications per day:
@@ -544,11 +674,21 @@ def phase6_scale_math():
 
   4. Deduplication window: idempotency keys stored 24h in Redis
      → prevents duplicates across retries and system restarts
+
+  Worker sizing (rule of thumb):
+     push workers:   ~35K peak RPS / 500 per APNs batch / ~10 batches/s each
+                     → ~7 push worker processes (APNs is fast, batching helps)
+     email workers:  ~1,735 avg RPS; SendGrid rate limit ~100 rps/IP
+                     → ~18 email worker processes (or IPs/dedicated pools)
+     sms workers:    ~580 avg RPS; Twilio throttles per account
+                     → scale horizontally by Twilio sub-account
+     in-app workers: ~5,200 avg RPS; simple Postgres/Redis writes
+                     → ~10-20 in-app workers
 """)
 
 
-def phase7_db_summary(conn):
-    section("Phase 7: Delivery Summary from Postgres")
+def phase8_db_summary(conn):
+    section("Phase 8: Delivery Summary from Postgres")
 
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM delivered_notifications")
@@ -599,9 +739,14 @@ def main():
     phase2_consume_and_deliver(conn)
     phase3_preference_filtering(conn)
     phase4_deduplication(conn)
-    phase5_retry_backoff()
-    phase6_scale_math()
-    phase7_db_summary(conn)
+    phase5_retry_backoff(conn)
+
+    fanout_producer = make_producer()
+    phase6_fanout_simulation(fanout_producer, conn)
+    fanout_producer.close()
+
+    phase7_scale_math()
+    phase8_db_summary(conn)
 
     conn.close()
 
@@ -609,11 +754,15 @@ def main():
     print("""
   Summary:
   - Kafka separates transactional (high-priority) from marketing notifications
-  - User preferences checked on every delivery (Redis in production)
-  - Idempotency key + DB unique constraint prevents double-delivery on retry
+  - User preferences checked at fan-out time + at delivery (Redis in production)
+  - Fan-out: early preference suppression at produce time reduces Kafka volume
+  - Idempotency key + INSERT...ON CONFLICT RETURNING id prevents double-delivery
+    even when concurrent workers race past the pre-check (correct at DB level)
   - Exponential backoff reduces pressure on failing delivery endpoints
-  - DLQ captures persistently failing notifications for manual review
-  - 1B/day requires ~35K channel workers and per-channel Kafka topic partitioning
+  - DLQ captures persistently failing notifications; expired OTP tokens must be
+    dropped rather than re-delivered from the DLQ
+  - 1B/day at peak 35K RPS requires ~7 push workers (APNs batching), ~18 email
+    workers (per-IP rate limits), and ~10-20 in-app workers
 
   Next: 10-rate-limiter/ — global rate limiting across distributed API servers
 """)

@@ -44,11 +44,17 @@ A naive single-threaded crawler fetching one page per second would take 158 year
 | Metric | Calculation | Result |
 |---|---|---|
 | Pages/second | 400M / 86,400s | ~4,630 RPS |
-| Bandwidth | 4,630 × 50KB | ~225 MB/s |
+| Inbound bandwidth | 4,630 × 50KB | ~225 MB/s |
 | URL frontier RAM (hash set) | 5B × 64B/URL | ~320 GB |
 | URL frontier RAM (Bloom filter) | 5B, 1% FPR | ~6 GB |
 | Raw HTML storage | 5B × 50KB | ~250 TB |
-| Crawler workers needed | 4,630 RPS / 10 RPS per worker | ~463 workers |
+| S3 storage cost | 250TB × $0.023/GB/month | ~$5,750/month |
+| Crawler workers | 4,630 RPS / 10 RPS per worker | ~463 workers |
+| Postgres write IOPS | 4,630 metadata rows/sec | ~4,630 IOPS |
+| robots.txt fetches | 200M domains / 24h TTL | ~2.3 RPS (cached) |
+| DNS lookups | dominated by cache hits (5-min TTL) | ~50–100 RPS |
+
+**Overhead that candidates miss:** Every page fetch also requires a DNS lookup (cached, ~5-min TTL) and a robots.txt check (cached per domain per session). At 200M unique domains even a 24-hour cache TTL requires re-fetching 2,300+ robots.txt files per second on re-crawl cycles. The metadata database must absorb 4,630+ IOPS sustained — this pushes Postgres to its single-node write limit; Cassandra or DynamoDB is better suited for this write pattern at Google scale.
 
 ---
 
@@ -205,6 +211,47 @@ Input:  HTTP://Example.COM/Path?b=2&a=1&sid=abc123#section
 Output: http://example.com/Path?a=1&b=2
 ```
 
+### 6. Content Deduplication: SimHash for Near-Duplicates
+
+URL deduplication (Bloom filter) catches exact URL matches. But the web has massive duplicate content at distinct URLs: printer-friendly mirrors, syndicated articles, CMS pagination variants, A/B test URL variants.
+
+**SimHash** (Charikar 2002) is a locality-sensitive hash where similar texts produce hashes with small Hamming distance:
+
+1. Tokenise page body into 3-word shingles: `["the quick brown", "quick brown fox", ...]`
+2. Hash each shingle to a 64-bit integer (MurmurHash)
+3. For each bit position i, accumulate +1 if bit i is 1, -1 if 0
+4. Final fingerprint: bit i = 1 iff `sum[i] > 0`
+
+**Near-duplicate threshold:** Two pages with `Hamming(fp_A, fp_B) <= 3` are considered near-duplicates (~95%+ content similarity).
+
+**Production implementation:**
+- Compute SimHash after stripping HTML tags (content-only)
+- Store 64-bit fingerprint alongside URL in Postgres metadata table
+- Index pipeline: before indexing a page, query for existing fingerprints within Hamming distance 3 (via Simhash lookup tables or brute-force scan within shards)
+- Keep only the canonical URL; mark near-dups as `canonical_url = <winner>`
+- Impact: Google estimates ~30% of crawled pages are near-duplicates — SimHash avoids indexing redundant content
+
+---
+
+## Failure Modes
+
+These are the deep-dive topics that separate senior from staff-level answers.
+
+| Failure | Symptom | Mitigation |
+|---|---|---|
+| Bloom filter false positives | Valid new URLs silently skipped | Acceptable at 1% FPR; tune m/k; rebuild filter periodically from stored URLs |
+| Bloom filter RAM exhaustion | Redis OOM, filter lost | Use Redis cluster; snapshot filter to disk (BGSAVE) hourly |
+| Worker crash mid-crawl | Kafka partition rebalanced; pages re-fetched | Kafka consumer group rebalance; page-level idempotency (`ON CONFLICT DO NOTHING` in Postgres) |
+| Kafka consumer lag spike | Frontier URLs pile up; crawl falls behind | Monitor lag; auto-scale workers; throttle link extraction on low-priority topics |
+| Politeness rate exceeded | Target site responds 429/503 | Increase per-domain delay on 429 response; implement exponential backoff |
+| Crawler trap slips through | Frontier grows unbounded | Depth limit + param threshold + per-domain URL count cap (e.g., max 100K URLs per domain) |
+| robots.txt changes mid-crawl | Newly disallowed paths fetched | TTL-based robots.txt refresh (e.g., re-fetch every 24h); re-crawl flagged pages |
+| DNS poisoning / redirect loops | Crawler follows redirect cycle indefinitely | Redirect depth limit (max 5 hops); detect cycle by tracking redirect chain per request |
+| Content store (S3) write failure | Raw HTML lost; indexer starved | Retry with exponential backoff; dead-letter queue for failed writes; alert on DLQ depth |
+| Clock skew across workers | Priority scores computed incorrectly | Use NTP-synchronized clocks; prefer monotonic counters for relative ordering over wall clock |
+
+**Key failure mode for the interview:** The Bloom filter is a shared mutable structure. In a distributed crawler, you need either (a) a single Redis Bloom filter with network round-trips on every URL check, or (b) per-worker local Bloom filters that diverge (workers may fetch the same URL). Production systems typically accept (b) with a reconciliation pass after each crawl cycle, or use a distributed Bloom filter sharded by URL hash across a Redis cluster.
+
 ---
 
 ## How It Actually Works
@@ -231,7 +278,7 @@ Source: CommonCrawl "About" documentation; Google Search Central "How Google Sea
 
 ## Hands-on Lab
 
-**Time:** ~15 minutes
+**Time:** ~20 minutes
 **Services:** `redis` (Redis 7), `db` (Postgres 15), `mock-server` (Flask, 50 pages), `crawler` (Python)
 
 ### Setup
@@ -247,7 +294,7 @@ docker compose ps
 
 ```bash
 # Run the crawler experiment (one-shot)
-docker compose run --rm crawler
+docker compose --profile experiment run --rm crawler
 
 # Or locally (faster iteration):
 pip install redis psycopg2-binary mmh3 flask
@@ -257,15 +304,17 @@ python mock_server.py
 MOCK_SERVER_URL=http://localhost:5100 python experiment.py
 ```
 
-The script runs 7 phases automatically:
+The script runs 9 phases automatically:
 
 1. **BFS crawl:** seed 5 URLs → BFS → crawl up to 30 pages, show frontier stats
 2. **Bloom filter demo:** show deduplication — URL seen twice is skipped
 3. **Politeness:** show per-domain rate limiting with wait times
 4. **robots.txt:** show /private/* pages are never fetched
 5. **Trap detection:** show ?page=N URLs blocked above threshold
-6. **Scale math:** compute real numbers for 5B page crawl
-7. **DB summary:** show crawled pages stored in Postgres by domain/depth
+6. **URL normalization:** collapse session IDs, tracking params, fragments; verify with test cases
+7. **SimHash:** compute 64-bit fingerprints; show near-duplicate detection by Hamming distance
+8. **Scale math:** compute real numbers for 5B page crawl including DNS/robots.txt/IOPS overhead
+9. **DB summary:** show crawled pages stored in Postgres by domain/depth
 
 ### Break It
 
