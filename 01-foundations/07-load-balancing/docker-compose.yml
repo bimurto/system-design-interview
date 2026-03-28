@@ -5,42 +5,42 @@ x-app-defaults: &app-defaults
   command: >
     bash -c "pip install flask -q &&
     python -c \"
-import os, time, random
-from flask import Flask, jsonify
-app = Flask(__name__)
-
-@app.route('/')
+  import os, time, random
+  from flask import Flask, jsonify
+  app = Flask(__name__)
+  
+  @app.route('/')
 def index():
-    delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
-    # Add small jitter (±10%) to simulate realistic variance, not a flat spike
-    jitter = delay * random.uniform(-0.1, 0.1)
-    time.sleep(max(0, delay + jitter))
-    return jsonify(
-        host=os.environ.get('APP_NAME', 'unknown'),
-        latency_ms=int(os.environ.get('LATENCY_MS', 0))
-    )
-
-@app.route('/health')
+  delay = int(os.environ.get('LATENCY_MS', 0)) / 1000.0
+  # Add small jitter (±10%) to simulate realistic variance, not a flat spike
+  jitter = delay * random.uniform(-0.1, 0.1)
+  time.sleep(max(0, delay + jitter))
+  return jsonify(
+  host=os.environ.get('APP_NAME', 'unknown'),
+  latency_ms=int(os.environ.get('LATENCY_MS', 0))
+  )
+  
+  @app.route('/health')
 def health():
-    # A real health endpoint would check DB connectivity, cache reachability, etc.
-    # Returning 200 unconditionally is the anti-pattern discussed in README.md.
-    return 'ok', 200
-
-app.run(host='0.0.0.0', port=8000)
-\""
-  healthcheck:
-    # Use wget (available in python:slim) rather than installing curl
-    test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
-    interval: 5s
-    timeout: 5s
-    retries: 10
-  # Resource caps: prevents any single backend from consuming unbounded CPU/RAM
-  # during the experiment, keeping the laptop responsive.
-  deploy:
-    resources:
-      limits:
-        cpus: "0.5"
-        memory: 128M
+  # A real health endpoint would check DB connectivity, cache reachability, etc.
+  # Returning 200 unconditionally is the anti-pattern discussed in README.md.
+  return 'ok', 200
+  
+  app.run(host='0.0.0.0', port=8000)
+  \""
+healthcheck:
+  # Use wget (available in python:slim) rather than installing curl
+  test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\"" ]
+  interval: 5s
+  timeout: 5s
+  retries: 10
+# Resource caps: prevents any single backend from consuming unbounded CPU/RAM
+# during the experiment, keeping the laptop responsive.
+deploy:
+  resources:
+    limits:
+      cpus: "0.5"
+      memory: 128M
 
 services:
   app1:
@@ -86,7 +86,7 @@ services:
       app4:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://localhost/health || exit 1"]
+      test: [ "CMD-SHELL", "wget -q -O- http://localhost/health || exit 1" ]
       interval: 5s
       timeout: 5s
       retries: 10

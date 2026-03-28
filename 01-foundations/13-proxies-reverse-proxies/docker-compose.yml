@@ -11,7 +11,7 @@ services:
       backend2:
         condition: service_healthy   # wait until backend2 passes its health check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost/health" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -51,7 +51,7 @@ services:
       http.server.HTTPServer(('0.0.0.0', int(os.environ['PORT'])), H).serve_forever()
       "
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -91,7 +91,7 @@ services:
       http.server.HTTPServer(('0.0.0.0', int(os.environ['PORT'])), H).serve_forever()
       "
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')" ]
       interval: 5s
       timeout: 3s
       retries: 10

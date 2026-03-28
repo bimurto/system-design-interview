@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: secret
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d payments"]
+      test: [ "CMD-SHELL", "pg_isready -U app -d payments" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -14,7 +14,7 @@ services:
   redis:
     image: redis:7
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -37,7 +37,7 @@ services:
       - "5002:5000"
     restart: on-failure
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\"" ]
       interval: 10s
       timeout: 5s
       retries: 10

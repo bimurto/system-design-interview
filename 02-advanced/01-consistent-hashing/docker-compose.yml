@@ -11,7 +11,7 @@ services:
           cpus: "1"
           memory: 256M
     healthcheck:
-      test: ["CMD", "python", "-c", "import hashlib, bisect, statistics; print('ok')"]
+      test: [ "CMD", "python", "-c", "import hashlib, bisect, statistics; print('ok')" ]
       interval: 5s
       timeout: 3s
       retries: 3

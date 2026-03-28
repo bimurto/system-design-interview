@@ -67,7 +67,7 @@ services:
       http.server.HTTPServer(('0.0.0.0', 9001), H).serve_forever()
       "
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health', timeout=3)"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health', timeout=3)" ]
       interval: 5s
       timeout: 5s
       retries: 12

@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: secret
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d whatsapp"]
+      test: [ "CMD-SHELL", "pg_isready -U app -d whatsapp" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -16,7 +16,7 @@ services:
     image: redis:7
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -42,7 +42,7 @@ services:
     # a raw TCP connect, which only proves the port is open, not that the server
     # is accepting WebSocket connections.
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"\nimport socket, hashlib, base64, os\ns = socket.socket()\ns.settimeout(3)\ns.connect(('localhost', 8765))\nkey = base64.b64encode(os.urandom(16)).decode()\nhs = f'GET / HTTP/1.1\\r\\nHost: localhost\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Key: {key}\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n'\ns.send(hs.encode())\nresp = s.recv(256).decode(errors='ignore')\nassert '101' in resp, f'bad response: {resp}'\ns.close()\n\""]
+      test: [ "CMD-SHELL", "python -c \"\nimport socket, hashlib, base64, os\ns = socket.socket()\ns.settimeout(3)\ns.connect(('localhost', 8765))\nkey = base64.b64encode(os.urandom(16)).decode()\nhs = f'GET / HTTP/1.1\\r\\nHost: localhost\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Key: {key}\\r\\nSec-WebSocket-Version: 13\\r\\n\\r\\n'\ns.send(hs.encode())\nresp = s.recv(256).decode(errors='ignore')\nassert '101' in resp, f'bad response: {resp}'\ns.close()\n\"" ]
       interval: 10s
       timeout: 5s
       retries: 10

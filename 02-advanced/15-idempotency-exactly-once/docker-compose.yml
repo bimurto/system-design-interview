@@ -6,7 +6,7 @@ services:
       - POSTGRES_USER=app
       - POSTGRES_PASSWORD=secret
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "app", "-d", "payments"]
+      test: [ "CMD", "pg_isready", "-U", "app", "-d", "payments" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -35,7 +35,7 @@ services:
     # despite the health check (e.g., first connection attempt during init_db).
     restart: on-failure
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')" ]
       interval: 5s
       timeout: 3s
       retries: 10

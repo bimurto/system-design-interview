@@ -15,7 +15,7 @@ services:
     # Nginx itself is lightweight; 64 MB is generous for this lab.
     mem_limit: 64m
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      test: [ "CMD", "wget", "-qO-", "http://localhost/nginx-health" ]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -35,8 +35,8 @@ services:
     command: python app.py
     mem_limit: 128m
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: [ "CMD", "python", "-c",
+              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -54,8 +54,8 @@ services:
     command: python app.py
     mem_limit: 128m
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: [ "CMD", "python", "-c",
+              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -73,8 +73,8 @@ services:
     command: python app.py
     mem_limit: 128m
     healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: [ "CMD", "python", "-c",
+              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 5s
       timeout: 3s
       retries: 5

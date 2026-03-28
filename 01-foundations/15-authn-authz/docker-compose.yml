@@ -4,7 +4,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -23,7 +23,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5001/health"]
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:5001/health" ]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -41,7 +41,7 @@ services:
       auth-service:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5002/health"]
+      test: [ "CMD", "wget", "-q", "--spider", "http://localhost:5002/health" ]
       interval: 5s
       timeout: 3s
       retries: 3

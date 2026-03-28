@@ -19,7 +19,7 @@ services:
         -c autovacuum_analyze_scale_factor=0.005
         -c log_autovacuum_min_duration=0
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
       timeout: 5s
       retries: 10

@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an interactive, lab-driven system design interview preparation course for senior/staff engineers (3+ years experience) targeting FAANG-level interviews. It contains 39 topic folders across three sections, each pairing a concept README with a locally-runnable Docker Compose experiment.
+This is an interactive, lab-driven system design interview preparation course for senior/staff engineers (3+ years
+experience) targeting FAANG-level interviews. It contains 39 topic folders across three sections, each pairing a concept
+README with a locally-runnable Docker Compose experiment.
 
 ## Running Experiments
 
@@ -46,6 +48,7 @@ make logs     # tail container logs
 ```
 
 Each topic folder contains:
+
 - `README.md` — concept explanation, trade-offs, interview talking points
 - `docker-compose.yml` — local infrastructure (no cloud required)
 - `experiment.py` — runnable Python demo of the concept
@@ -53,11 +56,13 @@ Each topic folder contains:
 
 ## Adding New Topics
 
-Follow the existing pattern: one folder per topic with `README.md`, `docker-compose.yml`, and `experiment.py`. Topics should be self-contained — no shared state between folders.
+Follow the existing pattern: one folder per topic with `README.md`, `docker-compose.yml`, and `experiment.py`. Topics
+should be self-contained — no shared state between folders.
 
 ## Interview Structure Reference
 
 Each case-study README is structured around the standard interview framework:
+
 1. Clarify Requirements (3–5 min)
 2. Capacity Estimation (3–5 min)
 3. High-Level Design (10 min)

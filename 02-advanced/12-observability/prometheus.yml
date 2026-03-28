@@ -6,4 +6,4 @@ scrape_configs:
   - job_name: 'flask_app'
     scrape_interval: 5s
     static_configs:
-      - targets: ['flask-app:8000']
+      - targets: [ 'flask-app:8000' ]

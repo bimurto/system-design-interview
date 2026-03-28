@@ -6,7 +6,7 @@ services:
     command: >
       sh -c "pip install flask --quiet && python /origin_server.py"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -21,7 +21,7 @@ services:
       origin:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/health"]
+      test: [ "CMD", "wget", "-qO-", "http://localhost:80/health" ]
       interval: 5s
       timeout: 3s
       retries: 10

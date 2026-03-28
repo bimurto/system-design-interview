@@ -23,7 +23,7 @@ services:
           cpus: "1.0"
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d captest"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d captest" ]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -60,7 +60,7 @@ services:
       # The replica's data directory is only populated after pg_basebackup
       # completes, so we also verify pg_is_in_recovery() to confirm standby
       # mode (not a misconfigured standalone instance).
-      test: ["CMD-SHELL", "pg_isready -U postgres && psql -U postgres -c 'SELECT pg_is_in_recovery()' | grep -q t"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres && psql -U postgres -c 'SELECT pg_is_in_recovery()' | grep -q t" ]
       interval: 5s
       timeout: 5s
       retries: 20

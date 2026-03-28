@@ -7,32 +7,70 @@
 
 ## Concept
 
-A single Redis instance can serve hundreds of thousands of requests per second from a single server. For many applications, this is sufficient. But as data grows beyond memory capacity, or as write throughput exceeds what a single server can handle, a distributed cache is needed. Distributed caching partitions the keyspace across multiple cache nodes, allowing the cache to grow horizontally: add more nodes, and the cache capacity and throughput scale proportionally.
+A single Redis instance can serve hundreds of thousands of requests per second from a single server. For many
+applications, this is sufficient. But as data grows beyond memory capacity, or as write throughput exceeds what a single
+server can handle, a distributed cache is needed. Distributed caching partitions the keyspace across multiple cache
+nodes, allowing the cache to grow horizontally: add more nodes, and the cache capacity and throughput scale
+proportionally.
 
-Redis Cluster is Redis's built-in distributed mode. Rather than using consistent hashing (as Cassandra or Memcached do), Redis Cluster pre-divides the keyspace into exactly **16,384 hash slots**. The slot for a key is computed as `CRC16(key) % 16384`. Each cluster node is assigned ownership of a contiguous range of slots. With 3 nodes, each owns roughly 5,461 slots. Adding a new node involves migrating some slot ranges to it — Redis supports live slot migration with the `CLUSTER MIGRATE` command, using `MOVED` and `ASK` redirections to route clients during the migration.
+Redis Cluster is Redis's built-in distributed mode. Rather than using consistent hashing (as Cassandra or Memcached do),
+Redis Cluster pre-divides the keyspace into exactly **16,384 hash slots**. The slot for a key is computed as
+`CRC16(key) % 16384`. Each cluster node is assigned ownership of a contiguous range of slots. With 3 nodes, each owns
+roughly 5,461 slots. Adding a new node involves migrating some slot ranges to it — Redis supports live slot migration
+with the `CLUSTER MIGRATE` command, using `MOVED` and `ASK` redirections to route clients during the migration.
 
-Redis Sentinel provides a different solution: not sharding, but **high availability for a single master**. Sentinel processes run alongside Redis instances and continuously monitor the master. If the master fails to respond to enough Sentinel processes within a timeout, Sentinel elects one of the replicas as the new master and notifies clients via its own discovery mechanism. Sentinel is appropriate when the dataset fits on a single Redis server but you need automatic failover — simpler to operate than Cluster but unable to scale beyond one master's write capacity.
+Redis Sentinel provides a different solution: not sharding, but **high availability for a single master**. Sentinel
+processes run alongside Redis instances and continuously monitor the master. If the master fails to respond to enough
+Sentinel processes within a timeout, Sentinel elects one of the replicas as the new master and notifies clients via its
+own discovery mechanism. Sentinel is appropriate when the dataset fits on a single Redis server but you need automatic
+failover — simpler to operate than Cluster but unable to scale beyond one master's write capacity.
 
-The hardest distributed caching problem is not technical — it's the **hot key**. Consistent hashing or hash slots ensure that on average, each node handles an equal share of the keyspace. But if one key is accessed millions of times per second (a viral tweet's like counter, a global leaderboard, a feature flag checked on every request), all those requests converge on a single node. No amount of horizontal scaling helps — you cannot spread one key across multiple nodes in a standard Redis setup. The solutions involve either splitting the key (shard the counter into N sub-counters), caching at the application layer (local in-process cache), or adding read replicas specifically for the hot key.
+The hardest distributed caching problem is not technical — it's the **hot key**. Consistent hashing or hash slots ensure
+that on average, each node handles an equal share of the keyspace. But if one key is accessed millions of times per
+second (a viral tweet's like counter, a global leaderboard, a feature flag checked on every request), all those requests
+converge on a single node. No amount of horizontal scaling helps — you cannot spread one key across multiple nodes in a
+standard Redis setup. The solutions involve either splitting the key (shard the counter into N sub-counters), caching at
+the application layer (local in-process cache), or adding read replicas specifically for the hot key.
 
-Cache warm-up is a related operational challenge. When a new cache cluster starts or all keys expire simultaneously (cache avalanche), the backing database receives every request directly. In a high-traffic system, this cold-start thundering herd can overwhelm the database before the cache has a chance to warm up. Mitigation strategies include pre-populating the cache before traffic arrives (eager warm-up from a DB dump), staggering expiry times with random jitter to avoid mass expiry, and using distributed locks so only one server repopulates each key while others wait.
+Cache warm-up is a related operational challenge. When a new cache cluster starts or all keys expire simultaneously (
+cache avalanche), the backing database receives every request directly. In a high-traffic system, this cold-start
+thundering herd can overwhelm the database before the cache has a chance to warm up. Mitigation strategies include
+pre-populating the cache before traffic arrives (eager warm-up from a DB dump), staggering expiry times with random
+jitter to avoid mass expiry, and using distributed locks so only one server repopulates each key while others wait.
 
-**Cache stampede (thundering herd on a single key)** is the single-key variant: when a popular cached value expires, dozens or hundreds of concurrent requests all get a cache miss simultaneously and all query the database, each independently attempting to repopulate the cache. The classic fix is a **mutex lock** (`SET lock:key NX EX 5`): the first request that wins the SETNX acquires the lock, fetches from the database, repopulates the cache, and releases the lock. All other requests either spin-wait or return a stale value. A more elegant variant is **probabilistic early expiration** (XFetch algorithm): before the TTL expires, read-heavy requests recompute the value with increasing probability as the TTL approaches zero, preventing the cliff-edge expiry entirely.
+**Cache stampede (thundering herd on a single key)** is the single-key variant: when a popular cached value expires,
+dozens or hundreds of concurrent requests all get a cache miss simultaneously and all query the database, each
+independently attempting to repopulate the cache. The classic fix is a **mutex lock** (`SET lock:key NX EX 5`): the
+first request that wins the SETNX acquires the lock, fetches from the database, repopulates the cache, and releases the
+lock. All other requests either spin-wait or return a stale value. A more elegant variant is **probabilistic early
+expiration** (XFetch algorithm): before the TTL expires, read-heavy requests recompute the value with increasing
+probability as the TTL approaches zero, preventing the cliff-edge expiry entirely.
 
-**Eviction policies** are a critical operational decision. Redis offers eight policies, but three dominate real-world use: `noeviction` (writes fail when memory is full — bad for a pure cache), `allkeys-lru` (evict any key by approximate LRU — correct for a pure cache with no TTLs), and `volatile-lru` (evict only keys that have a TTL set — use when Redis holds both ephemeral cache data and persistent data that must not be evicted). `allkeys-lfu` (Least Frequently Used, available since Redis 4.0) outperforms LRU for power-law access patterns where a small set of "hot" keys are accessed disproportionately — LFU keeps them in cache while LRU might evict a hot key that wasn't accessed in the last eviction scan window.
+**Eviction policies** are a critical operational decision. Redis offers eight policies, but three dominate real-world
+use: `noeviction` (writes fail when memory is full — bad for a pure cache), `allkeys-lru` (evict any key by approximate
+LRU — correct for a pure cache with no TTLs), and `volatile-lru` (evict only keys that have a TTL set — use when Redis
+holds both ephemeral cache data and persistent data that must not be evicted). `allkeys-lfu` (Least Frequently Used,
+available since Redis 4.0) outperforms LRU for power-law access patterns where a small set of "hot" keys are accessed
+disproportionately — LFU keeps them in cache while LRU might evict a hot key that wasn't accessed in the last eviction
+scan window.
 
 ## How It Works
 
 **Redis Cluster Key Routing Flow:**
+
 1. Client issues a command (e.g., `SET user:profile:42 "data"`)
 2. Client library computes the hash slot: `slot = CRC16("user:profile:42") % 16384` (e.g., slot 8790)
 3. Client consults its locally cached slot-to-node map and identifies that slot 8790 belongs to Node 2
 4. Client sends the command directly to Node 2 — no proxy, no coordinator
-5. If the slot has been migrated (e.g., to Node 3), Node 2 responds with `MOVED 8790 localhost:7003`; client updates its slot map and retries on Node 3
-6. During in-progress slot migration, Node 2 responds with `ASK localhost:7003`; client tries Node 3 for this request only (does not update the slot map)
-7. Reads can be served by the primary or any replica of the slot's shard (use `READONLY` mode on replicas to enable replica reads)
+5. If the slot has been migrated (e.g., to Node 3), Node 2 responds with `MOVED 8790 localhost:7003`; client updates its
+   slot map and retries on Node 3
+6. During in-progress slot migration, Node 2 responds with `ASK localhost:7003`; client tries Node 3 for this request
+   only (does not update the slot map)
+7. Reads can be served by the primary or any replica of the slot's shard (use `READONLY` mode on replicas to enable
+   replica reads)
 
 **Hash slot computation:**
+
 ```python
 def crc16(data: bytes) -> int:
     crc = 0
@@ -47,6 +85,7 @@ slot = crc16(key.encode()) % 16384
 ```
 
 **Redis Cluster slot assignment (3 nodes):**
+
 ```
   Node 1 (port 7001): slots    0 – 5460    (5461 slots)
   Node 2 (port 7002): slots 5461 – 10922   (5462 slots)
@@ -64,6 +103,7 @@ slot = crc16(key.encode()) % 16384
 ```
 
 **MOVED vs ASK redirections:**
+
 ```
   MOVED: slot permanently moved to new node. Client must update its
          slot map and use the new node for all future requests.
@@ -74,6 +114,7 @@ slot = crc16(key.encode()) % 16384
 ```
 
 **Hash tags for multi-key operations:**
+
 ```
   Multi-key operations (MGET, MSET, transactions) require all keys
   to be in the same slot. Use {tag} to force co-location:
@@ -87,6 +128,7 @@ slot = crc16(key.encode()) % 16384
 ```
 
 **Cache stampede — mutex lock pattern:**
+
 ```
   Many threads hit an expired key simultaneously:
 
@@ -111,6 +153,7 @@ slot = crc16(key.encode()) % 16384
 ```
 
 **Probabilistic early expiration (XFetch) — stampede prevention without locks:**
+
 ```python
 import math, random, time
 
@@ -138,6 +181,7 @@ def xfetch(cache, db_fetch_fn, key, ttl, beta=1.0):
 ```
 
 **Redis Sentinel topology:**
+
 ```
   Sentinel-1  Sentinel-2  Sentinel-3
       │            │            │
@@ -159,48 +203,72 @@ def xfetch(cache, db_fetch_fn, key, ttl, beta=1.0):
 
 ### Trade-offs
 
-| Feature | Redis Cluster | Redis Sentinel | Single Redis |
-|---|---|---|---|
-| Scale | Horizontal (N masters) | Vertical (one master) | Vertical |
-| HA | Built-in (replicas per master) | Yes (auto-failover) | No |
-| Multi-key ops | Only with hash tags | Yes | Yes |
-| Complexity | High | Medium | Low |
-| Max data | N × RAM | 1 × RAM | 1 × RAM |
-| Throughput | N × ops/s | 1 × ops/s | 1 × ops/s |
-| Use when | Large datasets, high write throughput | Medium datasets, need HA | Development, small data |
+| Feature       | Redis Cluster                         | Redis Sentinel           | Single Redis            |
+|---------------|---------------------------------------|--------------------------|-------------------------|
+| Scale         | Horizontal (N masters)                | Vertical (one master)    | Vertical                |
+| HA            | Built-in (replicas per master)        | Yes (auto-failover)      | No                      |
+| Multi-key ops | Only with hash tags                   | Yes                      | Yes                     |
+| Complexity    | High                                  | Medium                   | Low                     |
+| Max data      | N × RAM                               | 1 × RAM                  | 1 × RAM                 |
+| Throughput    | N × ops/s                             | 1 × ops/s                | 1 × ops/s               |
+| Use when      | Large datasets, high write throughput | Medium datasets, need HA | Development, small data |
 
 ### Eviction Policy Decision Matrix
 
-| Policy | Evicts | Best for |
-|---|---|---|
-| `noeviction` | Nothing — writes fail on OOM | Never use for a cache; use for a persistent primary store |
-| `allkeys-lru` | Any key, least recently used | Pure cache where all keys are ephemeral |
-| `volatile-lru` | Keys with TTL set, least recently used | Mixed store (some keys must never be evicted) |
-| `allkeys-lfu` | Any key, least frequently used | Power-law access patterns (few hot keys, many cold) |
-| `volatile-lfu` | Keys with TTL, least frequently used | Mixed store with power-law access pattern |
-| `allkeys-random` | Any key, random | Uniform access pattern (rare) |
-| `volatile-ttl` | Keys with shortest TTL first | When TTL is intentionally set to communicate priority |
+| Policy           | Evicts                                 | Best for                                                  |
+|------------------|----------------------------------------|-----------------------------------------------------------|
+| `noeviction`     | Nothing — writes fail on OOM           | Never use for a cache; use for a persistent primary store |
+| `allkeys-lru`    | Any key, least recently used           | Pure cache where all keys are ephemeral                   |
+| `volatile-lru`   | Keys with TTL set, least recently used | Mixed store (some keys must never be evicted)             |
+| `allkeys-lfu`    | Any key, least frequently used         | Power-law access patterns (few hot keys, many cold)       |
+| `volatile-lfu`   | Keys with TTL, least frequently used   | Mixed store with power-law access pattern                 |
+| `allkeys-random` | Any key, random                        | Uniform access pattern (rare)                             |
+| `volatile-ttl`   | Keys with shortest TTL first           | When TTL is intentionally set to communicate priority     |
 
-Rule of thumb: for a pure caching layer use `allkeys-lru` (safe default) or `allkeys-lfu` (better for popular-item skew). Never use `noeviction` if Redis can fill up.
+Rule of thumb: for a pure caching layer use `allkeys-lru` (safe default) or `allkeys-lfu` (better for popular-item
+skew). Never use `noeviction` if Redis can fill up.
 
 ### Failure Modes
 
-**Split-brain in Redis Cluster:** if the network partitions and nodes can't communicate, nodes on each side may believe they are masters. Redis Cluster uses a quorum-based failure detection: a node is considered failed only if a majority of masters agree it's unreachable. However, if the partition is between two equal halves (e.g., 3 nodes on each side of a 6-node cluster), neither half has quorum and both halves may reject writes — this is the safe behavior. With `cluster-require-full-coverage yes` (default), writes are rejected when any slot has no master. With `no`, writes continue for slots that do have a master.
+**Split-brain in Redis Cluster:** if the network partitions and nodes can't communicate, nodes on each side may believe
+they are masters. Redis Cluster uses a quorum-based failure detection: a node is considered failed only if a majority of
+masters agree it's unreachable. However, if the partition is between two equal halves (e.g., 3 nodes on each side of a
+6-node cluster), neither half has quorum and both halves may reject writes — this is the safe behavior. With
+`cluster-require-full-coverage yes` (default), writes are rejected when any slot has no master. With `no`, writes
+continue for slots that do have a master.
 
-**Hot key saturation:** a single key receiving millions of requests per second will saturate its node's CPU and network bandwidth. No horizontal scaling helps because the key always maps to one slot → one node. Detected by Redis `MONITOR` command or slow log. Solved by key splitting (shard counters), local process-level caching, or read replicas.
+**Hot key saturation:** a single key receiving millions of requests per second will saturate its node's CPU and network
+bandwidth. No horizontal scaling helps because the key always maps to one slot → one node. Detected by Redis `MONITOR`
+command or slow log. Solved by key splitting (shard counters), local process-level caching, or read replicas.
 
-**Cluster bus network saturation:** Redis Cluster nodes gossip with each other via a separate cluster bus (port = data port + 10000). In a large cluster (hundreds of nodes), gossip traffic can become significant. Each node sends gossip messages to a random subset of nodes periodically. Monitor cluster bus traffic separately from client traffic.
+**Cluster bus network saturation:** Redis Cluster nodes gossip with each other via a separate cluster bus (port = data
+port + 10000). In a large cluster (hundreds of nodes), gossip traffic can become significant. Each node sends gossip
+messages to a random subset of nodes periodically. Monitor cluster bus traffic separately from client traffic.
 
 ## Interview Talking Points
 
-- "Redis Cluster uses 16,384 hash slots, not consistent hashing. `slot = CRC16(key) % 16384`. Slots are explicitly assigned to masters. Adding a node requires migrating slot ranges — no automatic rebalancing."
-- "MOVED redirect: if a client asks the wrong node for a key, the node responds with `MOVED slot ip:port`. The client updates its slot map and retries. This is transparent to application code using a cluster-aware client like redis-py."
-- "Hot keys are the hardest distributed cache problem. A key accessed a million times/second always lands on one node. Solutions: shard the key (counter → N sub-counters), local in-process cache, or read replicas."
-- "Redis Sentinel provides high availability without sharding — auto-failover when the master dies. Use Cluster when data exceeds one node's RAM or write throughput exceeds one node's capacity. Use Sentinel for simpler HA when data fits in one master."
-- "Hash tags allow co-locating related keys on the same slot: `{user:42}:profile` and `{user:42}:settings` both hash on `user:42`. This enables multi-key operations (MGET, transactions) in a cluster, which otherwise require all keys to be on the same node."
-- "Cache warm-up is an operational problem: when a new cluster starts cold, every request is a cache miss and hits the database. Pre-populate before traffic, stagger TTLs to avoid avalanche, and use a distributed lock (Redis SETNX) to prevent stampede."
-- "Cache stampede (thundering herd) hits a single key: many concurrent requests all miss simultaneously and all hit the DB. Use a Redis mutex — `SET lock:key 1 NX EX 5` — so only one request re-populates the key. The lock TTL must exceed the DB query time or another stampede starts before the lock is released."
-- "Eviction policy is a Day 1 config decision. For a pure cache: `allkeys-lru` (safe) or `allkeys-lfu` (better for power-law access). Never use `noeviction` on a cache — when memory fills, all writes fail. For a mixed store (some keys must survive): `volatile-lru` evicts only keys that have a TTL, leaving non-TTL keys (your persistent data) untouched."
+- "Redis Cluster uses 16,384 hash slots, not consistent hashing. `slot = CRC16(key) % 16384`. Slots are explicitly
+  assigned to masters. Adding a node requires migrating slot ranges — no automatic rebalancing."
+- "MOVED redirect: if a client asks the wrong node for a key, the node responds with `MOVED slot ip:port`. The client
+  updates its slot map and retries. This is transparent to application code using a cluster-aware client like redis-py."
+- "Hot keys are the hardest distributed cache problem. A key accessed a million times/second always lands on one node.
+  Solutions: shard the key (counter → N sub-counters), local in-process cache, or read replicas."
+- "Redis Sentinel provides high availability without sharding — auto-failover when the master dies. Use Cluster when
+  data exceeds one node's RAM or write throughput exceeds one node's capacity. Use Sentinel for simpler HA when data
+  fits in one master."
+- "Hash tags allow co-locating related keys on the same slot: `{user:42}:profile` and `{user:42}:settings` both hash on
+  `user:42`. This enables multi-key operations (MGET, transactions) in a cluster, which otherwise require all keys to be
+  on the same node."
+- "Cache warm-up is an operational problem: when a new cluster starts cold, every request is a cache miss and hits the
+  database. Pre-populate before traffic, stagger TTLs to avoid avalanche, and use a distributed lock (Redis SETNX) to
+  prevent stampede."
+- "Cache stampede (thundering herd) hits a single key: many concurrent requests all miss simultaneously and all hit the
+  DB. Use a Redis mutex — `SET lock:key 1 NX EX 5` — so only one request re-populates the key. The lock TTL must exceed
+  the DB query time or another stampede starts before the lock is released."
+- "Eviction policy is a Day 1 config decision. For a pure cache: `allkeys-lru` (safe) or `allkeys-lfu` (better for
+  power-law access). Never use `noeviction` on a cache — when memory fills, all writes fail. For a mixed store (some
+  keys must survive): `volatile-lru` evicts only keys that have a TTL, leaving non-TTL keys (your persistent data)
+  untouched."
 
 ## Hands-on Lab
 
@@ -222,7 +290,11 @@ pip install redis
 python experiment.py
 ```
 
-The script sets 1000 keys and reports their distribution across the 3 nodes (should be ~333 each), demonstrates MOVED-transparent routing, hammers a hot key from 20 threads to show all traffic hitting one node, implements key splitting into 10 shards showing distributed load, demonstrates the 5 main Redis data structures (STRING, HASH, SET, SORTED SET, LIST) for different caching patterns, and runs a cache stampede simulation with 30 concurrent threads — comparing the unprotected case (30 DB hits) against the Redis mutex pattern (1 DB hit).
+The script sets 1000 keys and reports their distribution across the 3 nodes (should be ~333 each), demonstrates
+MOVED-transparent routing, hammers a hot key from 20 threads to show all traffic hitting one node, implements key
+splitting into 10 shards showing distributed load, demonstrates the 5 main Redis data structures (STRING, HASH, SET,
+SORTED SET, LIST) for different caching patterns, and runs a cache stampede simulation with 30 concurrent threads —
+comparing the unprotected case (30 DB hits) against the Redis mutex pattern (1 DB hit).
 
 ### Break It
 
@@ -258,7 +330,12 @@ except Exception as e:
 
 ### Observe
 
-Phase 1 shows the hash slot distribution is nearly uniform across the 3 nodes (~333 keys each). Phase 3 shows all 5000 hot-key writes hitting one specific node (the one that owns the slot for `leaderboard:global`). Phase 4 shows all 10 shard keys distributed across all 3 nodes. The data structures demo shows Redis's built-in types eliminating the need for application-level serialization for structured data. Phase 6 shows 30 threads all missing the same key simultaneously: without a mutex all 30 hit the "database"; with a Redis `SET NX EX` mutex only 1 thread hits the database while the rest wait for the cache to warm.
+Phase 1 shows the hash slot distribution is nearly uniform across the 3 nodes (~333 keys each). Phase 3 shows all 5000
+hot-key writes hitting one specific node (the one that owns the slot for `leaderboard:global`). Phase 4 shows all 10
+shard keys distributed across all 3 nodes. The data structures demo shows Redis's built-in types eliminating the need
+for application-level serialization for structured data. Phase 6 shows 30 threads all missing the same key
+simultaneously: without a mutex all 30 hit the "database"; with a Redis `SET NX EX` mutex only 1 thread hits the
+database while the rest wait for the cache to warm.
 
 ### Teardown
 
@@ -268,14 +345,38 @@ docker compose down -v
 
 ## Real-World Examples
 
-- **Twitter's Manhattan and Redis usage:** Twitter uses Redis Cluster for timeline caching, session storage, and rate limiting. Their "Twemproxy" (proxy for Redis/Memcached clusters) was widely used before Redis Cluster became production-ready. Their hot-tweet problem (a celebrity tweet gets millions of likes in seconds) is solved by local in-process caching in each API server for the hottest keys. Source: Twitter Engineering, "Caching with Twemproxy," 2012.
-- **Snapchat's Mustache:** Snapchat built "Mustache," a distributed cache layer on top of Redis Cluster, to handle their high-cardinality user data (each user's snap count, story views, etc.). Their hot key problem arises when a celebrity's story goes viral; their solution is per-key read replicas that can be spun up dynamically. Source: Snapchat Engineering Blog, "Scaling Snapchat," 2018.
-- **GitHub's use of Redis Cluster:** GitHub uses Redis Cluster for repository statistics, pull request state, and CI/CD pipeline state. They found that `cluster-require-full-coverage no` was essential for operating in degraded mode during partial cluster failures — rather than rejecting all writes, they accept writes for available slots and alert on the degraded slot ranges. Source: GitHub Engineering Blog, "How GitHub uses GitHub," 2021.
+- **Twitter's Manhattan and Redis usage:** Twitter uses Redis Cluster for timeline caching, session storage, and rate
+  limiting. Their "Twemproxy" (proxy for Redis/Memcached clusters) was widely used before Redis Cluster became
+  production-ready. Their hot-tweet problem (a celebrity tweet gets millions of likes in seconds) is solved by local
+  in-process caching in each API server for the hottest keys. Source: Twitter Engineering, "Caching with Twemproxy,"
+  2012.
+- **Snapchat's Mustache:** Snapchat built "Mustache," a distributed cache layer on top of Redis Cluster, to handle their
+  high-cardinality user data (each user's snap count, story views, etc.). Their hot key problem arises when a
+  celebrity's story goes viral; their solution is per-key read replicas that can be spun up dynamically. Source:
+  Snapchat Engineering Blog, "Scaling Snapchat," 2018.
+- **GitHub's use of Redis Cluster:** GitHub uses Redis Cluster for repository statistics, pull request state, and CI/CD
+  pipeline state. They found that `cluster-require-full-coverage no` was essential for operating in degraded mode during
+  partial cluster failures — rather than rejecting all writes, they accept writes for available slots and alert on the
+  degraded slot ranges. Source: GitHub Engineering Blog, "How GitHub uses GitHub," 2021.
 
 ## Common Mistakes
 
-- **Forgetting hash tags for multi-key operations.** In Redis Cluster, `MGET user:1 user:2` will fail if those keys are on different slots. Use `{user}:1` and `{user}:2` to co-locate them. This is the most common Redis Cluster migration gotcha when moving from standalone Redis.
-- **Treating Redis as a database.** Redis is an in-memory cache with optional persistence. Its persistence (AOF, RDB) is not as durable as a true database (Postgres, MySQL). Power loss between an AOF flush can cause data loss. Never use Redis as the primary store for data you can't afford to lose.
-- **Not planning for key expiry and eviction.** If Redis memory fills up and `noeviction` is set (the default), writes return errors — your cache layer starts failing under load. Set `maxmemory` and `maxmemory-policy` explicitly. Use `allkeys-lru` for a pure cache (evicts any key), `volatile-lru` when some keys must never be evicted (they have no TTL), or `allkeys-lfu` when access is highly skewed (a few very hot keys). Set TTLs with random jitter (`TTL + random(0, jitter)`) to avoid mass expiry (cache avalanche).
-- **Not handling cache stampede.** When a popular key expires under high load, tens or hundreds of concurrent requests all miss simultaneously and hammer the database. Use a distributed mutex (`SET lock:key 1 NX EX 5`) so only one request re-fetches; others wait or return a slightly stale value. This is distinct from cache avalanche (mass expiry of many keys).
-- **Using Cluster for all use cases.** Redis Cluster adds operational complexity: slot management, CROSSSLOT errors, hash tag requirements, cluster bus monitoring. If your dataset fits in 100GB (well within a single server's RAM), Redis Sentinel or single Redis is simpler, cheaper, and easier to operate. Choose Cluster when you need horizontal write scaling, not just HA.
+- **Forgetting hash tags for multi-key operations.** In Redis Cluster, `MGET user:1 user:2` will fail if those keys are
+  on different slots. Use `{user}:1` and `{user}:2` to co-locate them. This is the most common Redis Cluster migration
+  gotcha when moving from standalone Redis.
+- **Treating Redis as a database.** Redis is an in-memory cache with optional persistence. Its persistence (AOF, RDB) is
+  not as durable as a true database (Postgres, MySQL). Power loss between an AOF flush can cause data loss. Never use
+  Redis as the primary store for data you can't afford to lose.
+- **Not planning for key expiry and eviction.** If Redis memory fills up and `noeviction` is set (the default), writes
+  return errors — your cache layer starts failing under load. Set `maxmemory` and `maxmemory-policy` explicitly. Use
+  `allkeys-lru` for a pure cache (evicts any key), `volatile-lru` when some keys must never be evicted (they have no
+  TTL), or `allkeys-lfu` when access is highly skewed (a few very hot keys). Set TTLs with random jitter (
+  `TTL + random(0, jitter)`) to avoid mass expiry (cache avalanche).
+- **Not handling cache stampede.** When a popular key expires under high load, tens or hundreds of concurrent requests
+  all miss simultaneously and hammer the database. Use a distributed mutex (`SET lock:key 1 NX EX 5`) so only one
+  request re-fetches; others wait or return a slightly stale value. This is distinct from cache avalanche (mass expiry
+  of many keys).
+- **Using Cluster for all use cases.** Redis Cluster adds operational complexity: slot management, CROSSSLOT errors,
+  hash tag requirements, cluster bus monitoring. If your dataset fits in 100GB (well within a single server's RAM),
+  Redis Sentinel or single Redis is simpler, cheaper, and easier to operate. Choose Cluster when you need horizontal
+  write scaling, not just HA.
