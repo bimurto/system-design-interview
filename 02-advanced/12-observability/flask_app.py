@@ -69,37 +69,43 @@ DEPENDENCY_LATENCY = Histogram(
 
 @contextlib.contextmanager
 def track_request(endpoint):
-    """Context manager for request lifecycle: active connections + latency + count."""
+    """Context manager for safe request lifecycle instrumentation.
+
+    Guarantees ACTIVE_CONNECTIONS is always decremented — even if the handler
+    raises an unhandled exception. Without this guarantee, a crash loop would
+    cause the gauge to monotonically increase, producing a false overload signal
+    that looks like a traffic surge instead of a bug.
+
+    This is the preferred pattern over bare begin_request() + record_request().
+
+    Usage:
+        with track_request("/api/fast") as set_status:
+            ...do work...
+            set_status(200)
+    """
     ACTIVE_CONNECTIONS.inc()
     start = time.time()
-    status_code = 200
+    status_code_holder = [200]
+
+    def set_status(code):
+        status_code_holder[0] = code
+
     try:
-        yield lambda code: setattr(  # allow handler to set the status code
-            track_request, "_code", code
-        )
+        yield set_status
+    except Exception:
+        # Record as 500 so the error is visible in RED metrics even if Flask
+        # never sends a response (e.g. unhandled exception before return).
+        status_code_holder[0] = 500
+        raise
     finally:
         elapsed = time.time() - start
         REQUEST_LATENCY.labels(endpoint=endpoint).observe(elapsed)
+        REQUEST_COUNT.labels(
+            method=request.method,
+            endpoint=endpoint,
+            status_code=str(status_code_holder[0])
+        ).inc()
         ACTIVE_CONNECTIONS.dec()
-    return status_code
-
-
-def record_request(endpoint, start, status_code):
-    """Record completed request metrics (counter + histogram)."""
-    elapsed = time.time() - start
-    REQUEST_LATENCY.labels(endpoint=endpoint).observe(elapsed)
-    REQUEST_COUNT.labels(
-        method=request.method,
-        endpoint=endpoint,
-        status_code=str(status_code)
-    ).inc()
-    ACTIVE_CONNECTIONS.dec()
-
-
-def begin_request():
-    """Increment active connections counter; return start timestamp."""
-    ACTIVE_CONNECTIONS.inc()
-    return time.time()
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────
@@ -119,10 +125,10 @@ def metrics():
 @app.route("/api/fast")
 def fast():
     """Baseline endpoint: 5–20ms latency, no errors. Represents a cache hit."""
-    start = begin_request()
-    time.sleep(random.uniform(0.005, 0.020))
-    record_request("/api/fast", start, 200)
-    return jsonify({"status": "ok", "endpoint": "fast"})
+    with track_request("/api/fast") as set_status:
+        time.sleep(random.uniform(0.005, 0.020))
+        set_status(200)
+        return jsonify({"status": "ok", "endpoint": "fast"})
 
 
 @app.route("/api/slow")
@@ -131,29 +137,29 @@ def slow():
     This creates a clearly visible p99 >> p50 gap, showing why averages lie.
     With these numbers, p50 ≈ 100ms but p99 ≈ 500ms — the tail is 5× the median.
     """
-    start = begin_request()
-    if random.random() < 0.10:
-        # Tail: simulate a slow DB query, GC pause, or cold cache miss
-        time.sleep(random.uniform(0.4, 0.6))
-    else:
-        time.sleep(random.uniform(0.05, 0.15))
-    record_request("/api/slow", start, 200)
-    return jsonify({"status": "ok", "endpoint": "slow"})
+    with track_request("/api/slow") as set_status:
+        if random.random() < 0.10:
+            # Tail: simulate a slow DB query, GC pause, or cold cache miss
+            time.sleep(random.uniform(0.4, 0.6))
+        else:
+            time.sleep(random.uniform(0.05, 0.15))
+        set_status(200)
+        return jsonify({"status": "ok", "endpoint": "slow"})
 
 
 @app.route("/api/flaky")
 def flaky():
     """Error budget demo: 5% of requests return HTTP 500.
-    With a 99% SLO this is burning the error budget at 5× the allowed rate.
+    With a 99.9% SLO this is burning the error budget at 50× the allowed rate.
     """
-    start = begin_request()
-    time.sleep(random.uniform(0.010, 0.050))
-    if random.random() < 0.05:
-        ERROR_COUNT.labels(endpoint="/api/flaky", error_type="internal_error").inc()
-        record_request("/api/flaky", start, 500)
-        return jsonify({"error": "internal server error"}), 500
-    record_request("/api/flaky", start, 200)
-    return jsonify({"status": "ok", "endpoint": "flaky"})
+    with track_request("/api/flaky") as set_status:
+        time.sleep(random.uniform(0.010, 0.050))
+        if random.random() < 0.05:
+            ERROR_COUNT.labels(endpoint="/api/flaky", error_type="internal_error").inc()
+            set_status(500)
+            return jsonify({"error": "internal server error"}), 500
+        set_status(200)
+        return jsonify({"status": "ok", "endpoint": "flaky"})
 
 
 @app.route("/api/db-call")
@@ -167,29 +173,28 @@ def db_call():
     is immediate: the database is the bottleneck, not your service logic.
     Without per-dependency instrumentation you would only know total latency.
     """
-    start = begin_request()
+    with track_request("/api/db-call") as set_status:
+        # Simulate non-DB work: input validation, auth check, response serialization
+        time.sleep(random.uniform(0.005, 0.015))
 
-    # Simulate non-DB work: input validation, auth check, response serialization
-    time.sleep(random.uniform(0.005, 0.015))
+        # Instrument the downstream DB call separately
+        db_start = time.time()
+        time.sleep(random.uniform(0.100, 0.150))  # simulated slow DB query
+        db_elapsed = time.time() - db_start
+        DEPENDENCY_LATENCY.labels(
+            dependency="postgres",
+            operation="user_lookup"
+        ).observe(db_elapsed)
 
-    # Instrument the downstream DB call separately
-    db_start = time.time()
-    time.sleep(random.uniform(0.100, 0.150))  # simulated slow DB query
-    db_elapsed = time.time() - db_start
-    DEPENDENCY_LATENCY.labels(
-        dependency="postgres",
-        operation="user_lookup"
-    ).observe(db_elapsed)
+        # Simulate post-DB work: cache write, response assembly
+        time.sleep(random.uniform(0.005, 0.015))
 
-    # Simulate post-DB work: cache write, response assembly
-    time.sleep(random.uniform(0.005, 0.015))
-
-    record_request("/api/db-call", start, 200)
-    return jsonify({
-        "status": "ok",
-        "endpoint": "db-call",
-        "db_latency_ms": round(db_elapsed * 1000, 1)
-    })
+        set_status(200)
+        return jsonify({
+            "status": "ok",
+            "endpoint": "db-call",
+            "db_latency_ms": round(db_elapsed * 1000, 1)
+        })
 
 
 if __name__ == "__main__":

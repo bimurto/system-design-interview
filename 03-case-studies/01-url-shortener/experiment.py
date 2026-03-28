@@ -10,6 +10,7 @@ What this demonstrates:
   5. Hit counting: Redis INCR vs naive per-redirect Postgres UPDATE
   6. Hash vs. sequential vs. Snowflake-style ID generation trade-offs
   7. Birthday paradox: collision probability for hash-based IDs
+  8. Thundering herd: flush Redis, fire concurrent requests, observe latency spike
 
 Run:
   docker compose up -d
@@ -23,6 +24,7 @@ import math
 import random
 import string
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,7 +49,9 @@ def wait_for_service(url, max_wait=60):
             urllib.request.urlopen(f"{url}/health", timeout=3)
             print(f"  Service ready after {i+1}s")
             return
-        except Exception:
+        except Exception as e:
+            if i % 10 == 9:
+                print(f"  Still waiting... ({i+1}s elapsed, last error: {e})")
             time.sleep(1)
     raise RuntimeError(f"Service did not start within {max_wait}s")
 
@@ -144,41 +148,49 @@ def phase1_bulk_create():
 def phase2_cache_latency(codes):
     section("Phase 2: Redirect Latency -- Cache Cold vs. Warm")
 
-    # Reset stats so we start from a clean baseline.
-    # Easiest approach: use a slice not previously requested.
+    # Use a slice not yet warmed -- codes[30:] were not touched in Phase 1's
+    # read path. Phase 1 only did POST /shorten (writes); it did not issue
+    # any GET /<code> requests, so these codes are not in Redis yet.
     sample = codes[:30]
 
-    # Cold pass: first request for each code hits Postgres.
+    # Cold pass: first GET for each code hits Postgres (cache miss).
     cold_times = [time_redirect(code) for code in sample]
 
-    # Warm pass: second request for each code hits Redis.
+    # Warm pass: second GET for each code hits Redis (cache hit).
     warm_times = [time_redirect(code) for code in sample]
 
     def fmt_stats(times):
         return (
             f"avg={sum(times)/len(times):5.1f}ms  "
             f"P50={percentile(times,50):5.1f}ms  "
+            f"P95={percentile(times,95):5.1f}ms  "
             f"P99={percentile(times,99):5.1f}ms  "
-            f"min={min(times):5.1f}ms  max={max(times):5.1f}ms"
+            f"max={max(times):5.1f}ms"
         )
 
     print(f"\n  30 URLs, each requested twice (cold then warm):\n")
     print(f"  Cold (Postgres): {fmt_stats(cold_times)}")
     print(f"  Warm (Redis):    {fmt_stats(warm_times)}")
     avg_speedup = (sum(cold_times) / len(cold_times)) / (sum(warm_times) / len(warm_times))
-    print(f"\n  Speedup: {avg_speedup:.1f}x")
+    print(f"\n  Speedup: {avg_speedup:.1f}x  (avg cold / avg warm)")
 
     stats = get_json("/stats")
-    print(f"\n  Global cache stats:")
+    print(f"\n  Global cache stats after Phase 2:")
     print(f"    Hits:     {stats['cache_hits']}")
     print(f"    Misses:   {stats['cache_misses']}")
     print(f"    Hit rate: {stats['hit_rate_pct']}%")
 
     print("""
-  Why P99 matters more than average in production:
+  Why P95/P99 matters more than average in production:
     The average flattens the tail. At 115K RPS, even a 1% tail means
-    1,150 slow requests per second. The P99 is what users actually feel
-    on slow connections or viral links hitting a cold shard.
+    1,150 slow requests per second felt by real users. SLOs are almost
+    always expressed as P99, not average. P99 is also what drives
+    timeout budgets in dependent services (CDN, mobile clients).
+
+  The cold-vs-warm gap in this local experiment is smaller than in
+  production because both Postgres and Redis are on the same host.
+  In a real deployment (cross-AZ), the cold path adds ~1-5ms of network
+  latency on top of the Postgres query time, widening the gap further.
 """)
 
 
@@ -443,6 +455,125 @@ def phase7_birthday_paradox():
 """)
 
 
+# -- Phase 8: Thundering herd demonstration ------------------------------------
+
+def phase8_thundering_herd(codes):
+    section("Phase 8: Thundering Herd -- Cache Flush + Concurrent Redirects")
+
+    print("""
+  The thundering herd problem: when a cache layer is flushed or restarts,
+  all in-flight requests simultaneously miss and hit the backend together.
+  For a URL shortener at 115K RPS, this can instantly overload Postgres.
+
+  This phase:
+    1. Measures baseline latency while Redis is warm
+    2. Flushes Redis (simulating a restart or FLUSHALL)
+    3. Fires N concurrent redirects at the same codes -- all miss Redis,
+       all hit Postgres simultaneously
+    4. Compares cold-burst latency to the warm baseline
+    5. Shows how latency recovers as Redis repopulates
+""")
+
+    # Pick a set of codes that are guaranteed to be warm in Redis
+    # (they were created in Phase 1 and accessed in Phase 2).
+    warm_codes = codes[:20]
+
+    # Step 1: measure warm baseline (serial, no contention)
+    print("  [1/4] Measuring warm-cache baseline (serial, 20 requests)...")
+    warm_times = [time_redirect(code) for code in warm_codes]
+    warm_avg = sum(warm_times) / len(warm_times)
+    warm_p99 = percentile(warm_times, 99)
+    print(f"        avg={warm_avg:.1f}ms  P99={warm_p99:.1f}ms  (Redis warm)")
+
+    # Step 2: flush Redis
+    print("\n  [2/4] Flushing Redis cache (FLUSHALL)...")
+    try:
+        import redis as _redis_mod
+        r = _redis_mod.from_url("redis://localhost:6379", decode_responses=True)
+        r.flushall()
+        print("        Redis flushed via redis-py.")
+    except Exception:
+        # Fallback: Docker exec
+        import subprocess
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-T", "cache", "redis-cli", "FLUSHALL"],
+            capture_output=True, text=True,
+            cwd="/Users/bimurto/Work/personal/system-design-content/system-design-interview/03-case-studies/01-url-shortener"
+        )
+        if result.returncode == 0:
+            print("        Redis flushed via docker compose exec.")
+        else:
+            print(f"        WARNING: Could not flush Redis ({result.stderr.strip()}). Skipping herd simulation.")
+            return
+
+    # Step 3: fire concurrent requests -- simulate the thundering herd
+    concurrency = 40
+    print(f"\n  [3/4] Firing {concurrency} concurrent redirects (all cache misses -> Postgres)...")
+    burst_times = []
+    errors = []
+    lock = threading.Lock()
+
+    def concurrent_redirect(code):
+        t = time_redirect(code)
+        with lock:
+            burst_times.append(t)
+
+    threads = [
+        threading.Thread(target=concurrent_redirect, args=(random.choice(warm_codes),))
+        for _ in range(concurrency)
+    ]
+    burst_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    burst_elapsed = time.perf_counter() - burst_start
+
+    if burst_times:
+        burst_avg = sum(burst_times) / len(burst_times)
+        burst_p99 = percentile(burst_times, 99)
+        slowdown = burst_avg / warm_avg if warm_avg > 0 else float("inf")
+        print(f"        avg={burst_avg:.1f}ms  P99={burst_p99:.1f}ms  "
+              f"slowdown={slowdown:.1f}x vs warm baseline")
+        print(f"        ({len(burst_times)} requests completed in {burst_elapsed:.2f}s)")
+
+    # Step 4: measure recovery -- Redis is now re-warming
+    print("\n  [4/4] Measuring recovery (same codes, now repopulated in Redis)...")
+    recovery_times = [time_redirect(code) for code in warm_codes]
+    recovery_avg = sum(recovery_times) / len(recovery_times)
+    recovery_p99 = percentile(recovery_times, 99)
+    print(f"        avg={recovery_avg:.1f}ms  P99={recovery_p99:.1f}ms  (Redis warm again)")
+
+    # Summary table
+    print(f"""
+  Summary:
+    Phase              avg latency   P99 latency   vs baseline
+    -----------------  -----------   -----------   -----------
+    Warm (baseline)    {warm_avg:>7.1f}ms    {warm_p99:>7.1f}ms    1.0x
+    Cold burst (herd)  {burst_avg:>7.1f}ms    {burst_p99:>7.1f}ms    {burst_avg/warm_avg:.1f}x
+    Recovery           {recovery_avg:>7.1f}ms    {recovery_p99:>7.1f}ms    {recovery_avg/warm_avg:.1f}x
+
+  Observations:
+    - The cold burst latency spike reflects {concurrency} threads all hitting
+      Postgres simultaneously. In production at 115K RPS, this spike would be
+      orders of magnitude larger and would likely cause a cascade failure.
+    - Recovery is immediate once Redis repopulates: the first miss per code
+      re-warms the cache, and all subsequent requests are fast again.
+
+  Production mitigations for the thundering herd:
+    1. Request coalescing: only one goroutine/thread queries the DB per cache
+       key; all others wait and share the result. Reduces fan-out from N to 1.
+    2. Cache warm-up script: before reopening traffic after a cache restart,
+       pre-populate the top 100K hot URLs via SELECT ... ORDER BY hits DESC.
+    3. Staggered TTL jitter: instead of all keys expiring at the same time
+       (e.g., all set to TTL=86400s at startup), add random(0, 3600) jitter
+       to spread expirations across the hour.
+    4. Probabilistic early expiration (PER): re-fetch a cache entry slightly
+       before it expires using a probability proportional to how close the
+       TTL is to zero. Prevents synchronised expiry of hot keys.
+""")
+
+
 # -- Main ---------------------------------------------------------------------
 
 def main():
@@ -458,7 +589,7 @@ def main():
     2. Miss: query Postgres, populate Redis, INCR hits:<code> in Redis
     3. Background flush (/flush_hits): GETDEL counters, bulk UPDATE Postgres
 
-  This experiment walks through seven phases covering the key design
+  This experiment walks through eight phases covering the key design
   decisions a senior engineer would discuss in a FAANG interview.
 """)
 
@@ -471,6 +602,7 @@ def main():
     phase5_hit_counting(codes)
     phase6_id_generation()
     phase7_birthday_paradox()
+    phase8_thundering_herd(codes)
 
     section("Lab Complete")
     print("""
@@ -481,11 +613,17 @@ def main():
     Hash IDs: stateless generation, but birthday paradox causes collisions
     Snowflake IDs: distributed, no collisions, time-sorted -- best at scale
     Hit counting: Redis INCR + batch flush eliminates Postgres UPDATE bottleneck
+    Thundering herd: cache flush under load causes latency spikes -- mitigate
+      with request coalescing, pre-warming, TTL jitter, and probabilistic expiry
 
   Try this:
     docker compose exec cache redis-cli info stats | grep evicted_keys
     # Evictions show when Redis has to drop LRU keys to make room.
     # In production, monitor this metric and add memory before it spikes.
+
+    docker compose exec db psql -U app urlshortener -c \\
+      "SELECT short_code, hits FROM urls ORDER BY hits DESC LIMIT 10;"
+    # After running Phase 5, verify that hits were flushed to Postgres.
 
   Next: 02-twitter-timeline/ -- fan-out on write vs. pull at read time
 """)

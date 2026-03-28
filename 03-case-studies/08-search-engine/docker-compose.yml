@@ -18,6 +18,10 @@ services:
       memlock:
         soft: -1
         hard: -1
+    volumes:
+      # Named volume keeps index data across container restarts within a lab session.
+      # Wiped on `docker compose down -v` (teardown step in the lab).
+      - esdata:/usr/share/elasticsearch/data
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
       interval: 10s
@@ -32,8 +36,12 @@ services:
         condition: service_healthy
     environment:
       ES_URL: http://elasticsearch:9200
+    working_dir: /app
     volumes:
-      - ./experiment.py:/experiment.py
+      - ./experiment.py:/app/experiment.py
     # Install deps then run experiment
     command: >
-      sh -c "pip install elasticsearch --quiet && python /experiment.py"
+      sh -c "pip install elasticsearch --quiet && python experiment.py"
+
+volumes:
+  esdata:

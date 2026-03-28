@@ -137,6 +137,70 @@ The analyzer converts raw text into indexed tokens. The same analyzer must be us
     Code:       split on camelCase, underscores, dots (GitHub code search)
 ```
 
+### Hybrid Search
+
+Pure BM25 excels at exact keyword matching but fails on vocabulary mismatch ("earphones" vs. "headphones") and semantic intent ("noise isolation" vs. "active noise cancellation"). Dense vector search (kNN) captures semantic similarity but requires every document to have an embedding and can surface plausible-but-wrong matches that lack the exact terms. Hybrid search combines both signals.
+
+**Architecture:**
+```
+  User query: "wireless earphones for commuting"
+               │
+               ├─► BM25 branch: tokenize → posting list lookup → ranked list R_bm25
+               │
+               └─► Dense vector branch:
+                     embed query → kNN HNSW lookup → ranked list R_knn
+                                                          │
+                                       RRF merge ◄────────┘
+                                          │
+                              final ranked result list
+```
+
+**Reciprocal Rank Fusion (RRF):**
+```
+  For each document d across all result lists:
+    rrf_score(d) = Σ_retriever  1 / (k + rank_in_retriever(d))
+
+  k = 60  (smoothing constant, default in ES 8.8+)
+
+  Example — document "Studio Monitor Headphones":
+    BM25 rank:  #3  →  1/(60 + 3) = 0.0159
+    kNN rank:   #1  →  1/(60 + 1) = 0.0164
+    RRF score:          0.0323
+
+  Why RRF over score normalisation:
+    • BM25 scores and cosine similarity are dimensionally incompatible.
+      Normalisation requires global min/max — impossible in a live sharded cluster
+      without an expensive aggregation pass.
+    • RRF uses only ordinal rank — insensitive to score magnitude or distribution.
+    • Adding a third retriever (cross-encoder re-ranker, ColBERT, etc.) is additive:
+      rrf_score += 1/(k + rank_in_reranker(d))
+```
+
+**HNSW index for dense vectors:**
+```
+  ES stores dense_vector fields in a per-shard HNSW graph.
+  At query time, graph traversal finds approximate nearest neighbours
+  in O(log N) vs O(N×dims) for brute-force.
+
+  Key parameters:
+    m (max edges per node):   16–64   higher → better recall, larger index
+    ef_construction:          100–200 higher → better recall, slower indexing
+    num_candidates (ef_search): 10–100 higher → better recall, slower query
+
+  Recall@10 benchmark (typical):
+    ef_construction=128, m=16 → ~96% recall vs brute-force
+    ef_construction=64,  m=8  → ~90% recall
+```
+
+**When to use each retrieval strategy:**
+| Scenario | Best approach |
+|---|---|
+| Product code / SKU / exact name | BM25 only |
+| Conversational Q&A, intent-heavy | Dense kNN only |
+| Mixed keyword + semantic (most e-commerce) | Hybrid RRF |
+| Real-time with no embedding infra | BM25 + synonyms |
+| Re-ranking top-20 for highest quality | BM25 + kNN + cross-encoder |
+
 ### Trade-offs
 
 | Feature | Elasticsearch | Postgres FTS (tsvector) | Solr | Algolia |
@@ -165,6 +229,10 @@ The analyzer converts raw text into indexed tokens. The same analyzer must be us
 
 **Deep pagination memory blow-up:** `from+size` pagination fetches `from+size` documents per shard and merges them at the coordinator. At `from=50000, size=10` with 5 shards, the coordinator processes 250050 documents to return 10 results. ES enforces `max_result_window=10000` by default. Use `search_after` with a sort tiebreaker, or the Point-in-Time (PIT) API for stable cursor-based pagination.
 
+**Synonym explosion:** a synonym token filter configured at index time inserts extra tokens into posting lists for every synonym of every indexed term. A synonym ring of 5 words (e.g., "tv, television, telly, set, box") multiplies posting list entries 5× for every matching document. In a 50M-document medical corpus with 100-way ICD code synonym sets, index size can grow 10–20× and segment merges become extremely I/O intensive, causing indexing to fall behind ingestion. Mitigation: prefer query-time synonym expansion (synonym filter applied at search time, not index time), keep synonym rings small and focused (≤ 5 terms per concept), and monitor `_cat/indices?v` store.size after each synonym list update.
+
+**Index corruption and translog loss:** Lucene segments are immutable and self-describing, but the translog — the WAL bridging in-memory writes to durable segments — can become corrupt if the underlying storage fails mid-write (e.g., EC2 instance store with a sudden power cut, or a Kubernetes pod eviction during an fsync). A corrupt translog prevents the shard from opening on restart. Recovery path: delete the corrupt translog shard copy (`elasticsearch-translog truncate --index products --shard-id 0`), allow ES to promote a replica to primary or restore from snapshot. Prevention: use `index.translog.durability=request` for data-critical indices; replicate across AZs so a storage failure on one node does not take out all copies simultaneously; maintain regular Snapshot Lifecycle Management (SLM) policies to S3 or GCS as the final safety net.
+
 ## Interview Talking Points
 
 - "An inverted index maps each term to a posting list of document IDs. Search is: look up each query term in the index, intersect/union the posting lists, score with BM25. This is O(1) index lookup + O(posting_list_size) scoring — far faster than scanning every document."
@@ -176,10 +244,12 @@ The analyzer converts raw text into indexed tokens. The same analyzer must be us
 - "ES analyzers control how text is tokenized and normalized. The same analyzer must be used at index time and query time. Stemming ('running' → 'run') increases recall but can reduce precision (e.g., 'organ' matching 'organized'). For multilingual corpora like Wikipedia, each language needs its own analyzer configuration."
 - "Deep pagination with `from+size` is O(from × num_shards) memory on the coordinator — at from=50000 with 5 shards, you're sorting 250,000 docs to return 10. Use `search_after` with a sort tiebreaker for cursor-based pagination that is O(page_size) regardless of depth."
 - "For modern AI-augmented search, dense vector similarity (kNN) is increasingly important. Elasticsearch's `dense_vector` field with HNSW indexing enables approximate nearest-neighbor search over embedding vectors, used for semantic search, recommendation, and image similarity — often combined with BM25 via 'hybrid search' (RRF or linear combination of scores)."
+- "Keeping Elasticsearch in sync with the primary database is a classic dual-write vs CDC debate. Dual-write is operationally simple but creates a partial-failure window: if the application crashes after the DB commit but before the ES index call, the index is silently stale. CDC (Change Data Capture) via Debezium tailing the Postgres WAL into Kafka and an ES connector eliminates this gap — ES sees every committed change exactly once, in order, with at-least-once delivery. The trade-off is added infra complexity and ~seconds of replication lag. For FAANG-scale systems with strict auditability requirements, CDC is the safer choice."
+- "Hybrid BM25 + kNN search with RRF is now the industry standard for production search. BM25 handles keyword precision; dense vector kNN handles semantic intent; RRF fuses the rank lists without requiring score normalisation — which is impossible to do correctly in a sharded cluster without a prohibitively expensive global aggregation. Shopify, Airbnb, and Uber have all published case studies showing 10–30% relevance improvements from hybrid over BM25 alone. The main cost is the embedding pipeline at both index time and query time."
 
 ## Hands-on Lab
 
-**Time:** ~30-40 minutes
+**Time:** ~50-60 minutes
 **Services:** Elasticsearch 8.8 (port 9200, security disabled)
 
 ### Setup
@@ -197,7 +267,7 @@ pip install elasticsearch
 python experiment.py
 ```
 
-The script demonstrates: (1) a manual Python BM25 inverted index with position-aware posting lists, (2) phrase queries using position data vs term queries, (3) bulk indexing 5000 documents with a custom stemming analyzer, (4) full-text BM25 search with field boosting, (5) faceted search with filter context and aggregations, (6) analyzer pipeline comparison (standard vs stemming), (7) the NRT 1-second refresh delay demonstrated live, (8) deep pagination `from+size` failure vs `search_after` cursor pagination, (9) fuzzy/typo-tolerant search and prefix autocomplete, and (10) index vs search latency benchmark.
+The script demonstrates: (1) a manual Python BM25 inverted index with position-aware posting lists, (2) phrase queries using position data vs term queries, (3) bulk indexing 5000 documents with a custom stemming analyzer, (4) full-text BM25 search with field boosting, (5) faceted search with filter context and aggregations, (6) analyzer pipeline comparison (standard vs stemming), (7) the NRT 1-second refresh delay demonstrated live, (8) deep pagination `from+size` failure vs `search_after` cursor pagination, (9) fuzzy/typo-tolerant search and prefix autocomplete, (10) index vs search latency benchmark, (11) score explanation with the `_explain` API (reading the BM25 score tree to debug relevance), (12) synonym search with a custom synonym token filter (vocabulary expansion, synonym explosion risk), and (13) hybrid BM25 + dense vector kNN search with an HNSW index and Reciprocal Rank Fusion (RRF) score combination.
 
 ### Break It
 
@@ -228,7 +298,7 @@ print(f'Fix: set dynamic: false or dynamic: strict in the mapping')
 
 ### Observe
 
-The manual inverted index phase shows the BM25 formula in action: term saturation and length normalization visible in the scores. The phrase query phase shows that "wireless headphones" as an exact phrase matches fewer documents than a term query — because position data constrains the match. The NRT phase shows a document being invisible immediately after indexing and appearing after ~1.5 seconds without a manual refresh. The pagination phase demonstrates the `max_result_window` error and how `search_after` avoids it.
+The manual inverted index phase shows the BM25 formula in action: term saturation and length normalization visible in the scores. The phrase query phase shows that "wireless headphones" as an exact phrase matches fewer documents than a term query — because position data constrains the match. The NRT phase shows a document being invisible immediately after indexing and appearing after ~1.5 seconds without a manual refresh. The pagination phase demonstrates the `max_result_window` error and how `search_after` avoids it. The `_explain` phase shows the full BM25 score tree — IDF leaf, TF leaf, field boost — for a specific (query, document) pair, demonstrating how to audit relevance. The synonym phase shows "earphones" matching "headphones" documents via the synonym token filter, and the `_analyze` API output confirms the token expansion. The hybrid phase shows BM25-only, kNN-only, and RRF-combined results side by side — note that RRF typically promotes documents that appear in both result lists, which are usually the highest-quality matches.
 
 ### Teardown
 

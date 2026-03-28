@@ -17,7 +17,7 @@ What this demonstrates:
 Run:
   docker compose up -d zookeeper kafka db
   # Wait ~40s for Kafka to be healthy
-  docker compose run --rm workers
+  docker compose run --rm --no-deps -e KAFKA_BOOTSTRAP=kafka:9092 workers
   # Or locally:
   pip install kafka-python-ng psycopg2-binary
   KAFKA_BOOTSTRAP=localhost:9092 python experiment.py
@@ -26,12 +26,10 @@ Run:
 import json
 import os
 import random
-import threading
 import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 import psycopg2
 from kafka import KafkaConsumer, KafkaProducer
@@ -41,8 +39,11 @@ from kafka.errors import TopicAlreadyExistsError
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://app:secret@localhost:5432/notifications")
 
+# Three priority tiers matching the README architecture
 TOPIC_TRANSACTIONAL = "notifications-transactional"
+TOPIC_SOCIAL = "notifications-social"
 TOPIC_MARKETING = "notifications-marketing"
+TOPIC_DLQ = "notifications-dlq"
 CHANNELS = ["push", "email", "sms", "in-app"]
 
 random.seed(42)
@@ -91,11 +92,28 @@ def wait_for_kafka(bootstrap: str, max_wait: int = 90):
     raise RuntimeError("Kafka not ready")
 
 
+def wait_for_postgres(dsn: str, max_wait: int = 60):
+    """Wait until Postgres is accepting connections before running the lab."""
+    print(f"  Waiting for Postgres ...")
+    for i in range(max_wait):
+        try:
+            conn = psycopg2.connect(dsn)
+            conn.close()
+            print(f"  Postgres ready after {i + 1}s")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("Postgres not ready")
+
+
 def create_topics(bootstrap: str):
     admin = KafkaAdminClient(bootstrap_servers=bootstrap)
+    # Three priority tiers + one DLQ — mirroring the README architecture
     topics = [
         NewTopic(name=TOPIC_TRANSACTIONAL, num_partitions=4, replication_factor=1),
-        NewTopic(name=TOPIC_MARKETING, num_partitions=4, replication_factor=1),
+        NewTopic(name=TOPIC_SOCIAL,        num_partitions=4, replication_factor=1),
+        NewTopic(name=TOPIC_MARKETING,     num_partitions=4, replication_factor=1),
+        NewTopic(name=TOPIC_DLQ,           num_partitions=2, replication_factor=1),
     ]
     for topic in topics:
         try:
@@ -224,10 +242,17 @@ def mock_deliver(notif: Notification, attempt: int = 1) -> DeliveryResult:
 # with independent scaling, failure isolation, and per-provider rate limits.
 # See README Architecture section for the per-channel pool design.
 class DeliveryWorker:
-    def __init__(self, name: str, conn, stats: dict):
+    def __init__(self, name: str, conn, stats: dict,
+                 deliver_fn=None, max_attempts: int = 3,
+                 dlq_producer: KafkaProducer = None):
         self.name = name
         self.conn = conn
         self.stats = stats
+        # Injecting deliver_fn allows tests to override mock_deliver without
+        # monkey-patching module globals (safer, no leftover side effects).
+        self.deliver_fn = deliver_fn or mock_deliver
+        self.max_attempts = max_attempts
+        self.dlq_producer = dlq_producer
 
     def process(self, notif: Notification):
         user_id = notif.user_id
@@ -244,9 +269,8 @@ class DeliveryWorker:
             return
 
         # Attempt delivery with exponential backoff
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            result = mock_deliver(notif, attempt)
+        for attempt in range(1, self.max_attempts + 1):
+            result = self.deliver_fn(notif, attempt)
             if result.success:
                 # mark_delivered uses INSERT ... ON CONFLICT DO NOTHING RETURNING id
                 # so even if two workers race past the is_duplicate() check above,
@@ -262,12 +286,14 @@ class DeliveryWorker:
                 return
             else:
                 self.stats["failures"] += 1
-                if attempt < max_attempts:
+                if attempt < self.max_attempts:
                     backoff = (2 ** (attempt - 1)) * 0.05  # 50ms, 100ms
                     time.sleep(backoff)
 
-        # Exhausted retries → dead letter queue (simulated)
+        # Exhausted retries → dead letter queue
         self.stats["dlq"] += 1
+        if self.dlq_producer:
+            self.dlq_producer.send(TOPIC_DLQ, notif.to_json())
 
 
 # ── Phases ────────────────────────────────────────────────────────────────────
@@ -294,7 +320,13 @@ def phase1_produce_notifications(producer: KafkaProducer) -> list[Notification]:
             idempotency_key=f"idem-{i}",
             priority="high" if notif_type == "transactional" else "normal",
         )
-        topic = TOPIC_TRANSACTIONAL if notif_type == "transactional" else TOPIC_MARKETING
+        # Route to the correct priority topic
+        if notif_type == "transactional":
+            topic = TOPIC_TRANSACTIONAL
+        elif notif_type == "social":
+            topic = TOPIC_SOCIAL
+        else:
+            topic = TOPIC_MARKETING
         producer.send(topic, notif.to_json())
         notifications.append(notif)
 
@@ -306,9 +338,10 @@ def phase1_produce_notifications(producer: KafkaProducer) -> list[Notification]:
         by_type[n.type] += 1
         by_channel[n.channel] += 1
 
-    print(f"\n  Produced 100 notifications to 2 Kafka topics:")
+    print(f"\n  Produced 100 notifications to 3 Kafka topics:")
     print(f"  Topic '{TOPIC_TRANSACTIONAL}':  {by_type['transactional']} events")
-    print(f"  Topic '{TOPIC_MARKETING}':  {by_type['marketing'] + by_type['social']} events")
+    print(f"  Topic '{TOPIC_SOCIAL}':         {by_type['social']} events")
+    print(f"  Topic '{TOPIC_MARKETING}':      {by_type['marketing']} events")
     print(f"\n  By channel:")
     for channel, count in sorted(by_channel.items()):
         print(f"    {channel:<10} {count:>5}")
@@ -323,7 +356,7 @@ def phase2_consume_and_deliver(conn) -> dict:
     section("Phase 2: Channel Workers Consume and Deliver")
 
     print("""
-  Worker priority: transactional topic is consumed FIRST.
+  Worker priority: transactional → social → marketing.
   Each message is:
     1. Checked against user preferences (filter)
     2. Checked for duplicate (idempotency_key)
@@ -333,26 +366,21 @@ def phase2_consume_and_deliver(conn) -> dict:
     stats = defaultdict(int)
     worker = DeliveryWorker("worker-1", conn, stats)
 
-    # Consume transactional first, then marketing (priority ordering)
-    print("  Consuming TRANSACTIONAL topic first (high priority) ...")
-    consumer_txn = make_consumer([TOPIC_TRANSACTIONAL], "lab-group-txn")
-    txn_count = 0
-    for msg in consumer_txn:
-        notif = Notification.from_json(msg.value)
-        worker.process(notif)
-        txn_count += 1
-    consumer_txn.close()
-    print(f"  Processed {txn_count} transactional notifications")
-
-    print("  Consuming MARKETING topic (lower priority) ...")
-    consumer_mkt = make_consumer([TOPIC_MARKETING], "lab-group-mkt")
-    mkt_count = 0
-    for msg in consumer_mkt:
-        notif = Notification.from_json(msg.value)
-        worker.process(notif)
-        mkt_count += 1
-    consumer_mkt.close()
-    print(f"  Processed {mkt_count} marketing/social notifications")
+    # Consume in priority order: transactional → social → marketing
+    for topic, label in [
+        (TOPIC_TRANSACTIONAL, "TRANSACTIONAL (high priority)"),
+        (TOPIC_SOCIAL,        "SOCIAL (medium priority)"),
+        (TOPIC_MARKETING,     "MARKETING (lower priority)"),
+    ]:
+        print(f"  Consuming {label} ...")
+        consumer = make_consumer([topic], f"lab-group-{topic}")
+        count = 0
+        for msg in consumer:
+            notif = Notification.from_json(msg.value)
+            worker.process(notif)
+            count += 1
+        consumer.close()
+        print(f"  Processed {count} {label.split()[0].lower()} notifications")
 
     print(f"\n  Delivery stats:")
     print(f"  {'Delivered successfully':<30} {stats['delivered']:>6}")
@@ -476,26 +504,27 @@ def phase5_retry_backoff(conn):
   The DeliveryWorker handles all of this — same code path as Phase 2.
 """)
 
-    # Case A: 3 attempts allowed — should succeed despite 2 transient failures
-    # Case B: notification ID does NOT end in 7 — succeeds immediately
-    # Case C: simulate DLQ — use a mock that always fails (patch mock_deliver)
-    test_notifications = [
-        ("retry-ok-7",   "ends in 7: 2 transient failures, succeeds on attempt 3"),
-        ("retry-ok-1",   "normal:    succeeds immediately on attempt 1"),
-        ("retry-ok-17",  "ends in 7: 2 transient failures, succeeds on attempt 3"),
-        ("retry-dlq-7x", "always fails: exhausts 3 retries → DLQ"),
-    ]
+    # always_fail delivery function — injected via deliver_fn, no monkey-patching
+    def always_fail(n, attempt=1):
+        return DeliveryResult(False, "permanent_error")
 
-    # Temporarily override mock_deliver for the always-fail case
-    original_mock = mock_deliver.__code__
+    test_cases = [
+        # (notif_id, note, deliver_fn override or None)
+        ("retry-ok-7",   "ends in 7: 2 transient failures, succeeds on attempt 3", None),
+        ("retry-ok-1",   "normal:    succeeds immediately on attempt 1",            None),
+        ("retry-ok-17",  "ends in 7: 2 transient failures, succeeds on attempt 3", None),
+        ("retry-dlq-7x", "always fails: exhausts 3 retries → DLQ",                 always_fail),
+    ]
 
     print(f"  {'Notification ID':<20} {'Delivered':>10}  {'Retried':>8}  {'DLQ':>5}  Note")
     print(f"  {'-'*20}  {'-'*10}  {'-'*8}  {'-'*5}  {'-'*45}")
 
-    for notif_id, note in test_notifications:
+    for notif_id, note, deliver_fn in test_cases:
         local_stats = defaultdict(int)
-        worker = DeliveryWorker(f"retry-worker-{notif_id}", conn, local_stats)
-
+        worker = DeliveryWorker(
+            f"retry-worker-{notif_id}", conn, local_stats,
+            deliver_fn=deliver_fn,
+        )
         notif = Notification(
             notification_id=notif_id,
             user_id=104,
@@ -504,31 +533,13 @@ def phase5_retry_backoff(conn):
             message=f"Test retry for {notif_id}",
             idempotency_key=f"retry-phase5-{notif_id}-{uuid.uuid4()}",
         )
-
-        if notif_id == "retry-dlq-7x":
-            # Monkey-patch: always fail to demonstrate DLQ path
-            import types
-            def always_fail(n, attempt=1):
-                return DeliveryResult(False, "permanent_error")
-            worker_mock = always_fail
-            # Run the DLQ path manually mirroring DeliveryWorker.process()
-            if is_channel_enabled(conn, notif.user_id, notif.channel):
-                max_attempts = 3
-                for attempt in range(1, max_attempts + 1):
-                    result = worker_mock(notif, attempt)
-                    local_stats["failures"] += 1
-                    if attempt < max_attempts:
-                        time.sleep((2 ** (attempt - 1)) * 0.05)
-                local_stats["dlq"] += 1
-        else:
-            worker.process(notif)
-
+        worker.process(notif)
         print(f"  {notif_id:<20}  {local_stats['delivered']:>10}  "
               f"{local_stats['retried']:>8}  {local_stats['dlq']:>5}  {note}")
 
     print("""
   Dead Letter Queue (DLQ):
-  - Messages that exhaust all retries are produced to a 'notif-dlq' Kafka topic
+  - Messages that exhaust all retries are produced to a 'notifications-dlq' Kafka topic
   - On-call engineers monitor DLQ consumer lag as an alerting signal
   - A spike in DLQ lag = systemic issue (APNs outage, expired credentials)
   - DLQ messages can be replayed from the beginning of the topic after a fix
@@ -590,7 +601,8 @@ def phase6_fanout_simulation(producer: KafkaProducer, conn):
             idempotency_key=f"fo-{EVENT_ID}-{follower_id}-push",
             priority="normal",
         )
-        producer.send(TOPIC_MARKETING, notif.to_json())
+        # Social notifications use the social topic (medium priority)
+        producer.send(TOPIC_SOCIAL, notif.to_json())
         produced += 1
 
     producer.flush()
@@ -600,7 +612,7 @@ def phase6_fanout_simulation(producer: KafkaProducer, conn):
     print(f"  Events produced to Kafka:{produced}")
 
     # Drain and count deliveries
-    consumer = make_consumer([TOPIC_MARKETING], f"lab-fanout-{uuid.uuid4()}")
+    consumer = make_consumer([TOPIC_SOCIAL], f"lab-fanout-{uuid.uuid4()}")
     fanout_stats = defaultdict(int)
     worker = DeliveryWorker("fanout-worker", conn, fanout_stats)
     for msg in consumer:
@@ -659,8 +671,9 @@ def phase7_scale_math():
 
   1. Kafka topics per priority tier:
      - notifications-transactional  (OTP, alerts) → processed first
-     - notifications-social         (likes, follows)
+     - notifications-social         (likes, follows) → medium priority
      - notifications-marketing      (promotions) → processed last
+     - notifications-dlq            (exhausted retries) → ops monitoring
 
   2. Per-channel worker pools (independent scaling):
      - push workers:   integrate with APNs/FCM (batch up to 500/request)
@@ -724,6 +737,7 @@ def main():
 """)
 
     wait_for_kafka(KAFKA_BOOTSTRAP)
+    wait_for_postgres(DATABASE_URL)
     create_topics(KAFKA_BOOTSTRAP)
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -753,11 +767,14 @@ def main():
     section("Lab Complete")
     print("""
   Summary:
-  - Kafka separates transactional (high-priority) from marketing notifications
+  - Three Kafka topics (transactional/social/marketing) + DLQ match the README
+    architecture; workers drain higher-priority topics first
   - User preferences checked at fan-out time + at delivery (Redis in production)
   - Fan-out: early preference suppression at produce time reduces Kafka volume
   - Idempotency key + INSERT...ON CONFLICT RETURNING id prevents double-delivery
     even when concurrent workers race past the pre-check (correct at DB level)
+  - DeliveryWorker accepts a deliver_fn parameter — no monkey-patching needed
+    to simulate permanent failures or custom error codes in tests
   - Exponential backoff reduces pressure on failing delivery endpoints
   - DLQ captures persistently failing notifications; expired OTP tokens must be
     dropped rather than re-delivered from the DLQ

@@ -40,6 +40,20 @@ services:
       timeout: 5s
       retries: 10
 
+  # Redis is used in production for:
+  #   - User preference cache (HSET user:prefs:{id} email 1 push 1 ...)
+  #   - Idempotency key dedup store (SET dedup:{key}:{channel} 1 EX 86400)
+  #   - Per-user rate-limit counters (INCR notif:rl:{user_id}:{channel}:{minute})
+  # The experiment uses Postgres for simplicity; this service is here to let
+  # learners explore the Redis data structures described in the README.
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   workers:
     image: python:3.11-slim
     depends_on:
@@ -47,12 +61,15 @@ services:
         condition: service_healthy
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       DATABASE_URL: postgresql://app:secret@db:5432/notifications
+      REDIS_URL: redis://redis:6379
     volumes:
       - ./experiment.py:/experiment.py
     command: >
-      sh -c "pip install kafka-python-ng psycopg2-binary --quiet && python /experiment.py"
+      sh -c "pip install kafka-python-ng psycopg2-binary redis --quiet && python /experiment.py"
     profiles:
       - experiment

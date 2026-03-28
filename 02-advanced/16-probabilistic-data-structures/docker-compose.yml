@@ -18,12 +18,14 @@ services:
     volumes:
       - ./experiment.py:/experiment.py
     command: >
-      sh -c "pip install redis mmh3 --quiet && python /experiment.py"
+      sh -c "pip install --quiet --no-cache-dir redis==5.0.1 mmh3==4.1.0 && python /experiment.py"
     depends_on:
       redis-stack:
         condition: service_healthy
     environment:
       - REDIS_HOST=redis-stack
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
     deploy:
       resources:
         limits:

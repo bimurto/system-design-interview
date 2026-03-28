@@ -22,7 +22,6 @@ import json
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 
@@ -125,7 +124,7 @@ def phase1_double_entry():
     1. Debit  customer account  (money leaves customer)
     2. Credit merchant account  (money arrives at merchant)
 
-  The SUM of all amounts × sign must equal ZERO.
+  The SUM of all amounts x sign must equal ZERO.
   This is the fundamental invariant of accounting.
 """)
 
@@ -259,23 +258,24 @@ def phase4_failed_charge():
          "missing idempotency_key"),
     ]
 
-    print(f"  {'Test case':<30} {'HTTP':>6}  {'Error':>25}  {'Entries':>8}")
-    print(f"  {'-'*30}  {'-'*6}  {'-'*25}  {'-'*8}")
+    print(f"  {'Test case':<30} {'HTTP':>6}  {'Expected':>10}  {'Pass':>6}")
+    print(f"  {'-'*30}  {'-'*6}  {'-'*10}  {'-'*6}")
 
     for payload, note in test_cases:
-        status, result = post_json("/charge", payload)
-        error = result.get("error", "")[:25]
-
-        # Count ledger entries before
+        # Capture ledger count BEFORE the POST
         _, ledger_before = get_json("/ledger")
         count_before = len(ledger_before.get("entries", []))
 
-        # Count after (should be same)
+        status, result = post_json("/charge", payload)
+        error = result.get("error", "")[:25]
+
+        # Count AFTER — should be identical
         _, ledger_after = get_json("/ledger")
         count_after = len(ledger_after.get("entries", []))
 
         entries_created = count_after - count_before
-        print(f"  {note:<30}  {status:>6}  {error:>25}  {entries_created:>8}")
+        passed = status >= 400 and entries_created == 0
+        print(f"  {note:<30}  {status:>6}  {'4xx+no entry':>10}  {'YES' if passed else 'NO':>6}  {error}")
 
     print("""
   All invalid charges return 4xx — no ledger entries created.
@@ -381,7 +381,7 @@ def phase6_timeout_simulation():
 
     ids_match = txn_id1 and txn_id2 and txn_id1 == txn_id2
     print(f"\n  Transaction IDs match: {ids_match}")
-    print(f"  Customer charged:      1× (NOT 2×)")
+    print(f"  Customer charged:      1x (NOT 2x)")
     print(f"  Result:                {'CORRECT — idempotent' if ids_match else 'ERROR — duplicate charge!'}")
 
 
@@ -422,6 +422,51 @@ def phase7_refund():
     net = ledger.get("net_sum", "?")
     print(f"\n  Ledger net sum after refund: {net}")
     print(f"  Accounting check:            {check}")
+    print(f"  Result: {'CORRECT — ledger balanced after refund' if check == 'ZERO' else 'ERROR — ledger imbalanced!'}")
+
+    return txn_id, refund_key
+
+
+def phase8_double_refund_prevention(txn_id: str, original_refund_key: str):
+    section("Phase 8: Double-Refund Prevention")
+
+    print("""
+  A completed refund must not be applied a second time.
+  The original transaction is marked 'refunded' after the first refund.
+  A second refund attempt on the same transaction_id must be rejected.
+
+  Two sub-cases:
+    a) Same idempotency_key as the first refund → idempotent (return original refund result)
+    b) Different idempotency_key → rejected (transaction already refunded)
+""")
+
+    if not txn_id:
+        print("  SKIP — no transaction_id from Phase 7.")
+        return
+
+    # Case a: Idempotent retry of the same refund (same idem key)
+    print(f"  Case a: Retry refund with SAME idempotency_key ...")
+    status_a, result_a = post_json("/refund", {
+        "transaction_id": txn_id,
+        "idempotency_key": original_refund_key,
+    })
+    is_dup_a = result_a.get("status") in ("duplicate_refund", "refunded")
+    print(f"          HTTP {status_a}, status={result_a.get('status')}")
+    print(f"          Idempotent (no second refund): {is_dup_a}")
+
+    # Case b: New idempotency_key — should be rejected because txn is already refunded
+    new_refund_key = f"refund-second-{uuid.uuid4()}"
+    print(f"\n  Case b: Second refund attempt with DIFFERENT idempotency_key ...")
+    status_b, result_b = post_json("/refund", {
+        "transaction_id": txn_id,
+        "idempotency_key": new_refund_key,
+    })
+    rejected = status_b in (400, 409, 422)
+    print(f"          HTTP {status_b}, error={result_b.get('error', result_b.get('detail', ''))}")
+    print(f"          Rejected (correct — already refunded): {rejected}")
+
+    overall = is_dup_a and rejected
+    print(f"\n  Result: {'CORRECT — double-refund prevented' if overall else 'ERROR — check above'}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -430,15 +475,16 @@ def main():
     section("PAYMENT SYSTEM LAB")
     print("""
   Architecture:
-    Client → Flask /charge → Postgres (transaction + ledger_entries)
-                          ↗
-                     Redis (idempotency_key cache, 24h TTL)
+    Client -> Flask /charge -> Postgres (transaction + ledger_entries)
+                            ^
+                       Redis (idempotency_key cache, 24h TTL)
 
   Invariants:
     1. Every charge = 1 debit + 1 credit (double-entry)
-    2. Same idempotency_key → same response (no duplicate charge)
+    2. Same idempotency_key -> same response (no duplicate charge)
     3. Failed charges create NO ledger entries (atomicity)
     4. SUM of all ledger entries = 0 (reconciliation)
+    5. A refunded transaction cannot be refunded again (double-refund guard)
 """)
 
     wait_for_service(BASE_URL)
@@ -452,7 +498,10 @@ def main():
     phase4_failed_charge()
     phase5_reconciliation()
     phase6_timeout_simulation()
-    phase7_refund()
+    refund_result = phase7_refund()
+    if refund_result:
+        txn_id, refund_key = refund_result
+        phase8_double_refund_prevention(txn_id, refund_key)
 
     section("Lab Complete")
     print("""
@@ -463,6 +512,7 @@ def main():
   - Invalid charges: Postgres transaction rolled back, no partial ledger state
   - Reconciliation: sum of all entries = 0 is a verifiable system invariant
   - Refund: creates reverse entries, ledger remains balanced
+  - Double-refund: second refund on same txn is rejected (status guard)
 
   This is the core of Stripe, PayPal, and every financial system.
   The accounting invariant (sum=0) is the ultimate integration test.

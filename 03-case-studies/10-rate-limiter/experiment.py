@@ -104,10 +104,16 @@ def burst(base_url: str, n: int, api_key: str = "anonymous",
             results["429"] += 1
         else:
             results["other"] += 1
-        results["last_remaining"] = headers.get("X-Ratelimit-Remaining") or \
-                                    headers.get("x-ratelimit-remaining")
-        results["last_reset_ts"]  = headers.get("X-Ratelimit-Reset") or \
-                                    headers.get("x-ratelimit-reset")
+        # Python's http.client normalises header names to title-case on
+        # Python 3.12+ but lowercases them on older versions.  Try both.
+        results["last_remaining"] = (
+            headers.get("X-Ratelimit-Remaining")
+            or headers.get("x-ratelimit-remaining")
+        )
+        results["last_reset_ts"] = (
+            headers.get("X-Ratelimit-Reset")
+            or headers.get("x-ratelimit-reset")
+        )
         if delay > 0:
             time.sleep(delay)
     return results
@@ -228,9 +234,10 @@ def phase3_429_response():
     print(f"  {'Req':>4}  {'Status':>6}  {'Remaining':>10}  {'Reset in':>9}  Note")
     print(f"  {'---':>4}  {'------':>6}  {'---------':>10}  {'--------':>9}  ----")
 
-    now_ref = int(time.time())
     for i in range(1, n + 1):
         url = f"{API1_URL}/api/data?key=phase3-test"
+        # Capture time immediately before the request for accurate "reset in" math
+        req_time = int(time.time())
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 status    = resp.status
@@ -253,13 +260,15 @@ def phase3_429_response():
         except Exception:
             status, remaining, reset_ts, snippet = 0, "?", "?", "error"
 
+        # Use the per-request timestamp so "reset in" stays accurate even
+        # when the loop takes several seconds to complete.
         try:
-            reset_in = int(reset_ts) - now_ref
+            reset_in = int(reset_ts) - req_time
             reset_str = f"{reset_in:>7}s"
         except Exception:
             reset_str = "       ?"
 
-        marker = " ← BLOCKED" if status == 429 else ""
+        marker = " <- BLOCKED" if status == 429 else ""
         print(f"  {i:>4}  {status:>6}  {str(remaining):>10}  {reset_str}  {snippet}{marker}")
 
     print(f"""
@@ -283,6 +292,7 @@ def phase4_fail_open_and_recovery():
 
   Our server implements fail-open with AUTOMATIC RECOVERY:
     - While Redis is down: every request is allowed, X-Redis-Available: False
+    - X-RateLimit-Remaining: "unlimited" (sentinel — rate limiting suspended)
     - On each request while down: silently attempts to reconnect
     - When Redis comes back: rate limiting resumes immediately
     - No server restart required — recovery is transparent
@@ -301,13 +311,14 @@ def phase4_fail_open_and_recovery():
     time.sleep(2)  # give the server time to detect the failure
 
     print(f"\n  Sending 5 requests while Redis is DOWN:")
-    print(f"  {'Req':>4}  {'Status':>6}  {'Redis-Available':>16}  Note")
-    print(f"  {'---':>4}  {'------':>6}  {'---------------':>16}  ----")
+    print(f"  {'Req':>4}  {'Status':>6}  {'Redis-Available':>16}  {'Remaining':>12}  Note")
+    print(f"  {'---':>4}  {'------':>6}  {'---------------':>16}  {'---------':>12}  ----")
     for i in range(1, 6):
         status, body, headers = get(f"{API1_URL}/api/data?key=failopen-test")
         redis_avail = headers.get("X-Redis-Available", body.get("redis_available", "?"))
+        remaining   = headers.get("X-Ratelimit-Remaining", "?")
         note = "fail-open (allowed despite Redis down)" if status == 200 else "unexpected"
-        print(f"  {i:>4}  {status:>6}  {str(redis_avail):>16}  {note}")
+        print(f"  {i:>4}  {status:>6}  {str(redis_avail):>16}  {str(remaining):>12}  {note}")
 
     # ---- Restart Redis ----
     subsection("Restarting Redis — observing automatic recovery")
@@ -317,11 +328,12 @@ def phase4_fail_open_and_recovery():
     time.sleep(5)
 
     print(f"\n  Sending 5 requests after Redis restart (no server restart!):")
-    print(f"  {'Req':>4}  {'Status':>6}  {'Redis-Available':>16}  Note")
-    print(f"  {'---':>4}  {'------':>6}  {'---------------':>16}  ----")
+    print(f"  {'Req':>4}  {'Status':>6}  {'Redis-Available':>16}  {'Remaining':>12}  Note")
+    print(f"  {'---':>4}  {'------':>6}  {'---------------':>16}  {'---------':>12}  ----")
     for i in range(1, 6):
         status, body, headers = get(f"{API1_URL}/api/data?key=failopen-test")
         redis_avail = headers.get("X-Redis-Available", body.get("redis_available", "?"))
+        remaining   = headers.get("X-Ratelimit-Remaining", "?")
         if status == 200 and str(redis_avail).lower() in ("true", "1"):
             note = "rate limiting RESUMED — Redis reconnected"
         elif status == 200:
@@ -330,7 +342,7 @@ def phase4_fail_open_and_recovery():
             note = "rate limited (Redis back + counter from before outage)"
         else:
             note = f"status={status}"
-        print(f"  {i:>4}  {status:>6}  {str(redis_avail):>16}  {note}")
+        print(f"  {i:>4}  {status:>6}  {str(redis_avail):>16}  {str(remaining):>12}  {note}")
 
     print(f"""
   DESIGN DECISION — fail-open vs fail-closed:
@@ -351,8 +363,9 @@ def phase4_fail_open_and_recovery():
   AUTOMATIC RECOVERY (what we just demonstrated):
     The server probes Redis on every request while in fail-open mode.
     No operator action needed — it heals itself when Redis comes back.
-    Alternative: a background thread that probes Redis every N seconds
-    and re-registers the Lua script on reconnect.
+    Note: the "unlimited" Remaining header during fail-open is intentional —
+    it signals to monitoring tools that rate limiting is suspended, rather
+    than implying the client has 0 requests left.
 """)
 
 
@@ -443,7 +456,7 @@ def phase6_boundary_attack():
         status, body, _ = get(f"{API1_URL}/api/data?key={api_key}")
         results_a["200" if status == 200 else "429"] += 1
         count = body.get("request_count", "?")
-        marker = " ← BLOCKED" if status == 429 else ""
+        marker = " <- BLOCKED" if status == 429 else ""
         print(f"    req {i+1:>2}: status={status}  count={count}{marker}")
         time.sleep(0.05)
 
@@ -459,7 +472,7 @@ def phase6_boundary_attack():
         status, body, _ = get(f"{API1_URL}/api/data?key={api_key}")
         results_b["200" if status == 200 else "429"] += 1
         count = body.get("request_count", "?")
-        marker = " ← BLOCKED" if status == 429 else ""
+        marker = " <- BLOCKED" if status == 429 else ""
         print(f"    req {i+1:>2}: status={status}  count={count}{marker}")
         time.sleep(0.05)
 
@@ -471,15 +484,15 @@ def phase6_boundary_attack():
     Total passed: {total_ok} / {batch_size * 2} sent
 
   Intended limit: {DEFAULT_LIMIT}/window.
-  Observed: up to {total_ok} requests passed in ~{window + 2}s — potentially {total_ok}/{DEFAULT_LIMIT:.0f}× the rate.
+  Observed: up to {total_ok} requests passed in ~{window + 2}s — potentially {total_ok}/{DEFAULT_LIMIT:.0f}x the rate.
 
   FIX — Sliding window counter (Cloudflare's approach):
-    rate = prev_count × (1 - elapsed_fraction) + current_count
+    rate = prev_count x (1 - elapsed_fraction) + current_count
     where elapsed_fraction = seconds_since_window_start / window_size
 
-  At the boundary (elapsed_fraction ≈ 0):
-    rate ≈ prev_count × 1.0 + current_count
-         ≈ {DEFAULT_LIMIT} × 1.0 + {DEFAULT_LIMIT} = {DEFAULT_LIMIT * 2}  → DENIED (> {DEFAULT_LIMIT})
+  At the boundary (elapsed_fraction ~= 0):
+    rate ~= prev_count x 1.0 + current_count
+         ~= {DEFAULT_LIMIT} x 1.0 + {DEFAULT_LIMIT} = {DEFAULT_LIMIT * 2}  -> DENIED (> {DEFAULT_LIMIT})
   This prevents the burst even at the boundary.
 """)
 
@@ -494,7 +507,7 @@ def phase7_sliding_window():
   only 2 fixed-window counters (O(1) memory per key).
 
   Formula (Cloudflare, 2023):
-    rate = prev_window_count × (1 - elapsed_in_current_window / window_size)
+    rate = prev_window_count x (1 - elapsed_in_current_window / window_size)
          + current_window_count
 
   Interpretation: the previous window's count is weighted by the fraction
@@ -531,29 +544,29 @@ def phase7_sliding_window():
     print(f"    limit               = {limit}")
     print()
     print(f"  Sliding window approximation:")
-    print(f"    rate = {prev_count} × {prev_weight:.2f} + {current_count}")
+    print(f"    rate = {prev_count} x {prev_weight:.2f} + {current_count}")
     print(f"         = {prev_count * prev_weight:.2f} + {current_count}")
     print(f"         = {approx_rate:.2f}")
     print(f"    Decision: {'ALLOW' if approx_rate <= limit else 'DENY'} (limit={limit})")
     print()
     print(f"  Compare to fixed-window:")
     print(f"    Would allow up to {true_maximum} in the worst-case boundary attack.")
-    print(f"    Sliding window bounds this to ≈ {approx_rate:.1f} — much closer to {limit}.")
+    print(f"    Sliding window bounds this to ~= {approx_rate:.1f} — much closer to {limit}.")
     print()
 
     print("  Redis implementation requires 2 keys per rate-limited entity:")
-    print(f"    ratelimit:{{key}}:{{window_id - 1}}  → prev_window_count (TTL = 2×window)")
-    print(f"    ratelimit:{{key}}:{{window_id}}      → current_window_count (TTL = window)")
+    print(f"    ratelimit:{{key}}:{{window_id - 1}}  -> prev_window_count (TTL = 2x window)")
+    print(f"    ratelimit:{{key}}:{{window_id}}      -> current_window_count (TTL = window)")
     print()
     print("  Algorithm comparison:")
     print(f"  {'Algorithm':<26}  {'Memory/key':>12}  {'Accuracy':>10}  {'Burst?':>7}")
     print(f"  {'-'*26}  {'-'*12}  {'-'*10}  {'-'*7}")
     rows = [
-        ("Fixed Window Counter",      "O(1) — 1 key",  "±100% at boundary", "Yes"),
-        ("Sliding Window Log (ZADD)", "O(N) — N=limit", "Exact",             "No"),
-        ("Sliding Window Counter",    "O(1) — 2 keys",  "<0.003% error",     "No"),
-        ("Token Bucket",              "O(1) — 2 fields", "Exact avg rate",   "Yes"),
-        ("Leaky Bucket",              "O(1) — 1 queue",  "Exact smoothing",  "No"),
+        ("Fixed Window Counter",      "O(1) — 1 key",    "+-100% at boundary", "Yes"),
+        ("Sliding Window Log (ZADD)", "O(N) — N=limit",  "Exact",              "No"),
+        ("Sliding Window Counter",    "O(1) — 2 keys",   "<0.003% error",      "No"),
+        ("Token Bucket",              "O(1) — 2 fields", "Exact avg rate",     "Yes"),
+        ("Leaky Bucket",              "O(1) — 1 queue",  "Exact smoothing",    "No"),
     ]
     for name, mem, acc, burst in rows:
         print(f"  {name:<26}  {mem:>12}  {acc:>10}  {burst:>7}")
@@ -573,8 +586,8 @@ def main():
     section("RATE LIMITER LAB")
     print(f"""
   Architecture:
-    Client → Nginx :8080 (round-robin) → api1:8001 / api2:8002
-                                               ↕
+    Client -> Nginx :8080 (round-robin) -> api1:8001 / api2:8002
+                                               |
                                      Redis (shared counter store)
 
   Rate limiting: Fixed-Window Counter via Redis Lua script (atomic INCR).
@@ -596,18 +609,18 @@ def main():
     section("Lab Complete")
     print("""
   Summary of demonstrated concepts:
-    1. Global Redis counter: N servers × (limit/N) = limit total — not N×limit
+    1. Global Redis counter: N servers x (limit/N) = limit total — not N x limit
     2. Lua script atomicity: INCR + EXPIRE in one atomic step, no TOCTOU race
     3. Header contract: Retry-After enables precise client backoff, not guessing
     4. Fail-open + auto-recovery: Redis outage is transient, not permanent
     5. Per-key tiers: independent counter namespaces, auto-expire, no cleanup
-    6. Boundary attack: fixed-window allows 2× rate; sliding window prevents it
+    6. Boundary attack: fixed-window allows 2x rate; sliding window prevents it
     7. Sliding window formula: O(1) memory, <0.003% error vs true sliding window
 
   Useful commands:
     docker compose exec redis redis-cli keys "ratelimit:*"
     docker compose exec redis redis-cli monitor   # live command stream
-    curl -i http://localhost:8001/stats            # per-key counter snapshot
+    curl -s http://localhost:8001/stats | python3 -m json.tool
 
   Next: 11-distributed-cache/ — Redis internals, eviction, and clustering
 """)

@@ -65,6 +65,32 @@ def wait_for_service(url, max_wait=60, label="service"):
     raise RuntimeError(f"{label} did not start within {max_wait}s")
 
 
+def wait_for_postgres(dsn, max_wait=60, label="Postgres"):
+    print(f"  Waiting for {label} ...")
+    for i in range(max_wait):
+        try:
+            conn = psycopg2.connect(dsn)
+            conn.close()
+            print(f"  {label} ready after {i+1}s")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError(f"{label} did not start within {max_wait}s")
+
+
+def wait_for_redis(url, max_wait=60, label="Redis"):
+    print(f"  Waiting for {label} ...")
+    for i in range(max_wait):
+        try:
+            r = redis.from_url(url, decode_responses=True, socket_connect_timeout=3)
+            r.ping()
+            print(f"  {label} ready after {i+1}s")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError(f"{label} did not start within {max_wait}s")
+
+
 def get_db():
     return psycopg2.connect(DB_URL)
 
@@ -520,10 +546,15 @@ def phase4_resumable_upload(conn, mc, r):
 
     # Clean up Redis session
     r.delete(session_key, received_key)
+    pre_failure_bytes = len(chunks[0][1])
+    # On a full restart, the client would re-upload ALL chunks (including chunk 0 again).
+    # With resumable upload, chunk 0 is NOT re-uploaded on reconnect — it was already received.
+    saved_bytes = pre_failure_bytes  # chunk 0 was not re-sent on resume
     print(f"\n  Upload complete. File ID: {file_id}, Version: 1")
-    print(f"  Wasted bandwidth (pre-failure): {len(chunks[0][1])//1024}KB")
-    print(f"  Resume bandwidth:               {resumed_bytes//1024}KB")
-    print(f"  Saved vs full restart:          {len(file_data)//1024 - (len(chunks[0][1]) + resumed_bytes)//1024}KB")
+    print(f"  Uploaded before failure: {pre_failure_bytes//1024}KB  (chunk 0)")
+    print(f"  Uploaded on resume:      {resumed_bytes//1024}KB  (chunks 1 and 2)")
+    print(f"  Total transferred:       {(pre_failure_bytes + resumed_bytes)//1024}KB  (== file size)")
+    print(f"  Saved vs full restart:   {saved_bytes//1024}KB  (chunk 0 not re-sent on reconnect)")
     print(f"  Redis session keys deleted (upload complete)\n")
 
     print(f"""
@@ -790,6 +821,8 @@ def main():
 
     install_packages()
     wait_for_service(f"{MINIO_ENDPOINT}/minio/health/live", label="MinIO")
+    wait_for_postgres(DB_URL, label="Postgres")
+    wait_for_redis(REDIS_URL, label="Redis")
 
     conn = get_db()
     r    = get_redis()

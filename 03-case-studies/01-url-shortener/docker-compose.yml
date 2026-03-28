@@ -5,6 +5,12 @@ services:
       POSTGRES_DB: urlshortener
       POSTGRES_USER: app
       POSTGRES_PASSWORD: secret
+    # Expose port so you can inspect Postgres directly from the host:
+    #   psql -h localhost -p 5432 -U app urlshortener
+    #   SELECT short_code, hits FROM urls ORDER BY hits DESC LIMIT 10;
+    #   SELECT count(*) FROM pg_stat_activity WHERE state='active';
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app -d urlshortener"]
       interval: 5s
@@ -18,11 +24,17 @@ services:
     # the README Interview Checklist Q8. maxmemory is set low (64mb) so the
     # experiment can actually observe eviction behaviour locally.
     # In production, tune maxmemory to leave ~20% headroom on the host.
+    #
+    # slowlog-log-slower-than 0 records every command -- useful for Phase 8
+    # to observe what Redis sees during a thundering herd (many GETs arriving
+    # simultaneously after FLUSHALL). In production set this to 10000 (10ms).
     command: >
       redis-server
       --maxmemory 64mb
       --maxmemory-policy allkeys-lru
       --save ""
+      --slowlog-log-slower-than 0
+      --slowlog-max-len 128
     ports:
       - "6379:6379"
     healthcheck:

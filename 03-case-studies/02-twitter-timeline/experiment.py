@@ -5,10 +5,12 @@ Twitter Timeline Lab — experiment.py
 What this demonstrates:
   1. Setup: users + follow relationships in Postgres
   2. Post tweet → produce to Kafka topic
-  3. Fan-out worker: consume from Kafka → push to each follower's Redis sorted set
+  3. Fan-out worker: consume from Kafka → push to each regular follower's Redis sorted set
+     (celebrities are SKIPPED — hybrid approach mirrors production behavior)
   4. Fetch timeline from Redis sorted set (ZREVRANGE)
   5. Celebrity problem: fan-out time grows linearly with follower count
   6. Hybrid approach: skip fan-out for celebrities, merge at read time
+  7. Cold start: expire a Redis timeline key, reconstruct from Postgres
 
 Run:
   docker compose up -d
@@ -31,7 +33,10 @@ DB_URL    = os.getenv("DATABASE_URL", "postgresql://app:secret@localhost:5432/tw
 REDIS_URL = os.getenv("REDIS_URL",    "redis://localhost:6379")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 
-CELEBRITY_THRESHOLD = 500  # Lab only: production Twitter uses ~1M followers as threshold
+# Lab threshold: production Twitter uses ~1M followers
+CELEBRITY_THRESHOLD = 500
+# Maximum timeline entries to keep per user (Twitter's actual bound was 800)
+TIMELINE_MAX = 800
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -80,7 +85,8 @@ def wait_for_postgres(max_wait=30):
 
 def install_packages():
     import subprocess, sys
-    pkgs = ["kafka-python", "psycopg2-binary", "redis"]
+    # kafka-python-ng is the actively maintained fork of kafka-python
+    pkgs = ["kafka-python-ng", "psycopg2-binary", "redis"]
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "--quiet"] + pkgs
     )
@@ -108,6 +114,7 @@ def init_db(conn):
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
                 CREATE INDEX IF NOT EXISTS idx_tweets_user ON tweets(user_id);
+                CREATE INDEX IF NOT EXISTS idx_tweets_created ON tweets(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id);
             """)
 
@@ -150,7 +157,7 @@ def phase1_setup(conn):
                 # Also follow one celebrity
                 follows.add((uid, random.choice(celeb_ids)))
 
-            # Celebrity: 1000 followers (all regular users)
+            # celeb_popstar: followed by all 50 regular users (above threshold)
             big_celeb = celeb_ids[0]
             for uid in regular_ids:
                 follows.add((uid, big_celeb))
@@ -173,12 +180,13 @@ def phase1_setup(conn):
         rows = cur.fetchall()
 
     print(f"\n  Created 53 users, {len(follows)} follow relationships")
+    print(f"  Celebrity threshold (lab): {CELEBRITY_THRESHOLD} followers")
     print(f"\n  Top 10 users by follower count:")
-    print(f"  {'Username':<25}  {'Followers':>10}")
-    print(f"  {'-'*25}  {'-'*10}")
+    print(f"  {'Username':<25}  {'Followers':>10}  {'Treatment'}")
+    print(f"  {'-'*25}  {'-'*10}  {'-'*20}")
     for username, followers in rows:
-        tag = " ← celebrity" if username.startswith("celeb_") else ""
-        print(f"  {username:<25}  {followers:>10}{tag}")
+        treatment = "celebrity (pull)" if followers >= CELEBRITY_THRESHOLD else "regular (push)"
+        print(f"  {username:<25}  {followers:>10}  {treatment}")
 
     return all_users, regular_ids, celeb_ids
 
@@ -187,8 +195,6 @@ def phase1_setup(conn):
 
 def phase2_post_tweets(conn, all_users, producer):
     section("Phase 2: Post Tweets → Kafka")
-
-    from kafka import KafkaProducer
 
     tweet_data = []
     with conn:
@@ -211,10 +217,16 @@ def phase2_post_tweets(conn, all_users, producer):
                         "created_at": row[1].timestamp(),
                     }
                     tweet_data.append(tweet)
-                    producer.send("tweets", value=json.dumps(tweet).encode())
+                    # Partition key = user_id bytes → guarantees ordering per tweeter
+                    producer.send(
+                        "tweets",
+                        key=str(user_id).encode(),
+                        value=json.dumps(tweet).encode(),
+                    )
 
     producer.flush()
     print(f"\n  Posted {len(tweet_data)} tweets to Kafka topic 'tweets'")
+    print(f"  (Partitioned by user_id to preserve per-user ordering)")
     print(f"\n  Sample (first 3):")
     for t in tweet_data[:3]:
         print(f"    [{t['tweet_id']}] @{t['username']}: {t['content'][:50]}...")
@@ -226,15 +238,17 @@ def phase2_post_tweets(conn, all_users, producer):
 def phase3_fanout(conn, consumer, r):
     section("Phase 3: Fan-out Worker (Kafka → Redis Sorted Sets)")
 
-    print("""
-  Fan-out on write:
-    When a tweet arrives, push it into each follower's timeline.
-    Timeline stored in Redis as sorted set: key = timeline:{user_id}
+    print(f"""
+  Fan-out on write (hybrid):
+    Regular users (< {CELEBRITY_THRESHOLD} followers): push tweet ID into each follower's timeline.
+    Celebrities (>= {CELEBRITY_THRESHOLD} followers): SKIP fan-out entirely.
+    Timeline stored in Redis as sorted set: key = timeline:{{user_id}}
     Score = tweet timestamp (enables chronological order via ZREVRANGE)
 """)
 
     fanout_times = []
     total_pushes = 0
+    skipped_celebrity = 0
 
     with conn.cursor() as cur:
         # Consume up to 15 messages (5 users × 3 tweets)
@@ -244,19 +258,35 @@ def phase3_fanout(conn, consumer, r):
             tweet_id = tweet["tweet_id"]
             score    = tweet["created_at"]
 
-            # Fetch all followers of this tweeter
+            # Fetch follower count to decide celebrity treatment
+            cur.execute(
+                "SELECT COUNT(*) FROM follows WHERE followee_id = %s",
+                (user_id,),
+            )
+            follower_count = cur.fetchone()[0]
+
+            if follower_count >= CELEBRITY_THRESHOLD:
+                # Celebrity: skip fan-out; followers will pull at read time
+                skipped_celebrity += 1
+                print(f"  Tweet {tweet_id} from user {user_id}: "
+                      f"SKIPPED (celebrity, {follower_count} followers — pull at read time)")
+                if i >= 14:
+                    break
+                continue
+
+            # Fetch all followers of this regular tweeter
             cur.execute(
                 "SELECT follower_id FROM follows WHERE followee_id = %s",
                 (user_id,),
             )
             followers = [row[0] for row in cur.fetchall()]
 
-            # Fan-out: push tweet_id into each follower's sorted set
+            # Fan-out: push tweet_id into each follower's sorted set via pipeline
             start = time.perf_counter()
             pipe = r.pipeline()
             for follower_id in followers:
                 pipe.zadd(f"timeline:{follower_id}", {str(tweet_id): score})
-                pipe.zremrangebyrank(f"timeline:{follower_id}", 0, -801)  # keep 800 max
+                pipe.zremrangebyrank(f"timeline:{follower_id}", 0, -(TIMELINE_MAX + 1))
             pipe.execute()
             elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -270,12 +300,15 @@ def phase3_fanout(conn, consumer, r):
             if i >= 14:
                 break
 
-    print(f"\n  Total: {len(fanout_times)} tweets processed, {total_pushes} sorted-set entries written")
-    print(f"\n  Fan-out time vs follower count:")
-    print(f"  {'Followers':>10}  {'Fan-out ms':>12}")
-    print(f"  {'-'*10}  {'-'*12}")
-    for followers, ms in sorted(fanout_times)[:8]:
-        print(f"  {followers:>10}  {ms:>12.1f}")
+    print(f"\n  Total: {len(fanout_times)} tweets fanned out, "
+          f"{skipped_celebrity} celebrity tweets skipped, "
+          f"{total_pushes} sorted-set entries written")
+    if fanout_times:
+        print(f"\n  Fan-out time vs follower count (regular users):")
+        print(f"  {'Followers':>10}  {'Fan-out ms':>12}")
+        print(f"  {'-'*10}  {'-'*12}")
+        for followers, ms in sorted(fanout_times)[:8]:
+            print(f"  {followers:>10}  {ms:>12.1f}")
 
     return fanout_times
 
@@ -297,7 +330,7 @@ def phase4_read_timeline(conn, r, all_users):
     print(f"  ZREVRANGE returned {len(tweet_ids)} tweet IDs in {elapsed_ms:.2f}ms")
 
     if tweet_ids:
-        # Hydrate tweet content from Postgres
+        # Hydrate tweet content from Postgres in a single batched query
         ids_tuple = tuple(int(t) for t in tweet_ids)
         with conn.cursor() as cur:
             placeholders = ",".join(["%s"] * len(ids_tuple))
@@ -318,7 +351,7 @@ def phase4_read_timeline(conn, r, all_users):
     print(f"""
   Redis sorted set key: timeline:{{user_id}}
     Score = tweet timestamp → ZREVRANGE gives chronological order
-    Trim to 800 entries on write (users rarely scroll back 800 tweets)
+    Trim to {TIMELINE_MAX} entries on write (users rarely scroll back {TIMELINE_MAX} tweets)
     Read latency: ~{elapsed_ms:.2f}ms (pure Redis, no DB)
 """)
 
@@ -352,7 +385,7 @@ def phase5_celebrity_problem(conn, r):
     print(f"  {'Followers':>10}  {'Fan-out ms':>12}  {'Bar'}")
     print(f"  {'-'*10}  {'-'*12}  {'-'*30}")
     for n, ms in results:
-        bar = "#" * int(ms / 2)
+        bar = "#" * max(1, int(ms / 2))
         print(f"  {n:>10}  {ms:>12.1f}  {bar}")
 
     print(f"""
@@ -375,8 +408,8 @@ def phase6_hybrid(conn, r, all_users, celeb_ids):
 
     print(f"""
   Hybrid strategy (Twitter's actual approach):
-    - Regular users (< {CELEBRITY_THRESHOLD} followers): fan-out on write
-    - Celebrities (≥ {CELEBRITY_THRESHOLD} followers): NO fan-out, pull at read time
+    - Regular users (< {CELEBRITY_THRESHOLD} followers): fan-out on write (Phase 3 did this)
+    - Celebrities (>= {CELEBRITY_THRESHOLD} followers): NO fan-out, pull at read time
 
   At timeline read time, merge two sources:
     1. Pre-built timeline from Redis (regular users' tweets)
@@ -392,13 +425,15 @@ def phase6_hybrid(conn, r, all_users, celeb_ids):
     fanout_tweet_ids = r.zrevrange(f"timeline:{reader_id}", 0, 19, withscores=True)
     redis_ms = (time.perf_counter() - start) * 1000
 
-    # Step 2: Get celebrity IDs this user follows
+    # Step 2: Find which celebrities this user follows, then fetch their recent tweets
     with conn.cursor() as cur:
         if celeb_ids:
+            # Only fetch celebs that this reader actually follows
             placeholders = ",".join(["%s"] * len(celeb_ids))
             cur.execute(
-                f"SELECT id FROM users WHERE id IN ({placeholders})",
-                celeb_ids,
+                f"SELECT followee_id FROM follows "
+                f"WHERE follower_id = %s AND followee_id IN ({placeholders})",
+                [reader_id] + celeb_ids,
             )
             followed_celebs = [row[0] for row in cur.fetchall()]
         else:
@@ -420,7 +455,7 @@ def phase6_hybrid(conn, r, all_users, celeb_ids):
             celeb_tweets = []
         db_ms = (time.perf_counter() - start) * 1000
 
-    # Step 3: Merge and sort
+    # Step 3: Merge and sort by timestamp, return top 20
     start = time.perf_counter()
     combined = list(fanout_tweet_ids) + [(str(t[0]), t[3].timestamp()) for t in celeb_tweets]
     combined.sort(key=lambda x: x[1], reverse=True)
@@ -450,6 +485,97 @@ def phase6_hybrid(conn, r, all_users, celeb_ids):
   - Low threshold (100 followers): many users skip fan-out → reads slower
   - High threshold (1M followers): only true mega-celebrities skip fan-out
   - Twitter used ~1M follower threshold in production
+""")
+
+
+# ── Phase 7: Cold start reconstruction ───────────────────────────────────────
+
+def phase7_cold_start(conn, r, all_users):
+    section("Phase 7: Cold Start — Timeline Reconstruction from Postgres")
+
+    print("""
+  Scenario: A user has not logged in for >24h, so their Redis timeline
+  key has expired (TTL eviction). On next login:
+    1. ZREVRANGE returns empty — cache miss
+    2. Fall back to Postgres: join tweets + follows, sort by created_at
+    3. Backfill the reconstructed timeline back into Redis
+
+  This is expensive at scale (user following 1,000 accounts = massive join),
+  but rare — active users keep their TTL alive via daily reads.
+""")
+
+    # Pick a user whose timeline was populated in phase 3
+    cold_user_id = list(all_users.values())[3]
+    cold_username = list(all_users.keys())[3]
+
+    # Confirm the timeline exists first
+    before_count = r.zcard(f"timeline:{cold_user_id}")
+    print(f"  User @{cold_username} (id={cold_user_id})")
+    print(f"  Timeline entries before expiry: {before_count}")
+
+    # Simulate TTL expiry by deleting the key
+    r.delete(f"timeline:{cold_user_id}")
+    after_delete = r.zcard(f"timeline:{cold_user_id}")
+    print(f"  Timeline entries after key expiry (simulated): {after_delete}")
+
+    # Cold-start reconstruction: fetch from Postgres
+    start = time.perf_counter()
+    with conn.cursor() as cur:
+        # Step 1: find who the user follows
+        cur.execute(
+            "SELECT followee_id FROM follows WHERE follower_id = %s",
+            (cold_user_id,),
+        )
+        followee_ids = [row[0] for row in cur.fetchall()]
+
+        # Step 2: fetch the most recent TIMELINE_MAX tweets from those followees
+        if followee_ids:
+            placeholders = ",".join(["%s"] * len(followee_ids))
+            cur.execute(
+                f"SELECT id, created_at FROM tweets "
+                f"WHERE user_id IN ({placeholders}) "
+                f"ORDER BY created_at DESC "
+                f"LIMIT {TIMELINE_MAX}",
+                followee_ids,
+            )
+            tweet_rows = cur.fetchall()
+        else:
+            tweet_rows = []
+    reconstruct_db_ms = (time.perf_counter() - start) * 1000
+
+    # Step 3: backfill Redis sorted set
+    start = time.perf_counter()
+    if tweet_rows:
+        pipe = r.pipeline()
+        for tweet_id, created_at in tweet_rows:
+            pipe.zadd(f"timeline:{cold_user_id}", {str(tweet_id): created_at.timestamp()})
+        pipe.execute()
+        # Set TTL so inactive users' keys expire again
+        r.expire(f"timeline:{cold_user_id}", 86400)
+    backfill_ms = (time.perf_counter() - start) * 1000
+
+    after_backfill = r.zcard(f"timeline:{cold_user_id}")
+    total_ms = reconstruct_db_ms + backfill_ms
+
+    print(f"\n  Cold-start reconstruction:")
+    print(f"    Followees queried:        {len(followee_ids)}")
+    print(f"    Tweets fetched from DB:   {len(tweet_rows)}")
+    print(f"    Postgres query:           {reconstruct_db_ms:.2f}ms")
+    print(f"    Redis backfill:           {backfill_ms:.2f}ms")
+    print(f"    Total reconstruction:     {total_ms:.2f}ms")
+    print(f"    Timeline entries after:   {after_backfill}")
+
+    print(f"""
+  Key observations:
+  - Even in this small lab, reconstruction takes {total_ms:.0f}ms.
+  - At production scale (user follows 1,000 accounts, each with many tweets),
+    the Postgres join can exceed 500ms — justifying pre-computation.
+  - Twitter pre-warmed timelines for users predicted to return soon
+    (based on past activity), before they actually logged in.
+  - New-follow backfill uses the same logic: when user A follows user B,
+    copy B's last {TIMELINE_MAX} tweet IDs into A's Redis sorted set immediately.
+    Without backfill, B's tweets would only appear after B posts something new.
+  - TTL is reset to 24h on every read/write, so active users never cold-start.
 """)
 
 
@@ -500,17 +626,20 @@ def main():
     phase4_read_timeline(conn, r, all_users)
     phase5_celebrity_problem(conn, r)
     phase6_hybrid(conn, r, all_users, celeb_ids)
+    phase7_cold_start(conn, r, all_users)
 
     conn.close()
 
     section("Lab Complete")
     print("""
   Summary:
-  • Fan-out on write: O(followers) writes per tweet, O(1) timeline reads
-  • Redis sorted sets: score=timestamp, ZREVRANGE = chronological feed
-  • Celebrity problem: 100M followers × 1 tweet = massive write amplification
-  • Hybrid approach: fan-out only for regular users, pull celebs at read time
-  • Twitter's actual threshold: ~1M followers triggers celebrity treatment
+  * Fan-out on write: O(followers) writes per tweet, O(1) timeline reads
+  * Redis sorted sets: score=timestamp, ZREVRANGE = chronological feed
+  * Celebrity problem: 100M followers x 1 tweet = massive write amplification
+  * Hybrid approach: fan-out only for regular users, pull celebs at read time
+    (Phase 3 skips celebrities during fan-out — consistent with production)
+  * Cold start (Phase 7): expired Redis key triggers Postgres reconstruction,
+    demonstrating why pre-computation matters at scale
 
   Next: 03-youtube/ — video upload, transcoding pipeline, adaptive bitrate
 """)

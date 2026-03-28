@@ -20,6 +20,7 @@ Run:
   python experiment.py
 """
 
+import random
 import threading
 import time
 
@@ -33,7 +34,6 @@ NODES = [
     ("localhost", 7003),
 ]
 
-import random
 random.seed(42)
 
 
@@ -65,7 +65,6 @@ def wait_for_cluster(max_wait: int = 90):
     for i in range(max_wait):
         try:
             rc = connect_cluster()
-            rc.ping()
             info = rc.cluster_info()
             if info.get("cluster_state") == "ok":
                 print(f"  Cluster ready after {i + 1}s")
@@ -178,8 +177,9 @@ def phase2_eviction():
 
     r = connect_single(7001)
 
-    # Flush this node's data first so we start from a clean baseline
-    r.flushall()
+    # Flush only this node's database to start from a clean baseline
+    # (flushdb instead of flushall to avoid disrupting other nodes)
+    r.flushdb()
     time.sleep(0.2)
 
     print("""
@@ -232,8 +232,11 @@ def phase2_eviction():
             used_mb = info["used_memory"] / (1024 * 1024)
             print(f"  {i + 1:<22}  {used_mb:>12.2f}MB  {evictions:>10}")
             pipe = r.pipeline(transaction=False)
-    if pipe.command_stack:
+    # Execute any remaining queued commands
+    try:
         pipe.execute()
+    except Exception:
+        pass
 
     # Final check: which keys survived?
     hot_survived = sum(1 for k in hot_keys if r.exists(k))
@@ -428,7 +431,7 @@ end
     ok = try_acquire("worker-2")
     steps.append(("worker-2 retry", ok, False))
 
-    # worker-1 tries to release using wrong owner ID — must be rejected
+    # wrong owner tries to release — must be rejected
     ok = try_release("wrong-owner")
     steps.append(("wrong-owner release attempt", ok, False))
 
@@ -494,7 +497,7 @@ def phase5_rdb_snapshot():
       3. Parent continues serving commands; modified memory pages are COW-copied
       4. On restart: load dump.rdb — fast (binary format, no replay needed)
     Data loss: all writes since the last snapshot are lost on crash
-    Typical schedule: every 60s (if ≥1 write) or every 5min (if ≥100 writes)
+    Typical schedule: every 60s (if >=1 write) or every 5min (if >=100 writes)
     Memory overhead during save: COW can double memory in write-heavy workloads
 
   AOF (Append-Only File) — write-ahead log:
@@ -503,7 +506,7 @@ def phase5_rdb_snapshot():
     On restart: replay AOF from beginning — slower but more durable.
     appendfsync options:
       always   — fsync after every command: safest, slowest (~1K writes/s)
-      everysec — fsync once per second: ≤1s data loss, fast (default)
+      everysec — fsync once per second: <=1s data loss, fast (default)
       no       — OS decides: fastest, highest data loss risk
 
   AOF Rewrite: AOF grows without bound. BGREWRITEAOF compacts it by
@@ -557,11 +560,11 @@ def phase5_rdb_snapshot():
   The fork() is fast (O(1)) because Linux uses copy-on-write.
   The child only reads memory; dirty pages accumulate in the parent.
   On a write-heavy workload during BGSAVE, memory can temporarily double.
-  This is why Redis nodes are typically provisioned with 2× their working set.
+  This is why Redis nodes are typically provisioned with 2x their working set.
 
   Production recommendation: enable both RDB + AOF.
     - RDB for fast restarts after planned maintenance
-    - AOF for ≤1s data loss on unplanned crash
+    - AOF for <=1s data loss on unplanned crash
     - appendfsync everysec: the right balance for most workloads
 """)
 
@@ -576,7 +579,7 @@ def phase6_cluster_slots_and_hash_tags():
     print("""
   Redis Cluster: 16,384 hash slots distributed across master nodes.
   Key routing: slot = CRC16(key) % 16384
-  Client downloads slot→node mapping on connect; routes directly (no proxy).
+  Client downloads slot->node mapping on connect; routes directly (no proxy).
   On MOVED error (stale mapping), client refreshes topology and retries.
   On ASK redirect (slot migration in progress), client sends ASKING then retries.
 """)
@@ -612,15 +615,15 @@ def phase6_cluster_slots_and_hash_tags():
   Hash tags: force keys to the same slot for co-located multi-key ops.
   If a key contains {{tag}}, only the tag portion is CRC16-hashed.
 
-  Example — WITHOUT hash tags (keys land on different slots → different nodes):""")
+  Example — WITHOUT hash tags (keys land on different slots -> different nodes):""")
 
     keys_no_tag = ["user:42:profile", "user:42:settings", "user:42:sessions"]
     for k in keys_no_tag:
         slot = key_slot(k)
-        print(f"    {k:<30} → slot {slot}")
+        print(f"    {k:<30} -> slot {slot}")
 
     print(f"""
-  Example — WITH hash tags (all land on the same slot → same node):""")
+  Example — WITH hash tags (all land on the same slot -> same node):""")
 
     keys_with_tag = ["{user:42}.profile", "{user:42}.settings", "{user:42}.sessions"]
     slots = set()
@@ -628,7 +631,7 @@ def phase6_cluster_slots_and_hash_tags():
         slot = key_slot(k)
         slots.add(slot)
         rc.set(k, f"data", ex=60)
-        print(f"    {k:<30} → slot {slot}")
+        print(f"    {k:<30} -> slot {slot}")
 
     same_slot = len(slots) == 1
     print(f"\n  All hash-tagged keys on same slot: {same_slot}")
@@ -636,9 +639,9 @@ def phase6_cluster_slots_and_hash_tags():
     # Demonstrate cross-slot MGET fails without hash tags
     print(f"""
   Cross-slot operation behavior:
-  - MGET without hash tags: keys span multiple nodes → cluster raises
+  - MGET without hash tags: keys span multiple nodes -> cluster raises
     CROSSSLOT error (keys in request don't hash to the same slot)
-  - MGET with hash tags: all keys on same slot → works correctly
+  - MGET with hash tags: all keys on same slot -> works correctly
 """)
 
     # Safe: tagged keys are on same slot
@@ -664,7 +667,7 @@ def phase6_cluster_slots_and_hash_tags():
   - Group related keys with a shared hash tag: {user:42}.profile, {user:42}.feed
   - This enables transactions (MULTI/EXEC), pipelines, and MGET across those keys
   - Trade-off: if all users share the same tag ({user}), all keys land on one slot
-    → hot slot problem (next phase)
+    -> hot slot problem (next phase)
 """)
 
 
@@ -677,8 +680,8 @@ def phase7_hot_key_problem():
   The hot key problem: one key (or slot) receives disproportionate traffic.
   Common causes:
   - Trending content (viral tweet, popular product listing)
-  - Poorly chosen hash tags (all user keys share same tag → one slot)
-  - Thundering herd: cache miss for popular key → all requests hit DB simultaneously
+  - Poorly chosen hash tags (all user keys share same tag -> one slot)
+  - Thundering herd: cache miss for popular key -> all requests hit DB simultaneously
 
   Symptoms:
   - One Redis node at 100% CPU while others are idle
@@ -686,28 +689,52 @@ def phase7_hot_key_problem():
   - Client timeouts for keys on that node only
 """)
 
-    r1 = connect_single(7001)
-    r2 = connect_single(7002)
-    r3 = connect_single(7003)
+    # Find one key that actually lands on each node by probing the cluster
+    rc = connect_cluster()
+    node_to_key: dict = {}
+    try:
+        nodes_info = rc.cluster_nodes()
+        # Build a map of slot-range start -> host:port for masters
+        master_slots: dict = {}
+        for node_id, info in nodes_info.items():
+            if "master" in info.get("flags", ""):
+                for s, e in info.get("slots", []):
+                    port = info.get("port")
+                    for slot in range(s, min(s + 1, e + 1)):  # just first slot of range
+                        master_slots[slot] = port
+
+        # Probe keys until we find one per master port
+        needed_ports = set(master_slots.values())
+        for i in range(10000):
+            k = f"probe:{i}"
+            slot = key_slot(k)
+            if slot in master_slots:
+                port = master_slots[slot]
+                if port in needed_ports:
+                    node_to_key[port] = k
+                    needed_ports.discard(port)
+            if not needed_ports:
+                break
+    except Exception:
+        pass
+    finally:
+        rc.close()
+
+    # Fall back to well-distributed keys if probing failed
+    if not node_to_key:
+        node_to_key = {7001: "probe:0", 7002: "probe:1", 7003: "probe:2"}
 
     N_OPS = 500
-    NODE_KEYS = {
-        7001: "pipeline:key:0",   # from phase 1, likely on node 7001
-        7002: "pipeline:key:5",
-        7003: "pipeline:key:10",
-    }
-
     print(f"  Simulating {N_OPS} reads to a single key on each node (hot key scenario):\n")
-    timings = {}
-    for port, conn in [(7001, r1), (7002, r2), (7003, r3)]:
-        key = NODE_KEYS[port]
+    for port, key in sorted(node_to_key.items()):
+        conn = connect_single(port)
         conn.set(key, "hot-value", ex=300)
         t0 = time.perf_counter()
         for _ in range(N_OPS):
             conn.get(key)
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        timings[port] = elapsed_ms
-        print(f"  Node :{port}  {N_OPS} reads in {elapsed_ms:.1f}ms  ({N_OPS * 1000 / elapsed_ms:,.0f} ops/s)")
+        print(f"  Node :{port}  key={key}  {N_OPS} reads in {elapsed_ms:.1f}ms  ({N_OPS * 1000 / elapsed_ms:,.0f} ops/s)")
+        conn.close()
 
     print(f"""
   Mitigation strategies for hot keys:
@@ -737,16 +764,12 @@ def phase7_hot_key_problem():
      When a hot key expires, N threads all miss simultaneously and all query DB.
      Solutions:
        a. Probabilistic early expiration (PER): re-compute before TTL expires
-          with probability ∝ 1/(TTL remaining). One thread refreshes early;
-          others still get the stale value.
+          with probability proportional to 1/(TTL remaining). One thread refreshes
+          early; others still get the stale value.
        b. Lock-based fetch: first thread acquires a lock and populates cache;
           others wait and read from cache on lock release.
        c. Stale-while-revalidate: return stale value immediately; async refresh.
 """)
-
-    r1.close()
-    r2.close()
-    r3.close()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -798,7 +821,7 @@ def main():
      or ZooKeeper/etcd.
 
   5. PERSISTENCE: RDB for fast restarts (binary snapshot via COW fork).
-     AOF for minimal data loss (≤1s with appendfsync everysec). Use both.
+     AOF for minimal data loss (<=1s with appendfsync everysec). Use both.
      Provision 2x working set memory to accommodate COW during BGSAVE.
 
   6. CLUSTER ROUTING: slot = CRC16(key) % 16384. Use hash tags to co-locate
@@ -808,6 +831,10 @@ def main():
   7. HOT KEYS: single slot becomes bottleneck. Mitigate with: client-side
      caching, key sharding across N copies, replica read routing, or
      stale-while-revalidate to prevent thundering herd on cache miss.
+
+  8. WRITE STRATEGIES: cache-aside for read-heavy (populate on miss).
+     Write-through for strong consistency (write to cache and DB together).
+     Write-behind for write-heavy with tolerable loss (async DB flush).
 
   Next: 12-payment-system/ — exactly-once semantics with double-entry ledger
 """)

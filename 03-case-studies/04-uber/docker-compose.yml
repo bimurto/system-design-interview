@@ -63,13 +63,16 @@ services:
         condition: service_healthy
       cache:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://app:secret@db:5432/uber
       REDIS_URL: redis://cache:6379
+      KAFKA_BOOTSTRAP: kafka:29092
     volumes:
       - ./app.py:/app.py
     command: >
-      sh -c "pip install flask psycopg2-binary redis --quiet &&
+      sh -c "pip install flask psycopg2-binary redis kafka-python-ng --quiet &&
              python /app.py"
     ports:
       - "5002:5000"

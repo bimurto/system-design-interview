@@ -96,7 +96,7 @@ A naive SQL `SELECT ... ORDER BY distance LIMIT 5` against a 4-million-row table
   │  OFFLINE ←→ AVAILABLE ←→ ON_TRIP                             │
   │                                                               │
   │  State stored in: Redis HSET driver:status:{driver_id}       │
-  │  TTL tracking: Redis HSET driver:heartbeat:{driver_id}       │
+  │  TTL tracking: Redis ZADD driver:heartbeats {epoch} {id}     │
   │  Stale detection: background job ZRANGEBYSCORE by last_seen  │
   └──────────────────────────────────────────────────────────────┘
 
@@ -269,7 +269,7 @@ Source: Uber Engineering Blog, "How Uber Uses Location Data in the Real World" (
 
 ## Hands-on Lab
 
-**Time:** ~20–25 minutes
+**Time:** ~25–30 minutes
 **Services:** `db` (PostGIS 15-3.3), `cache` (Redis 7), `kafka` + `zookeeper` (Confluent 7.5), `api` (Python/Flask)
 
 ### Setup
@@ -290,12 +290,12 @@ python experiment.py
 Seven phases run automatically:
 
 1. **Seed:** GEOADD 1,000 driver locations in San Francisco bounding box, measure throughput
-2. **Find nearest + ETA simulation:** GEOSEARCH from rider position, simulate ETA ranking vs distance ranking
-3. **Driver state machine:** demonstrate AVAILABLE → ON_TRIP → AVAILABLE transitions with stale driver eviction
+2. **Find nearest + ETA simulation:** GEOSEARCH from rider position; compare top-5 by distance vs top-5 by ETA to show they differ
+3. **Driver state machine:** demonstrate AVAILABLE → ON_TRIP → AVAILABLE transitions; simulate a 90-second-stale driver and run the heartbeat eviction scan
 4. **Update throughput:** pipeline 500 GEOADD commands, measure ops/second, extrapolate to 4M drivers
-5. **Geofence:** ray-casting point-in-polygon test for 5 locations against SF boundary polygon + surge pricing simulation
-6. **PostGIS:** sync 200 drivers, run ST_DWithin query, compare with Redis GEOSEARCH
-7. **Latency comparison:** benchmark Redis vs PostGIS at multiple search radii
+5. **Kafka pipeline:** produce 50 driver location updates to Kafka, consume them back into Redis GEOADD — demonstrating the production ingest path
+6. **Geofence:** ray-casting point-in-polygon test for 5 locations against SF boundary polygon + H3 surge pricing simulation
+7. **Latency comparison:** benchmark Redis GEOSEARCH vs PostGIS ST_DWithin at multiple search radii
 
 ### Break It
 
@@ -315,10 +315,10 @@ docker compose exec cache redis-cli GEOSEARCH drivers:geo FROMLONLAT -122.4194 3
 **Simulate Kafka consumer lag:**
 
 ```bash
-# Pause the Redis consumer group to simulate lag
+# Inspect the consumer group offset lag after running experiment.py
 docker compose exec kafka kafka-consumer-groups.sh \
   --bootstrap-server localhost:9092 \
-  --group location-redis-consumer \
+  --group location-redis-consumer-lab \
   --describe
 # Check LAG column — should be 0 normally
 ```
@@ -337,8 +337,11 @@ docker compose exec cache redis-cli GEOSEARCH drivers:geo FROMLONLAT -122.4194 3
 # Check driver status entries
 docker compose exec cache redis-cli KEYS "driver:status:*" | wc -l
 
-# View surge pricing state
+# View surge pricing state (written by Phase 6)
 docker compose exec cache redis-cli HGETALL surge:h3:8928308280fffff
+
+# View heartbeat sorted set (written by Kafka consumer in Phase 5)
+docker compose exec cache redis-cli ZRANGE driver:heartbeats 0 4 WITHSCORES
 ```
 
 ### Teardown

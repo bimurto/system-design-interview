@@ -7,19 +7,29 @@ Phase 2: HyperLogLog — Redis PFADD/PFCOUNT + PFMERGE demo vs exact set
 Phase 3: Count-Min Sketch — manual Python implementation
 Phase 4: Top-K — Redis TOPK.ADD/TOPK.LIST
 Phase 5: Bloom Filter Saturation — "break it" demo
-Phase 6: Comparison Summary
+Phase 6: MinHash — Jaccard similarity estimation
+Phase 7: Comparison Summary
 """
 
 import os
 import sys
 import math
 import random
-import string
 import time
 from collections import defaultdict
 
 import mmh3
 import redis
+
+# Fix seed for reproducible output across runs.
+# NOTE: mmh3 with different integer seeds is NOT cryptographically independent —
+# it is a single hash family with a seed parameter, not k truly independent hash
+# functions. For production Bloom filters, use multiple independent hash algorithms
+# (SHA-256 + MurmurHash + FNV) or the double-hashing construction
+# (h_i(x) = h1(x) + i*h2(x)) to approximate independence. The seed approach used
+# here is common in practice and sufficient for the FPR math, but be aware of the
+# theoretical gap when explaining this in an interview.
+random.seed(42)
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 
@@ -44,6 +54,10 @@ class BloomFilter:
     """
     Probabilistic membership test.
     False positives possible; false negatives impossible.
+
+    Hash independence note: uses mmh3 with integer seeds. This is the
+    double-hashing approximation (not k truly independent hash functions),
+    which is standard in practice. The FPR math still holds empirically.
     """
     def __init__(self, capacity, error_rate):
         self.capacity   = capacity
@@ -81,6 +95,10 @@ class BloomFilter:
     def memory_bytes(self):
         return len(self._bytes)
 
+    def fill_ratio(self):
+        """Fraction of bits set to 1. Approaches 1.0 as filter saturates."""
+        return sum(bin(b).count('1') for b in self._bytes) / self.m
+
     def false_positive_rate(self, n_inserted):
         """Actual FPR = (1 - e^(-k*n/m))^k"""
         k = self.k
@@ -98,6 +116,10 @@ def phase1_bloom_filter():
 
   Math: m = -n*ln(p) / ln(2)²    k = (m/n)*ln(2)
     n = capacity, p = false positive rate, m = bit array size, k = hash functions
+
+  Hash independence caveat: using mmh3 with integer seeds approximates
+  independent hash functions (double-hashing construction). Production systems
+  may combine multiple unrelated hash families for stronger independence.
 """)
 
     CAPACITY   = 100_000
@@ -105,17 +127,21 @@ def phase1_bloom_filter():
 
     bf = BloomFilter(CAPACITY, ERROR_RATE)
     print(f"  Bloom filter config:")
-    print(f"    Capacity:      {CAPACITY:,} items")
-    print(f"    Target FPR:    {ERROR_RATE*100:.1f}%")
-    print(f"    Bit array:     {bf.m:,} bits = {bf.m // 8 / 1024:.1f} KB")
+    print(f"    Capacity:       {CAPACITY:,} items")
+    print(f"    Target FPR:     {ERROR_RATE*100:.1f}%")
+    print(f"    Bit array:      {bf.m:,} bits = {bf.m // 8 / 1024:.1f} KB")
     print(f"    Hash functions: {bf.k}")
-    print(f"    Memory:        {bf.memory_bytes / 1024:.1f} KB")
+    print(f"    Memory:         {bf.memory_bytes / 1024:.1f} KB")
 
     # Add 100K items
     print(f"\n  Adding {CAPACITY:,} items...")
     items = [f"user:{i}" for i in range(CAPACITY)]
     for item in items:
         bf.add(item)
+
+    fill = bf.fill_ratio()
+    print(f"  Bit array fill ratio after {CAPACITY:,} insertions: {fill:.3f} "
+          f"(optimal for 1% FPR ≈ 0.500)")
 
     # Test 10K items NOT in the set → count false positives
     false_positives = 0
@@ -131,6 +157,11 @@ def phase1_bloom_filter():
     print(f"    False positives: {false_positives} / {TEST_COUNT:,}")
     print(f"    Actual FPR:      {actual_fpr*100:.2f}%")
     print(f"    Theoretical FPR: {theoretical_fpr*100:.2f}%")
+
+    # Verify the asymmetry guarantee: true members must NEVER be missed
+    false_negatives = sum(1 for item in items if item not in bf)
+    print(f"    False negatives: {false_negatives}  (MUST be 0 — no exceptions)")
+    assert false_negatives == 0, "BUG: Bloom filter produced a false negative!"
 
     # Memory comparison
     set_memory_approx = CAPACITY * 20  # ~20 bytes per string in a Python set
@@ -156,8 +187,8 @@ def phase1_bloom_filter():
     # Check membership
     exists_yes = r.execute_command("BF.EXISTS", "bf:users", "user:500")
     exists_no  = r.execute_command("BF.EXISTS", "bf:users", "user:99999")
-    print(f"    BF.EXISTS user:500   → {exists_yes} (should be 1)")
-    print(f"    BF.EXISTS user:99999 → {exists_no}  (probably 0, may be 1)")
+    print(f"    BF.EXISTS user:500   → {exists_yes} (should be 1 — true member)")
+    print(f"    BF.EXISTS user:99999 → {exists_no}  (probably 0 — not added; 1 = false positive)")
 
     # Info
     info = r.execute_command("BF.INFO", "bf:users")
@@ -167,8 +198,9 @@ def phase1_bloom_filter():
 
     print(f"""
   Real-world uses:
-    Cassandra: Bloom filter per SSTable — check if SSTable may contain a key
-               before doing an expensive disk read. Reduces I/O for missing keys.
+    Cassandra / RocksDB / LevelDB: Bloom filter per SSTable/SST file —
+      skip disk reads for keys definitely not in that file. Reduces I/O
+      for "key not found" by ~99% at 1% FPR. Critical for LSM-tree engines.
     Chrome:    Bloom filter for malicious URL database (~250MB → ~9MB)
     PostgreSQL: query optimiser uses bloom filters for index-skip scans
 """)
@@ -215,7 +247,7 @@ def phase2_hyperloglog():
     pipe2.execute()
 
     hll_after = r.execute_command("PFCOUNT", "hll:users")
-    print(f"  HLL estimate after adding duplicates: {hll_after:,}  (should be ~same)")
+    print(f"  HLL estimate after adding duplicates: {hll_after:,}  (should be ~same as {hll_count:,})")
 
     # PFMERGE demo: simulate 3 shards with overlapping users
     print(f"\n  PFMERGE demo — 3 database shards, each tracks its own unique visitors:")
@@ -244,10 +276,22 @@ def phase2_hyperloglog():
     print(f"\n    PFMERGE result: {merged_count:,}  (true union={true_union:,},  error={merge_error:.2f}%)")
     print(f"    Cross-shard distinct count achieved without transferring {true_union:,} raw IDs!")
 
+    # PFMERGE sparse→dense memory note
+    print(f"""
+  PFMERGE memory note:
+    Redis HLLs start in 'sparse' representation (a few hundred bytes) for
+    low cardinalities and switch to 'dense' (12KB) once the register count
+    is large enough. PFMERGE ALWAYS produces a dense output — even if both
+    inputs are sparse. If you merge thousands of per-user HLLs hourly, you
+    convert all of them from ~200 bytes to 12KB each. At 10K small HLLs,
+    that is 200KB (sparse) vs 120MB (post-merge dense). Design merges as
+    terminal aggregation operations, not intermediate pipeline steps.
+""")
+
     # Memory comparison
     hll_mem = 12 * 1024  # Redis HLL is ~12KB
     set_mem = TOTAL * 20
-    print(f"\n  Memory comparison for {TOTAL:,} unique items:")
+    print(f"  Memory comparison for {TOTAL:,} unique items:")
     print(f"    Exact set:    ~{set_mem / 1024 / 1024:.1f} MB")
     print(f"    HyperLogLog:  ~12 KB ({set_mem // hll_mem}x smaller)")
 
@@ -340,16 +384,24 @@ def phase3_count_min_sketch():
     for u in urls:
         cms.add(u)
 
-    print(f"\n  {'URL':<12} {'True Count':>12} {'CMS Estimate':>14} {'Overcount':>10}")
-    print(f"  {'─'*12} {'─'*12} {'─'*14} {'─'*10}")
+    print(f"\n  {'URL':<12} {'True Count':>12} {'CMS Estimate':>14} {'Overcount':>10} {'Guarantee'}")
+    print(f"  {'─'*12} {'─'*12} {'─'*14} {'─'*10} {'─'*15}")
+    all_over = True
     for url in sorted(popular + ["page_100", "page_200"],
                       key=lambda x: -true_counts[x]):
         true = true_counts[url]
         est  = cms.query(url)
         over = est - true
-        # CMS should NEVER under-estimate — flag if it does (bug indicator)
-        flag = "  <-- UNDER? (bug)" if over < 0 else ""
-        print(f"  {url:<12} {true:>12,} {est:>14,} {over:>+10,}{flag}")
+        # CMS guarantee: estimate MUST be >= true count (over-estimate only)
+        ok = "OK (>=true)" if over >= 0 else "VIOLATION!"
+        if over < 0:
+            all_over = False
+        print(f"  {url:<12} {true:>12,} {est:>14,} {over:>+10,} {ok}")
+
+    if all_over:
+        print(f"\n  Guarantee confirmed: CMS never under-estimated any item.")
+    else:
+        print(f"\n  WARNING: CMS violated over-estimate guarantee (implementation bug).")
 
     exact_mem = len(true_counts) * 20
     print(f"\n  Memory: exact dict={exact_mem/1024:.1f} KB   CMS(2000x5)={cms.memory_bytes/1024:.1f} KB")
@@ -359,7 +411,9 @@ def phase3_count_min_sketch():
   Real-world uses:
     Network switches: count per-flow packet frequencies for traffic analysis
     Ad fraud detection: frequency of IP address in ad impression stream
-    Rate limiting: approximate per-user request counts (always safe-to-reject)
+    Rate limiting: approximate per-user request counts (always safe-to-reject
+      because CMS only over-estimates — you may throttle slightly early but
+      you will never under-count and accidentally allow excess traffic)
     Databases: query-level access frequency for buffer cache management
 """)
 
@@ -403,12 +457,19 @@ def phase4_topk():
             true_counts[p] += 1
 
     top_k_result = r.execute_command("TOPK.LIST", "topk:pages")
-    print(f"\n  Top-{K} most frequent pages:")
-    print(f"  {'Rank':<6} {'Page':<12} {'True Count':>12}")
-    print(f"  {'─'*6} {'─'*12} {'─'*12}")
+    true_top_10 = sorted(true_counts, key=lambda x: -true_counts[x])[:K]
+
+    print(f"\n  Top-{K} most frequent pages (Redis TOPK vs exact sort):")
+    print(f"  {'Rank':<6} {'TOPK Result':<14} {'True Count':>12}  {'In exact top-10?'}")
+    print(f"  {'─'*6} {'─'*14} {'─'*12}  {'─'*16}")
+    topk_set = set(p for p in top_k_result if p)
     for rank, page in enumerate(top_k_result, 1):
         if page:
-            print(f"  {rank:<6} {page:<12} {true_counts.get(page, 0):>12,}")
+            in_exact = "YES" if page in true_top_10 else "no (near boundary)"
+            print(f"  {rank:<6} {page:<14} {true_counts.get(page, 0):>12,}  {in_exact}")
+
+    overlap = len(topk_set & set(true_top_10))
+    print(f"\n  Overlap with exact top-{K}: {overlap}/{K} items match")
 
     exact_mem_kb = len(true_counts) * 30 / 1024
     # Top-K internal sketch memory: width * depth * 4 bytes for the CMS counters
@@ -446,8 +507,8 @@ def phase5_bloom_saturation():
     print(f"  Filter designed for: {CAPACITY} items at {ERROR_RATE*100:.0f}% FPR")
     print(f"  We will add items at 1x, 2x, 5x, and 10x capacity and measure actual FPR.\n")
 
-    print(f"  {'Items Added':>12}  {'vs Capacity':>13}  {'Theoretical FPR':>17}  {'Actual FPR':>12}  {'Assessment'}")
-    print(f"  {'─'*12}  {'─'*13}  {'─'*17}  {'─'*12}  {'─'*20}")
+    print(f"  {'Items Added':>12}  {'vs Capacity':>13}  {'Fill Ratio':>11}  {'Theoretical FPR':>17}  {'Actual FPR':>12}  {'Assessment'}")
+    print(f"  {'─'*12}  {'─'*13}  {'─'*11}  {'─'*17}  {'─'*12}  {'─'*20}")
 
     for multiplier in [1, 2, 5, 10]:
         n_insert = CAPACITY * multiplier
@@ -455,6 +516,8 @@ def phase5_bloom_saturation():
 
         for i in range(n_insert):
             bf.add(f"item_{i}")
+
+        fill = bf.fill_ratio()
 
         # Test items never added
         fp = sum(1 for i in range(n_insert, n_insert + TEST_COUNT) if f"item_{i}" in bf)
@@ -468,21 +531,135 @@ def phase5_bloom_saturation():
         else:
             assessment = "SATURATED (replace!)"
 
-        print(f"  {n_insert:>12,}  {multiplier:>12}x  {theoretical_fpr*100:>16.1f}%  {actual_fpr*100:>11.1f}%  {assessment}")
+        print(f"  {n_insert:>12,}  {multiplier:>12}x  {fill:>10.3f}  {theoretical_fpr*100:>16.1f}%  {actual_fpr*100:>11.1f}%  {assessment}")
 
     print(f"""
+  Fill ratio interpretation:
+    0.500 = optimal operating point (maximum entropy, minimum FPR for capacity)
+    0.800 = significantly degraded — FPR rises sharply
+    1.000 = all bits set — every query returns "probably yes" (useless)
+
   Key takeaway:
     At 5x capacity the filter is largely useless (high FPR).
     At 10x it returns true for nearly everything — all bits set.
     Production mitigation: use Redis BF.RESERVE with expansion factor,
     or pre-provision at 2-3x expected peak, or use Scalable Bloom Filters (SBF).
+
+  Monitor: track (items inserted / designed capacity) as a gauge metric.
+    Alert at 80% fill. At 95% fill, start provisioning a replacement filter.
+""")
+
+
+# ── Phase 6: MinHash — Jaccard Similarity ─────────────────────────────────
+
+class MinHash:
+    """
+    Estimates Jaccard similarity between sets using k minimum hash values.
+
+    Insight: P(min_hash_i(A) == min_hash_i(B)) = |A ∩ B| / |A ∪ B|
+    So the fraction of matching min-hashes directly estimates Jaccard similarity.
+
+    Memory: O(k) per set — independent of set size.
+    """
+    def __init__(self, num_hashes=128):
+        self.num_hashes = num_hashes
+        # Initialize min values to infinity
+        self.min_hashes = [float('inf')] * num_hashes
+
+    def update(self, item):
+        for seed in range(self.num_hashes):
+            h = mmh3.hash(item, seed, signed=False)
+            if h < self.min_hashes[seed]:
+                self.min_hashes[seed] = h
+
+    def jaccard(self, other):
+        """Estimate Jaccard similarity by counting matching min-hashes."""
+        matches = sum(
+            1 for a, b in zip(self.min_hashes, other.min_hashes) if a == b
+        )
+        return matches / self.num_hashes
+
+
+def phase6_minhash():
+    section("Phase 6: MinHash — Jaccard Similarity Estimation")
+    print("""
+  MinHash estimates the Jaccard similarity between two sets.
+  Jaccard(A, B) = |A ∩ B| / |A ∪ B|
+
+  Insight: if you apply k hash functions and take the minimum from each,
+  P(min_hash_i(A) == min_hash_i(B)) = Jaccard(A, B)
+  So: fraction of matching min-hashes ≈ Jaccard similarity
+
+  Memory: O(k) per set (e.g., 128 hashes × 4 bytes = 512 bytes)
+  versus storing the full set: O(|set|)
+
+  Use cases:
+    Near-duplicate document detection (plagiarism, news clustering)
+    Collaborative filtering (users with similar interaction histories)
+    LSH (Locality-Sensitive Hashing): band MinHash signatures to find
+      candidate pairs efficiently in O(1) per band rather than O(n²)
+""")
+
+    # Build sets with known Jaccard similarity
+    base_set = set(f"word_{i}" for i in range(1000))
+
+    test_cases = [
+        ("90% overlap",  set(f"word_{i}" for i in range(900)) | set(f"unique_A_{i}" for i in range(100))),
+        ("50% overlap",  set(f"word_{i}" for i in range(500)) | set(f"unique_B_{i}" for i in range(500))),
+        ("10% overlap",  set(f"word_{i}" for i in range(100)) | set(f"unique_C_{i}" for i in range(900))),
+        ("0% overlap",   set(f"completely_different_{i}" for i in range(1000))),
+    ]
+
+    print(f"  Base set: {len(base_set)} words\n")
+    print(f"  {'Scenario':<16} {'True Jaccard':>14} {'MinHash (128)':>14} {'MinHash (32)':>13} {'Error (128)':>12}")
+    print(f"  {'─'*16} {'─'*14} {'─'*14} {'─'*13} {'─'*12}")
+
+    for label, other_set in test_cases:
+        # True Jaccard
+        true_j = len(base_set & other_set) / len(base_set | other_set)
+
+        # MinHash with 128 hashes
+        mh_base_128 = MinHash(num_hashes=128)
+        mh_other_128 = MinHash(num_hashes=128)
+        for w in base_set:
+            mh_base_128.update(w)
+        for w in other_set:
+            mh_other_128.update(w)
+        est_128 = mh_base_128.jaccard(mh_other_128)
+
+        # MinHash with 32 hashes (noisier)
+        mh_base_32 = MinHash(num_hashes=32)
+        mh_other_32 = MinHash(num_hashes=32)
+        for w in base_set:
+            mh_base_32.update(w)
+        for w in other_set:
+            mh_other_32.update(w)
+        est_32 = mh_base_32.jaccard(mh_other_32)
+
+        err_128 = abs(est_128 - true_j) / max(true_j, 0.001) * 100
+        print(f"  {label:<16} {true_j:>14.3f} {est_128:>14.3f} {est_32:>13.3f} {err_128:>+11.1f}%")
+
+    print(f"""
+  Key observations:
+    128 hashes gives good accuracy (typical error <5%) for most cases.
+    32 hashes is noisier but uses 4x less memory — tune k to your accuracy need.
+    Standard error of MinHash estimate ≈ 1/sqrt(k).
+    At k=128: std_error ≈ {1/math.sqrt(128):.3f} ({100/math.sqrt(128):.1f}%)
+    At k=32:  std_error ≈ {1/math.sqrt(32):.3f} ({100/math.sqrt(32):.1f}%)
+
+  LSH (Locality-Sensitive Hashing) extension:
+    Split k hashes into b bands of r hashes each (k = b * r).
+    Two sets become candidates if they match ALL hashes in ANY band.
+    This trades recall for precision: high-Jaccard pairs are very likely
+    to share at least one band; low-Jaccard pairs rarely do.
+    Used by LinkedIn for "People You May Know" and news deduplication pipelines.
 """)
 
 
 # ── Summary ───────────────────────────────────────────────────────────────
 
-def phase6_summary():
-    section("Phase 6: Comparison Summary")
+def phase7_summary():
+    section("Phase 7: Comparison Summary")
     print(f"""
   {'Structure':<22} {'Question':<35} {'Memory':<20} {'Error'}
   {'─'*22} {'─'*35} {'─'*20} {'─'*15}
@@ -491,26 +668,39 @@ def phase6_summary():
   {'HyperLogLog':<22} {'How many distinct items?':<35} {'O(1) ~12KB':<20} {'±0.81%, mergeable'}
   {'Count-Min Sketch':<22} {'How often does item appear?':<35} {'O(w×d)':<20} {'Over-estimate only'}
   {'Top-K':<22} {'What are the K most frequent?':<35} {'O(K)':<20} {'Approx rank'}
-  {'MinHash':<22} {'How similar are two sets?':<35} {'O(bands)':<20} {'Tunable'}
+  {'MinHash':<22} {'How similar are two sets?':<35} {'O(k) ~512B':<20} {'±1/sqrt(k)'}
 
   Key insight: trade exact answers for dramatically less memory.
   Acceptable for analytics, monitoring, recommendations.
   NOT acceptable for financial counts, exact billing, legal compliance.
 
+  Quick sizing cheat-sheet (memorize for interviews):
+    Bloom filter 1% FPR, 100M items  → ~120 MB bits, k=7 hash functions
+    Bloom filter 0.1% FPR, 100M items → ~180 MB bits, k=10 hash functions
+    HyperLogLog any cardinality        → 12 KB, ±0.81% error
+    Count-Min Sketch 1% error, δ=1%   → width≥272, depth≥5
+    MinHash 5% Jaccard error           → k=400 hashes, ~1.6 KB per set
+
   Bloom filter false positive formula:
     FPR = (1 - e^(-kn/m))^k
     k = hash functions, n = items inserted, m = bit array size
+    Optimal k = (m/n) * ln(2)  →  gives minimum FPR for a given m/n ratio
 
   HyperLogLog harmonic mean:
     Uses leading zeros in hash values as a proxy for cardinality.
     m registers, each tracking the max leading zeros seen.
     Harmonic mean of 2^(max_zeros) across registers = cardinality estimate.
 
-  Error direction summary:
+  Error direction summary (critical for interview):
     Bloom / Cuckoo Filter:   false positives only (never false negatives)
+      → safe for "skip unnecessary work"; unsafe as a security gate
     HyperLogLog:             symmetric error (±0.81%)
+      → good for dashboards; never use for billing
     Count-Min Sketch:        over-estimates only (never under-estimates)
-    Top-K:                   may miss low-frequency items near the K boundary
+      → safe for rate limiting (you throttle early, never under-count)
+      → safe for "heavy hitter" detection; over-estimates harmless
+    Top-K:                   may miss items near the K boundary
+    MinHash:                 symmetric error, controlled by k
 
   Next: ../../03-case-studies/01-url-shortener/
 """)
@@ -523,8 +713,8 @@ def main():
   dramatically less memory than exact approaches.
 
   Redis Stack (BF, HLL, TopK modules) backs Phases 1, 2, and 4.
-  Bloom filter and Count-Min Sketch also have manual Python implementations
-  so you can see the underlying algorithm directly.
+  Bloom filter, Count-Min Sketch, and MinHash have manual Python
+  implementations so you can see the underlying algorithm directly.
 
   Phases:
     1 — Bloom Filter:          membership test, FPR measurement, Redis BF
@@ -532,7 +722,8 @@ def main():
     3 — Count-Min Sketch:      frequency estimation, width sensitivity
     4 — Top-K:                 most frequent items via Redis TOPK
     5 — Bloom Saturation:      "break it" — observe FPR rise to ~100%
-    6 — Summary:               comparison table + error direction cheat-sheet
+    6 — MinHash:               Jaccard similarity estimation
+    7 — Summary:               comparison table + error direction cheat-sheet
 """)
 
     phase1_bloom_filter()
@@ -540,7 +731,8 @@ def main():
     phase3_count_min_sketch()
     phase4_topk()
     phase5_bloom_saturation()
-    phase6_summary()
+    phase6_minhash()
+    phase7_summary()
 
 
 if __name__ == "__main__":

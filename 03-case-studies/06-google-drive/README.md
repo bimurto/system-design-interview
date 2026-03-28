@@ -4,6 +4,17 @@
 
 ---
 
+## Interview Framework
+
+| Phase | Duration | What to Cover |
+|---|---|---|
+| Clarify Requirements | 3–5 min | File size limits, sync latency SLA, version history retention, offline access, collaboration model |
+| Capacity Estimation | 3–5 min | Storage at scale, dedup savings, delta sync bandwidth reduction |
+| High-Level Design | 10 min | Upload path (chunk → hash → check → upload → commit), sync notification (WebSocket push), metadata store, object storage |
+| Deep Dive | 15–20 min | Chunked upload + resumability, CDC for delta sync, cross-user deduplication, conflict resolution (OT vs conflict copy), metadata sharding |
+
+---
+
 ## The Problem at Scale
 
 Google Drive stores 2 trillion files for 1 billion users. The core engineering challenges are not just storage scale but sync efficiency — when a user edits a 1GB file and changes 3 words, the system should upload only the changed bytes, not re-upload the entire file. And when two users edit the same document simultaneously, the system must resolve the conflict without silently losing either person's work.
@@ -49,7 +60,7 @@ At this scale, per-byte deduplication (storing identical files once across all u
 | Daily sync bandwidth | 2B files × 10 KB avg change | 20 TB/day |
 | Without delta sync | 2B files × 1 MB avg size | 2 PB/day |
 | Metadata storage | 2T files × 1 KB metadata | 2 PB |
-| Version history | 10 versions × 10% unique chunks | +10% storage |
+| Version history | 10 versions × ~10% unique chunks per edit | ~2× base file size (not 10×) |
 
 ---
 
@@ -136,7 +147,30 @@ At Google Drive's scale, an estimated 20–30% of all uploaded data already exis
 
 **Cross-user deduplication:** Dropbox performs deduplication across all users (one copy of a common file serves everyone). This raised privacy concerns — the same hash means the same file, which reveals that two users have identical data. Google Drive stores per-user copies of chunks with shared underlying storage at the infrastructure level, which provides deduplication benefits without metadata-level cross-user linkage.
 
-### 4. Conflict Resolution
+### 4. Sync Notification Architecture
+
+After a file is uploaded, all other devices belonging to the same user (and all collaborators with access) must be notified in near-real-time. This is a fan-out problem.
+
+**WebSocket per connected device:**
+Each sync client maintains a persistent WebSocket connection to a notification server. When a file is committed, the upload service publishes an event to a message bus (Kafka or Pub/Sub). Notification servers subscribed to the user's topic push the event to all of that user's open WebSocket connections.
+
+```
+Upload Service → Kafka topic: user.{user_id}.changes
+                         ↓
+           Notification Server (fan-out per user)
+                         ↓
+    WebSocket push → Device A, Device B, Device C
+```
+
+**Why not polling?** A 30-second sync SLA with 500M active users polling every 30 seconds = ~17M requests/second to the sync check endpoint. WebSocket push inverts this: the server pushes only when there is a real change, cutting unnecessary traffic by orders of magnitude.
+
+**Notification server scalability:**
+- Each notification server holds WebSocket connections for a subset of users. A user's devices always connect to the same notification server (sticky routing by `user_id` hash).
+- If a notification server crashes, clients reconnect and re-establish WebSocket connections within seconds. No in-flight events are lost because Kafka retains them; the notification server replays from the last committed offset on restart.
+
+**Long-polling as fallback:** Clients that cannot maintain a WebSocket (corporate firewalls, certain mobile networks) fall back to long-polling: `GET /sync/poll?since={last_event_id}` blocks up to 30 seconds and returns immediately if a new event arrives. This degrades gracefully to the 30-second SLA.
+
+### 5. Conflict Resolution
 
 When two users edit the same file version concurrently, the server detects a conflict on save:
 
@@ -283,3 +317,9 @@ docker compose down -v
 
 10. **Q: What happens if two clients both think they have the "latest" version?**
     A: This is a distributed systems conflict (split-brain). Prevention: use optimistic locking — each save includes the client's known version number. Server rejects saves where `provided_version != current_version`. Resolution: the rejected client receives the current version's content and chunk hashes, diffs against their edit, and either: (a) auto-merges if changes are non-overlapping (different chunks changed), or (b) creates a conflict copy for user review. Google Drive implements option (b) for simplicity and safety.
+
+11. **Q: How do you notify all of a user's devices when a file changes? Why not polling?**
+    A: Each sync client holds a persistent WebSocket connection to a notification server. On file commit, the upload service publishes an event to Kafka (keyed by `user_id`). Notification servers consume from Kafka and push to all WebSocket connections for that user. Polling would require 500M active users × 1 poll/30 s ≈ 17M RPS just for sync checks; WebSocket push eliminates that load. Clients behind restrictive firewalls fall back to long-polling (`GET /sync/poll?since={cursor}` blocks up to 30 s). Notification servers are stateless with respect to the event log — if one crashes, clients reconnect and Kafka replays missed events from the last committed offset.
+
+12. **Q: How do you safely garbage collect chunks when a file version is deleted?**
+    A: Deleting a file version decrements `ref_count` on all its chunks. A background GC job queries `SELECT hash FROM chunks WHERE ref_count = 0` and deletes from both the chunks table and object storage. Chunks are never deleted synchronously at version-delete time, because a concurrent upload of the same chunk hash might be in flight — synchronous deletion would cause that upload to succeed at the DB level but point to a missing object. The async GC job runs after a quiescence window (e.g., 1 hour), by which time any in-flight uploads using the same hash have either completed (and incremented ref_count above 0) or failed.

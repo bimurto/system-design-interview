@@ -119,23 +119,25 @@ All well within a single region's commodity network capacity.
   │  6. Cache response in Redis (24h TTL)                          │
   │  7. [async] Publish PaymentCreated event → webhook queue       │
   │  8. Return 201 with transaction object                         │
-  └──────────┬──────────────────────────────────────┬─────────────┘
-             │                                      │
-  ┌──────────▼───────────┐              ┌───────────▼────────────┐
-  │       Postgres        │              │    Redis               │
-  │  transactions table   │              │  idem:{key} → response │
-  │  ledger_entries table │              │  24h TTL, LRU eviction │
-  │  ACID, UNIQUE idem_key│              └────────────────────────┘
-  │  append-only ledger   │
-  └───────────────────────┘
-             │
-  ┌──────────▼───────────┐
-  │  Reconciliation Job   │
-  │  (nightly/hourly)     │
-  │  Verify SUM(ledger)=0 │
-  │  Cross-check vs Visa/ │
-  │  Mastercard files     │
-  └───────────────────────┘
+  └──────┬───────────────────────────────┬──────────┬─────────────┘
+         │                               │          │
+  ┌──────▼───────────┐       ┌───────────▼──────┐  ┌──────▼──────────────┐
+  │     Postgres      │       │    Redis         │  │  Webhook Queue      │
+  │  transactions     │       │  idem:{key} →    │  │  (Kafka / SQS)      │
+  │  ledger_entries   │       │  response        │  │  Delivers merchant  │
+  │  ACID, UNIQUE     │       │  24h TTL, LRU    │  │  event callbacks    │
+  │  append-only      │       └──────────────────┘  └─────────────────────┘
+  └───────┬───────────┘
+          │
+  ┌───────▼───────────┐
+  │  Reconciliation   │
+  │  Job (nightly/    │
+  │  hourly)          │
+  │  Verify SUM(      │
+  │  ledger)=0        │
+  │  Cross-check vs   │
+  │  Visa/Mastercard  │
+  └───────────────────┘
 ```
 
 **Postgres** is the source of truth. ACID transactions ensure that either all three operations (insert transaction + 2 ledger entries) succeed, or none do. No partial state can persist.
@@ -321,8 +323,6 @@ ML scoring (beyond scope):
 
 ---
 
----
-
 ## Failure Modes and Scale Challenges
 
 These are the failure scenarios interviewers expect you to reason through for a senior/staff role:
@@ -392,7 +392,7 @@ curl -X POST http://localhost:5002/charge \
   -d '{"amount":"100","currency":"USD","customer_id":"cust-1","idempotency_key":"test-001"}'
 ```
 
-The script runs 7 phases:
+The script runs 8 phases:
 
 1. **Double-entry:** charge $100, inspect 2 ledger entries (1 debit + 1 credit)
 2. **Idempotency:** retry same charge 3 times, verify same response each time
@@ -401,6 +401,7 @@ The script runs 7 phases:
 5. **Reconciliation:** run 5 more charges, verify ledger sum = 0
 6. **Timeout simulation:** charge succeeds server-side, client retries → idempotent
 7. **Refund:** reverse original charge, verify ledger still balanced
+8. **Double-refund prevention:** second refund on same txn → rejected
 
 ### Break It
 
@@ -420,9 +421,11 @@ FROM ledger_entries;"
 # Insert a debit without a matching credit — Postgres rollback prevents this
 docker compose exec db psql -U app -d payments -c "
 BEGIN;
-INSERT INTO transactions VALUES ('test-broken', 'idem-broken', 'cust-x', 50, 'USD', 'completed', 'test', NOW(), NOW());
-INSERT INTO ledger_entries (transaction_id, account_id, amount, entry_type) VALUES ('test-broken', 'cust-x', 50, 'debit');
--- Intentionally omit the credit entry
+INSERT INTO transactions (idempotency_key, customer_id, amount, currency, status, description)
+  VALUES ('idem-broken', 'cust-x', 50, 'USD', 'completed', 'test');
+INSERT INTO ledger_entries (transaction_id, account_id, amount, entry_type)
+  SELECT id, 'cust-x', 50, 'debit' FROM transactions WHERE idempotency_key = 'idem-broken';
+-- Intentionally omit the matching credit entry
 ROLLBACK;
 -- Net sum is still 0 because we rolled back
 "
@@ -495,3 +498,6 @@ docker compose down -v
 
 13. **Q: Why should you not call the card network inside the database transaction?**
     A: A card network call takes 100–300ms on average, with tail latency potentially seconds (timeouts). If this call is inside a `BEGIN...COMMIT` block, Postgres holds row locks for the full duration. At 3,500 TPS with 200ms average card latency, you have ~700 concurrent transactions holding locks. Under load spikes this exhausts connection pools and causes cascading failures. The correct pattern: (1) COMMIT the `authorized` record synchronously to Postgres first, (2) call the card network asynchronously or in a follow-up step, (3) UPDATE status to `captured` or `failed`. The idempotency key ensures retries are safe even if the card call fails and must be retried.
+
+14. **Q: How do you prevent a refund from being applied twice to the same transaction?**
+    A: Mark the original transaction's status as `refunded` inside the same atomic DB transaction that inserts the refund record and ledger entries. Before inserting the refund, check that the original transaction's status is `completed` — if it is already `refunded`, reject with a 422. Because the status update and refund insert are in the same ACID transaction, no concurrent request can see the old `completed` status after the commit. The refund's own idempotency_key provides safe retry semantics: a retry of the exact same refund returns the original refund result without re-applying the reversal.

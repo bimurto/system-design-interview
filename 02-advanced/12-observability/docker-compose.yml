@@ -19,11 +19,17 @@ services:
       retries: 10
 
   prometheus:
-    image: prom/prometheus:v2.51.0
+    image: prom/prometheus:v2.53.0
     ports:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # Retain 7 days of data — sufficient for the lab, avoids unbounded disk growth.
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
     depends_on:
       flask-app:
         condition: service_healthy
@@ -38,7 +44,7 @@ services:
       retries: 10
 
   grafana:
-    image: grafana/grafana:10.4.0
+    image: grafana/grafana:11.1.0
     ports:
       - "3000:3000"
     volumes:
@@ -71,11 +77,16 @@ services:
       - ./experiment.py:/experiment.py
     command: >
       sh -c "pip install requests --quiet && python /experiment.py"
+    # Only needs flask-app and prometheus — grafana is optional for the script.
     depends_on:
-      grafana:
+      prometheus:
         condition: service_healthy
     environment:
       - APP_HOST=flask-app
       - PROM_HOST=prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 128m
     profiles:
       - experiment

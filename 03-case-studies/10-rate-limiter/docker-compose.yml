@@ -23,6 +23,9 @@ services:
       sh -c "pip install flask==3.0.3 redis==5.0.8 --quiet && python /api_server.py"
     ports:
       - "8001:8000"
+    # Restart on failure so a transient pip install hiccup doesn't leave
+    # the container silently stopped (docker compose ps would show "Exited").
+    restart: on-failure
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s
@@ -44,6 +47,7 @@ services:
       sh -c "pip install flask==3.0.3 redis==5.0.8 --quiet && python /api_server.py"
     ports:
       - "8002:8000"
+    restart: on-failure
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s

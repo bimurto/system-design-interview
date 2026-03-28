@@ -13,6 +13,13 @@ run:
 		--name $(DOCKER_CONTAINER_NAME) \
 		$(DOCKER_IMAGE_NAME)
 
+run-api:
+	docker run -it \
+		-v $(CURDIR):/workspace \
+		-v $(HOME)/.claude-docker-config/:/home/claude \
+		--name $(DOCKER_CONTAINER_NAME) \
+		$(DOCKER_IMAGE_NAME)
+
 stop:
 	docker stop $(DOCKER_CONTAINER_NAME) || true
 	docker rm $(DOCKER_CONTAINER_NAME) || true

@@ -25,6 +25,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   redis-2:
     image: redis:7
@@ -52,6 +53,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   redis-3:
     image: redis:7
@@ -79,6 +81,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
 
   cluster-init:
     image: redis:7
@@ -97,3 +100,7 @@ services:
         echo 'Cluster init complete — all 16384 slots covered'
       "
     restart: "no"
+
+networks:
+  default:
+    name: 11-distributed-cache_default

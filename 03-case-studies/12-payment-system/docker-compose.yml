@@ -35,6 +35,7 @@ services:
       sh -c "pip install flask psycopg2-binary redis --quiet && python /payment_service.py"
     ports:
       - "5002:5000"
+    restart: on-failure
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
       interval: 10s

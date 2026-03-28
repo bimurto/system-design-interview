@@ -241,15 +241,15 @@ docker compose logs -f kafka  # wait for "started (kafka.server.KafkaServer)"
 python experiment.py
 ```
 
-The script installs `kafka-python`, `psycopg2-binary`, and `redis` automatically, then runs seven phases:
+The script installs `kafka-python-ng`, `psycopg2-binary`, and `redis` automatically, then runs seven phases:
 
-1. **Seed data:** 50 regular users + 3 celebrities, follow relationships in Postgres
-2. **Post tweets:** 15 tweets published to Kafka topic `tweets`
-3. **Fan-out worker:** consume from Kafka, push tweet IDs to follower Redis timelines, measure per-follower latency
-4. **Read timeline:** ZREVRANGE from Redis, hydrate content from Postgres
+1. **Seed data:** 50 regular users + 3 celebrities, follow relationships in Postgres; prints each user's follower count and whether they receive push (fan-out) or pull (celebrity) treatment
+2. **Post tweets:** 15 tweets published to Kafka topic `tweets`, partitioned by `user_id` to guarantee per-tweeter ordering
+3. **Fan-out worker:** consume from Kafka; for each tweet, check the tweeter's follower count — **celebrities are skipped**, regular users get their tweet ID pushed into each follower's Redis sorted set via pipeline; prints per-tweet fan-out latency
+4. **Read timeline:** ZREVRANGE from Redis, hydrate content from Postgres in a single batched query
 5. **Celebrity problem:** simulate fan-out to 10–1,000 followers, demonstrate linear scaling
-6. **Hybrid approach:** demonstrate merge of Redis timeline + celebrity Postgres query at read time
-7. **Cold start:** expire a timeline key and show reconstruction from Postgres
+6. **Hybrid approach:** demonstrate merge of pre-built Redis timeline + celebrity Postgres query at read time; prints per-source latency breakdown
+7. **Cold start:** expire a Redis timeline key, reconstruct from Postgres, backfill into Redis; prints reconstruction latency and entry count
 
 ### Break It
 

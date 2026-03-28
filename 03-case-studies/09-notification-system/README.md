@@ -89,8 +89,8 @@ Before designing anything, drive a short requirements conversation. These are th
   Kafka: transactional  Kafka: social      Kafka: marketing
   (OTP, alerts)         (likes, follows)   (promotions)
          │                    │                    │
-         └──────────┬─────────┘                    │
-                    ▼                              ▼
+         └──────────┬─────────┴──────────┐         │
+                    ▼                    ▼         ▼
   ┌─────────────────────────────────────────────────────┐
   │            Channel Workers (per-channel pools)       │
   │                                                     │
@@ -99,14 +99,14 @@ Before designing anything, drive a short requirements conversation. These are th
   │  SMS Workers     → Twilio / AWS SNS                  │
   │  In-App Workers  → Write to user's notification feed │
   └─────────────────────────────────────────────────────┘
-       │ on failure
+       │ on failure (after N retries)
        ▼
-  Dead Letter Queue (Kafka DLQ topic)
+  Dead Letter Queue (Kafka: notifications-dlq)
 ```
 
-**Kafka topics by priority:** Transactional messages (password reset, payment alert) go on a separate high-priority topic. Workers drain transactional first. This prevents marketing campaigns from starving time-sensitive alerts.
+**Kafka topics by priority:** Transactional messages (password reset, payment alert) go on a separate high-priority topic. Workers drain transactional first, then social, then marketing. This prevents marketing campaigns from starving time-sensitive alerts.
 
-**Channel workers:** Separate worker pools per channel, each with its own Kafka consumer group. Push workers scale independently from email workers (push is faster; email has rate limits per domain). Workers are stateless — state lives in Redis (preferences) and Postgres (delivered log).
+**Channel workers:** Separate worker pools per channel, each with its own Kafka consumer group. Push workers scale independently from email workers (push is faster; email has rate limits per domain). Workers are stateless — state lives in Redis (preferences, dedup) and Postgres (delivered log).
 
 **Idempotency:** Every notification event carries an idempotency_key. Before delivery, the worker checks if this key has already been delivered to this channel. A unique constraint on `(idempotency_key, channel)` in Postgres guarantees exactly-once delivery even with retries or worker restarts.
 
@@ -123,7 +123,7 @@ User action
       1. Fetch user preferences from Redis (O(1))
       2. If channel is enabled:
          a. Assign idempotency_key = hash(event_id + user_id + channel)
-         b. Produce to Kafka (transactional/marketing topic)
+         b. Produce to Kafka (transactional/social/marketing topic)
   → Channel Workers consume from Kafka:
       1. Dedup check (idempotency_key in Redis/Postgres)
       2. Call third-party API (APNs, SendGrid, Twilio)
@@ -133,7 +133,7 @@ User action
 
 **Fan-out at scale:** A celebrity with 10M followers who posts triggers 10M notification events. The Notification Service uses a worker pool to fan out in parallel. Each event is small (~200 bytes). At 10M events × 200B = 2GB — manageable for Kafka.
 
-**Batching:** Push workers can send up to 500 notifications per APNs request, and up to 1000 per FCM request. Workers accumulate messages from Kafka and batch them before calling the API. This reduces API calls from 4,050 RPS to ~10 RPS for push.
+**Batching:** Push workers can send up to 500 notifications per APNs HTTP/2 request. FCM supports batches of up to 500 messages per HTTP request. Workers accumulate messages from Kafka and batch them before calling the API. This reduces API calls from 4,050 RPS to ~10 RPS for push.
 
 ### 2. Fan-Out Strategy: Write vs. Read
 
@@ -180,7 +180,7 @@ Every notification lookup needs to check:
 
 **Problem:** Network failures cause retries. A push notification sent successfully to APNs, but the ACK was lost, causes the worker to retry → user gets the same notification twice.
 
-**Solution:** Idempotency key = `sha256(event_id + user_id + channel)[:16]`
+**Solution:** Idempotency key = `sha256(event_id + user_id + channel)[:32]` (full 128-bit hex — see Failure Modes for why truncation is risky)
 
 Before delivery:
 ```sql
@@ -202,9 +202,10 @@ If `RETURNING id` is empty → already delivered → skip.
 **Priority tiers:**
 | Tier | Examples | SLA | Kafka Topic |
 |---|---|---|---|
-| Transactional | OTP, password reset, payment alert | < 1s | `notif-transactional` |
-| Social | New follower, comment, like | < 30s | `notif-social` |
-| Marketing | Promotions, newsletters | < 10min | `notif-marketing` |
+| Transactional | OTP, password reset, payment alert | < 1s | `notifications-transactional` |
+| Social | New follower, comment, like | < 30s | `notifications-social` |
+| Marketing | Promotions, newsletters | < 10min | `notifications-marketing` |
+| Dead Letter | Exhausted retries | ops alert | `notifications-dlq` |
 
 **Worker allocation:** Transactional workers are always running. Social workers scale with traffic. Marketing workers can be stopped during peak hours to reserve capacity.
 
@@ -218,7 +219,7 @@ attempt 3: wait 2^2 × base_delay = 4s
 attempt 4: wait 2^3 × base_delay = 8s
 ```
 
-**Max attempts:** 5 for transactional, 3 for marketing. After exhausting retries → produce to `notif-dlq` Kafka topic.
+**Max attempts:** 5 for transactional, 3 for marketing. After exhausting retries → produce to `notifications-dlq` Kafka topic.
 
 **DLQ monitoring:** On-call engineers monitor the DLQ consumer lag. A spike indicates a systemic delivery failure (APNs outage, invalid credentials). The DLQ preserves the original message for re-processing after the incident.
 
@@ -273,7 +274,7 @@ If the counter exceeds the limit (e.g., 10 push per minute per user), suppress t
 
 **Airbnb's notification platform:** Airbnb published a blog post (2023) describing their migration from a monolithic notification service to a Kafka-based pipeline. Key insight: separating the "decide what to send" step from the "actually send" step allowed them to scale channel workers independently. They also implemented a suppression layer (don't send marketing during active booking flow) in the router, not in individual channel workers.
 
-**APNs and FCM batch sizes:** Apple Push Notification service accepts up to 500 notifications per HTTP/2 connection, each as a separate request. FCM (Firebase Cloud Messaging) supports batch sends of up to 500 messages in a single HTTP request. Batching is the primary lever for throughput in push notification systems.
+**APNs and FCM batch sizes:** Apple Push Notification service accepts individual HTTP/2 requests, each delivering one notification per device, over a persistent connection — batching means pipelining multiple requests over the same connection, not a single bulk API call. FCM supports batch sends of up to 500 messages in a single HTTP request. Batching is the primary lever for throughput in push notification systems.
 
 Source: Facebook OSDI 2011 "TAO"; Airbnb Engineering Blog "Rearchitecting Airbnb's Notification Platform" (2023); Apple Developer Documentation "Sending Notification Requests to APNs".
 
@@ -282,13 +283,13 @@ Source: Facebook OSDI 2011 "TAO"; Airbnb Engineering Blog "Rearchitecting Airbnb
 ## Hands-on Lab
 
 **Time:** ~20 minutes
-**Services:** `zookeeper`, `kafka`, `db` (Postgres 15), `workers` (Python)
+**Services:** `zookeeper`, `kafka`, `db` (Postgres 15), `redis` (Redis 7), `workers` (Python)
 
 ### Setup
 
 ```bash
 cd system-design-interview/03-case-studies/09-notification-system/
-docker compose up -d zookeeper kafka db
+docker compose up -d zookeeper kafka db redis
 # Wait ~40s for Kafka to be healthy
 docker compose ps
 ```
@@ -296,21 +297,23 @@ docker compose ps
 ### Experiment
 
 ```bash
-docker compose run --rm workers
+# Run the experiment container (requires the 'experiment' profile)
+docker compose --profile experiment run --rm workers
 # Or locally:
-pip install kafka-python psycopg2-binary
+pip install kafka-python-ng psycopg2-binary redis
 KAFKA_BOOTSTRAP=localhost:9092 python experiment.py
 ```
 
-The script runs 7 phases:
+The script runs 8 phases:
 
-1. **Produce:** 100 notifications to transactional and marketing Kafka topics
-2. **Consume & deliver:** workers drain transactional first (priority), then marketing
+1. **Produce:** 100 notifications to transactional, social, and marketing Kafka topics
+2. **Consume & deliver:** workers drain transactional first, then social, then marketing
 3. **Preference filtering:** verify users 101-103 have email suppressed
 4. **Deduplication:** same idempotency_key sent twice → delivered exactly once
-5. **Retry backoff:** notifications ending in "7" simulate 2 failures then succeed
-6. **Scale math:** compute real numbers for 1B/day
-7. **DB summary:** delivered count per channel in Postgres
+5. **Retry backoff:** notifications ending in "7" simulate 2 failures then succeed; one case exhausts all retries and goes to DLQ
+6. **Fan-out:** celebrity post fans out to 500 followers via the social topic with early preference suppression
+7. **Scale math:** compute real numbers for 1B/day
+8. **DB summary:** delivered count per channel in Postgres
 
 ### Break It
 
@@ -318,7 +321,7 @@ The script runs 7 phases:
 
 ```bash
 # After modifying mock_deliver threshold, run and watch DLQ stat increment
-docker compose run --rm workers
+docker compose --profile experiment run --rm workers
 ```
 
 **Test preference filtering at scale:** Add 50 notifications for user 103 (push+email disabled) and verify none of the email/push ones are delivered:
@@ -327,13 +330,30 @@ docker compose run --rm workers
 # In the produce phase, loop 50 notifications targeting user_id=103 on channel="push"
 ```
 
+**Explore Redis data structures:** Connect to Redis and set user preferences as you would in production:
+
+```bash
+docker compose exec redis redis-cli
+# Set preferences for user 106
+HSET user:prefs:106 email 1 push 1 sms 0 mkt 0
+HGETALL user:prefs:106
+
+# Simulate a dedup key (24-hour TTL)
+SET dedup:idem-test:push 1 EX 86400
+EXISTS dedup:idem-test:push
+
+# Simulate a rate-limit counter
+INCR notif:rl:104:push:minute1
+EXPIRE notif:rl:104:push:minute1 60
+```
+
 ### Observe
 
 ```bash
 # Check Kafka consumer group lag
 docker compose exec kafka kafka-consumer-groups \
   --bootstrap-server localhost:9092 \
-  --group lab-group-txn \
+  --group lab-group-notifications-transactional \
   --describe
 
 # Check delivered notifications in Postgres
@@ -344,7 +364,7 @@ docker compose exec db psql -U app -d notifications \
 ### Teardown
 
 ```bash
-docker compose down -v
+docker compose --profile experiment down -v
 ```
 
 ---
@@ -358,7 +378,7 @@ docker compose down -v
    A: Idempotency key per (notification_event, user, channel). Before delivery, check `delivered_notifications` table (unique constraint on key+channel). Use `INSERT ... ON CONFLICT DO NOTHING` — if the row already exists, skip delivery. This handles retries from worker crashes, network timeouts, and duplicate Kafka events.
 
 3. **Q: How do you prevent a marketing campaign from delaying password reset notifications?**
-   A: Separate Kafka topics per priority tier. Channel workers drain `notif-transactional` completely before consuming from `notif-marketing`. In practice, transactional workers run continuously; marketing workers can be paused during incidents. This is consumer-side priority, not Kafka-side — Kafka itself doesn't have priority queues.
+   A: Separate Kafka topics per priority tier. Channel workers drain `notifications-transactional` completely before consuming from `notifications-social` and `notifications-marketing`. In practice, transactional workers run continuously; marketing workers can be paused during incidents. This is consumer-side priority, not Kafka-side — Kafka itself doesn't have priority queues.
 
 4. **Q: What happens when APNs is down for 30 minutes?**
    A: Retry with exponential backoff up to N attempts. After exhausting retries, produce to the DLQ. When APNs recovers, re-process DLQ messages. The user receives their notification late rather than not at all. For transactional notifications (OTP), a 30-minute delay may invalidate the token. Detection mechanism: the notification event carries an `expires_at` timestamp set by the Auth Service (equal to the OTP's Redis TTL). The DLQ consumer checks `if now() > expires_at: drop`. This requires the original event schema to include expiry metadata — a design decision made at schema definition time, not during an outage.
@@ -376,10 +396,10 @@ docker compose down -v
    A: A DLQ is a Kafka topic that receives messages which have exhausted all delivery retries. A message goes to the DLQ after N failed delivery attempts (N=5 for transactional). On-call engineers monitor the DLQ consumer lag as an alert signal. Messages can be re-processed by replaying the DLQ topic after fixing the underlying issue.
 
 9. **Q: How do you handle 100M email notifications from a single marketing campaign?**
-   A: Produce all 100M events to the `notif-marketing` Kafka topic (1-2 minutes to produce at 1M/s). Email workers consume and batch-send via SendGrid/SES. Email providers have rate limits per domain (e.g., 100 emails/second to same domain). Workers implement per-domain rate limiting. The campaign drains over several hours — acceptable for marketing. Transactional email is on a separate dedicated IP pool.
+   A: Produce all 100M events to the `notifications-marketing` Kafka topic (1-2 minutes to produce at 1M/s). Email workers consume and batch-send via SendGrid/SES. Email providers have rate limits per domain (e.g., 100 emails/second to same domain). Workers implement per-domain rate limiting. The campaign drains over several hours — acceptable for marketing. Transactional email is on a separate dedicated IP pool.
 
 10. **Q: Walk me through what happens when a user requests a password reset.**
-    A: (1) User submits email → Auth service generates OTP, stores in Redis with 10-minute TTL, sets `expires_at = now + 10 min`. (2) Auth service produces notification event with `{type: transactional, channel: email, user_id, message: "OTP: 123456", idempotency_key: hash(event_id), expires_at}`. (3) Notification service produces to `notif-transactional` Kafka topic. (4) Email worker picks up within seconds (transactional has dedicated consumer). (5) Worker checks preferences (email enabled?), checks dedup, checks `expires_at` (drop if expired), calls SendGrid API. (6) User receives email in < 5 seconds. On failure, retry up to 5 times with backoff. If all fail → DLQ + alert on-call.
+    A: (1) User submits email → Auth service generates OTP, stores in Redis with 10-minute TTL, sets `expires_at = now + 10 min`. (2) Auth service produces notification event with `{type: transactional, channel: email, user_id, message: "OTP: 123456", idempotency_key: hash(event_id), expires_at}`. (3) Notification service produces to `notifications-transactional` Kafka topic. (4) Email worker picks up within seconds (transactional has dedicated consumer). (5) Worker checks preferences (email enabled?), checks dedup, checks `expires_at` (drop if expired), calls SendGrid API. (6) User receives email in < 5 seconds. On failure, retry up to 5 times with backoff. If all fail → DLQ + alert on-call.
 
 11. **Q: How would you design for a celebrity with 50M followers posting content?**
     A: Use a hybrid fan-out strategy. Flag celebrity accounts (above a threshold, e.g., 1M followers) in the social graph service. For regular users: write fan-out — enumerate followers at post time and produce one Kafka event per follower. For celebrities: read fan-out — store one post event; notification feeds are assembled lazily when followers open the app, pulling recent posts from followed celebrities. This prevents a single post from generating 50M Kafka produces in milliseconds. The threshold is configurable and typically 1–5M followers.

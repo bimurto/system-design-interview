@@ -12,11 +12,30 @@ A URL shortener like bit.ly converts long URLs into 6–8 character codes and re
 |---|---|
 | Total URLs stored | 100 million |
 | Daily redirects | 10 billion |
-| Peak read RPS | 115,000 |
-| Peak write RPS | 1,150 |
+| Peak read RPS | 115,000 (sustained); up to 580,000 at 5× burst |
+| Peak write RPS | 1,150 (sustained); up to 3,500 at 3× burst |
 | Read:write ratio | 100:1 |
 
 At 115K RPS, a single Postgres server would be saturated by reads alone (typical: 5–10K RPS with index lookups). The solution is a read cache in Redis that absorbs 99%+ of traffic.
+
+---
+
+## Clarifying Requirements (3–5 min)
+
+Before jumping to design, force agreement on scope. These are the questions an interviewer expects you to ask:
+
+| Question | Why it matters |
+|---|---|
+| Who creates short URLs — authenticated users or anonymous? | Auth adds a user table, per-user quotas, and ownership-based deletion |
+| Does the same long URL always produce the same short code? | Dedup on input URL changes the write path (lookup before insert) |
+| What is the expected URL volume and redirect traffic? | Drives sharding, caching tier size, and CDN strategy |
+| Do shortened URLs expire? | Adds `expires_at` column, background cleanup job, and cache TTL logic |
+| Is analytics required (click counts, geo, device)? | Drives analytics pipeline complexity (Redis INCR vs. Kafka streaming) |
+| Does the system need to support custom aliases (`/my-brand`)? | Custom codes bypass the auto-increment path and need conflict detection |
+| What is the availability SLA? | Determines whether a single Postgres region is acceptable or multi-region active-active is required |
+| Should we detect malicious URLs (phishing, malware)? | Adds a Safe Browsing API integration on the write path |
+
+**Scope for this design:** anonymous shortening, no input URL dedup, 100M stored URLs, 10B redirects/day, optional expiry, click-count analytics, custom aliases, 99.99% read availability. No real-time geo analytics for this pass.
 
 ---
 
@@ -37,14 +56,23 @@ At 115K RPS, a single Postgres server would be saturated by reads alone (typical
 
 ### Capacity Estimation
 
+Back-of-envelope math for the design justification — do this explicitly in the interview.
+
 | Metric | Calculation | Result |
 |---|---|---|
-| Write RPS | 100M URLs / (3 years × 365d × 86400s) | ~1,000 RPS |
-| Read RPS | 10B redirects / 86400s | ~115,000 RPS |
-| Storage/URL | 500 bytes (URL avg 200b + metadata) | — |
-| Total storage | 100M × 500B | 50 GB |
-| Bandwidth (reads) | 115K × 500B | ~57 MB/s |
-| Redis memory | 10M hot URLs × 300B | ~3 GB |
+| Write RPS (sustained) | 100M URLs / (3 years × 365d × 86400s) | ~1,060 RPS |
+| Write RPS (peak, 3× burst) | 1,060 × 3 | ~3,200 RPS |
+| Read RPS (sustained) | 10B redirects / 86400s | ~115,750 RPS |
+| Read RPS (peak, 5× burst) | 115,750 × 5 | ~580,000 RPS |
+| Read:write ratio | — | 100:1 |
+| Storage per URL | URL avg 200B + short_code 8B + metadata + index overhead | ~500 B |
+| Total DB storage | 100M × 500B | ~50 GB |
+| Storage growth rate | 1,060 writes/s × 500B × 86400s | ~46 GB/year |
+| Outbound bandwidth (redirects) | 115K × 500B (302 header response) | ~57 MB/s |
+| Redis working set | Top 10M hot URLs × 300B/entry | ~3 GB |
+| Cache hit rate target | 99%+ | Postgres sees < 1,150 RPS |
+
+**Key insight for the interview:** 50 GB fits comfortably on a single Postgres node with read replicas. Sharding is not needed until ~1B URLs (~500 GB). The bottleneck is reads (115K RPS), not storage — solved by Redis caching, not by partitioning.
 
 ---
 
@@ -89,7 +117,7 @@ Take `md5(url)[:7]` and use as the code. Pros: stateless, no DB round-trip to ge
 Insert the URL, take the auto-increment ID, encode as base62. ID 1 → `"1"`, ID 1000 → `"g8"`, ID 1 billion → `"15FTGg"`. Pros: zero collisions, compact, fast. Cons: predictable (sequential codes can be enumerated by crawlers). In practice, bit.ly uses this approach but adds a private salt or epoch offset to obscure the sequence.
 
 **Option C: Snowflake-style ID (Twitter's approach)**
-64-bit integer: `timestamp_ms (41b) | machine_id (10b) | sequence (12b)`. Encode as base62. Pros: globally unique, no coordination, time-sortable, unpredictable without knowing the epoch. Cons: requires clock synchronisation; clock drift on one machine can produce duplicate IDs (mitigated by refusing to generate IDs while clock is behind last-seen timestamp).
+64-bit integer: `timestamp_ms (41b) | datacenter_id (5b) | machine_id (5b) | sequence (12b)`. Encode as base62. Pros: globally unique, no coordination, time-sortable, unpredictable without knowing the epoch. Cons: requires clock synchronisation; clock drift on one machine can produce duplicate IDs (mitigated by refusing to generate IDs while clock is behind last-seen timestamp).
 
 **Production choice:** most large systems use option B (sequential) with a base62 encoding, accepting that codes are technically guessable but adding rate limiting to prevent bulk enumeration.
 
@@ -118,6 +146,43 @@ Naive approach: `UPDATE urls SET hits = hits + 1 WHERE code = ?` on every redire
 3. Redis counter is reset (or decremented) after flush
 
 This converts 115K writes/second (per-redirect DB writes) into ~1 batch write per minute. The trade-off: hit counts are approximate (up to 60 seconds stale). For a URL shortener, this is perfectly acceptable. For billing or fraud detection, you'd use a stronger consistency model.
+
+### 4. Failure Modes and Resilience
+
+This is often where senior/staff interview questions go deep. Know each failure scenario before the interview.
+
+**Scenario A: Redis goes down (cache layer unavailable)**
+
+Every redirect falls through to Postgres. With 115K sustained RPS and Postgres handling maybe 10K RPS at indexscan speed, requests will queue and then time out. The thundering herd makes it worse: when Redis restarts with an empty cache, all in-flight requests simultaneously miss and hammer Postgres.
+
+Mitigations:
+- **Request coalescing (mutex/singleflight):** only the first goroutine/thread for a given cache key issues a Postgres query; the rest wait and share the result. Reduces fan-out from N concurrent misses to 1 per key.
+- **Cache warm-up on restart:** a startup script pre-populates the top N hot URLs by querying `SELECT short_code, original FROM urls ORDER BY hits DESC LIMIT 100000` before opening traffic.
+- **Circuit breaker on Redis:** if Redis is unhealthy, route reads directly to Postgres read replicas (degraded mode), shedding non-critical traffic via load shedding to stay under DB capacity.
+- **Redis Sentinel / Cluster:** automatic failover to a replica in <30s. Redis Cluster shards keys across nodes, eliminating single-node SPOF.
+
+**Scenario B: Postgres primary goes down (write path unavailable)**
+
+Reads continue if Redis is warm — this is why the 99.99% SLA applies to reads only. Writes fail until the replica is promoted (streaming replication lag determines data loss window, typically <1s with synchronous_commit=on).
+
+For zero-RPO on writes, use a synchronous replica (`synchronous_commit = remote_apply`) at the cost of ~1ms added write latency.
+
+**Scenario C: Hot key (viral link)**
+
+A single short code receives 100K+ RPS (e.g., a viral tweet with a bit.ly link). Redis handles high single-key read throughput well (~100K GET/s on a single shard), but a single Redis shard at that rate risks CPU saturation.
+
+Mitigations:
+- **CDN edge caching:** the most effective solution. A viral URL served from CDN PoPs means 0 requests reach Redis or Postgres.
+- **Local in-process cache (L1):** each app server caches the top 1,000 codes in a local LRU dict with a 5-second TTL. Eliminates Redis round-trips entirely for the hottest keys.
+- **Redis read replicas:** replicate the keyspace across multiple Redis read nodes; route reads via consistent hashing.
+
+**Scenario D: Redirect loop / malicious URL**
+
+A short URL pointing to another short URL on the same domain creates a redirect loop. Detect this at write time: before inserting, fetch the first redirect of the submitted URL (with a 1-hop HEAD request) and reject if it resolves to the same domain. Additionally, integrate Google Safe Browsing API: the write path submits the URL asynchronously and marks it `is_flagged = true` if it returns a malware/phishing match.
+
+**Scenario E: Thundering herd after schema migration or cache flush**
+
+During a planned maintenance window (e.g., Redis FLUSHALL before upgrading), the first wave of requests post-maintenance will miss the cache entirely and concentrate on Postgres. Mitigation: use a cache pre-warming script before cutting traffic, and use a gradual rollout (shift 5% of traffic initially, monitor Postgres connection count, then increase).
 
 ---
 
@@ -153,14 +218,16 @@ docker compose ps   # wait until web shows healthy
 python experiment.py
 ```
 
-The script runs six phases automatically:
+The script runs eight phases automatically:
 
 1. **Bulk create:** POST 1,000 URLs, measure throughput, inspect generated codes
 2. **Cache latency:** request same URLs cold (Postgres) then warm (Redis), compare P50/P99
 3. **Base62 demo:** show how sequential IDs 1–100M map to increasingly longer codes
 4. **Cache warm-up curve:** 500 requests with Zipf distribution, watch hit rate climb from 0% to 80%+
-5. **ID strategies:** live demonstration of hash, sequential, and Snowflake-style ID generation
-6. **Birthday paradox:** calculate collision probability for hash-based IDs at various URL counts
+5. **Hit counting:** Redis INCR vs naive per-redirect Postgres UPDATE
+6. **ID strategies:** live demonstration of hash, sequential, and Snowflake-style ID generation
+7. **Birthday paradox:** calculate collision probability for hash-based IDs at various URL counts
+8. **Thundering herd:** flush Redis cache, fire concurrent redirects, measure latency spike and recovery
 
 ### Break It
 
@@ -223,7 +290,7 @@ docker compose down -v
    A: Per-redirect `UPDATE` would saturate Postgres at high RPS. Use Redis `INCR` to count redirects in memory, then a background worker flushes to Postgres every 60 seconds. For real-time analytics dashboards, stream click events to Kafka → Flink/Spark aggregation → OLAP store (ClickHouse). The click log enables segmentation by geography, device, referrer.
 
 6. **Q: What if a URL goes viral and all traffic hits the same short code?**
-   A: This is the "hot key" problem. Redis handles high single-key read throughput well (~100K GET/s per shard). If viral traffic exceeds Redis capacity, replicate that specific key across multiple Redis nodes (key replication or read replicas). CDN caching is more effective: a viral URL cached at CDN PoPs means 0 requests reach the origin.
+   A: This is the "hot key" problem. Redis handles high single-key read throughput well (~100K GET/s per shard). If viral traffic exceeds Redis capacity, replicate that specific key across multiple Redis nodes (key replication or read replicas). CDN caching is more effective: a viral URL cached at CDN PoPs means 0 requests reach the origin. For extreme cases, add a local in-process LRU cache (L1) per app server for the top 1,000 codes with a 5-second TTL — this eliminates the Redis round-trip entirely for the hottest keys.
 
 7. **Q: How would you shard Postgres when 50GB is no longer enough?**
    A: Shard by short code prefix (first 1–2 characters, 62 values → 62 shards). Each shard owns a range of codes. A routing layer hashes the code to find the correct shard. Alternatively, shard by user (each user's URLs on one shard) for multi-tenant deployments. Range sharding on code is simpler to reason about but requires careful capacity planning.
@@ -236,3 +303,9 @@ docker compose down -v
 
 10. **Q: Walk me through the complete flow when a user clicks a short link.**
     A: (1) Browser sends `GET /abc123` to CDN edge. (2) If CDN has it cached (`Cache-Control: max-age=3600`), CDN responds with 302 directly — origin never sees the request. (3) On CDN miss, request reaches load balancer → Flask instance. (4) Flask checks Redis for `url:abc123`. (5) Redis hit: return 302 with original URL, set `Cache-Control` header. (6) Redis miss: query Postgres by index scan on `short_code`. (7) Populate Redis with 24h TTL. (8) Return 302. Total latency: CDN hit <5ms, Redis hit <10ms, Postgres miss <50ms.
+
+11. **Q: What happens to reads if Redis goes down?**
+    A: All redirects fall through to Postgres. At 115K RPS, Postgres (capacity ~10K RPS) will be immediately overwhelmed. The thundering herd compounds this: when Redis restarts with an empty cache, all in-flight requests simultaneously miss. Mitigations in order of effectiveness: (1) Redis Sentinel/Cluster for automatic failover; (2) request coalescing so only one thread queries Postgres per cache key; (3) cache warm-up script that pre-populates the top 100K hot URLs from Postgres before opening traffic; (4) circuit breaker that sheds non-critical traffic to stay under DB capacity.
+
+12. **Q: How do you handle the thundering herd after a planned cache flush?**
+    A: Never flush during peak traffic. Use a rolling warm-up: before cutting traffic post-maintenance, run `SELECT short_code, original FROM urls ORDER BY hits DESC LIMIT 100000` and pre-populate Redis. Then gradually shift traffic (5% → 20% → 100%), watching Postgres `pg_stat_activity` for connection saturation at each step.

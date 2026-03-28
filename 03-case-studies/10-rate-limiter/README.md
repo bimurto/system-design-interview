@@ -80,10 +80,10 @@ Baseline: Stripe-scale — 100K API RPS, 1M active API keys, 10s fixed window.
               │
        allowed / denied
               │
-   ┌──────────┴──────────┐
-   │  200 OK             │  or  │  429 Too Many Requests
-   │  X-RateLimit-*      │      │  Retry-After header
-   └─────────────────────┘      └─────────────────────────
+   ┌──────────────────────┐      ┌───────────────────────────┐
+   │  200 OK              │  or  │  429 Too Many Requests    │
+   │  X-RateLimit-*       │      │  Retry-After header       │
+   └──────────────────────┘      └───────────────────────────┘
 ```
 
 **Redis** holds the shared counters. Each counter is a Redis string key: `ratelimit:{api_key}:{window_number}`. The key auto-expires after the window duration, requiring no cleanup job.
@@ -167,6 +167,8 @@ When Redis is unavailable, every API server faces a binary choice:
 - Approximate global enforcement without full outage
 - Complexity: N must be known and consistent
 
+**Automatic recovery:** On each request while in fail-open mode, the server probes Redis. When Redis comes back, rate limiting resumes immediately with no operator action. An alternative is a background thread that polls Redis every few seconds and re-registers the Lua script on reconnect.
+
 ### 4. Multi-Tier Rate Limiting
 
 Production systems layer multiple rate limits:
@@ -203,7 +205,37 @@ rate = prev_window_count × (seconds_since_window_start / window_size)
 
 Uses 2 Redis keys per limit (current and previous window). Redis memory: 2× fixed window. Error rate vs a true sliding window: < 0.003% in practice. Used by Cloudflare for their global rate limiter (published 2023 blog post).
 
-**Token bucket (Stripe's approach):** more flexible for burst handling. A key accumulates tokens at rate R/second up to a bucket capacity B. A request consumes 1 token. Allows short bursts (B tokens) while enforcing an average rate (R/second). Implemented in Redis with `LPUSH` timestamps or with a counter + last_refill_time.
+**Token bucket (Stripe's approach):** more flexible for burst handling. A key accumulates tokens at rate R/second up to a bucket capacity B. A request consumes 1 token. Allows short bursts (B tokens) while enforcing an average rate (R/second). Implemented in Redis with two fields: `tokens` (current bucket fill level) and `last_refill` (Unix timestamp of last refill). On each request, compute `elapsed = now - last_refill`, add `elapsed × R` tokens (capped at B), then consume 1 token if available.
+
+### 6. Token Bucket in Redis (Implementation Detail)
+
+The token bucket requires reading two fields, computing new state, and writing back — all atomically. A Lua script handles this:
+
+```lua
+local tokens_key = KEYS[1]
+local last_key   = KEYS[2]
+local rate       = tonumber(ARGV[1])  -- tokens per second
+local capacity   = tonumber(ARGV[2])  -- max bucket size
+local now        = tonumber(ARGV[3])
+
+local last_refill = tonumber(redis.call("GET", last_key) or now)
+local tokens      = tonumber(redis.call("GET", tokens_key) or capacity)
+
+local elapsed  = now - last_refill
+local refill   = elapsed * rate
+tokens = math.min(capacity, tokens + refill)
+
+if tokens >= 1 then
+    tokens = tokens - 1
+    redis.call("SET", tokens_key, tokens, "EX", 3600)
+    redis.call("SET", last_key,   now,    "EX", 3600)
+    return 1  -- allowed
+else
+    return 0  -- denied
+end
+```
+
+This uses two Redis keys per rate-limited entity and a Lua script for atomicity — the same pattern as fixed-window, but computing time-based refill instead of window-id rollover.
 
 ---
 
@@ -229,26 +261,26 @@ Source: Stripe Engineering Blog "Scaling your API with Rate Limiters" (2015); Cl
 ```bash
 cd system-design-interview/03-case-studies/10-rate-limiter/
 docker compose up -d
-# Wait ~30s for all services to be healthy
+# Wait ~60s for all services to be healthy (pip install runs on first start)
 docker compose ps
 ```
 
 ### Experiment
 
 ```bash
-# Run from host (no container needed — talks to exposed ports)
-pip install  # no extra deps — uses stdlib only
+# Run from host (no extra pip installs needed — uses stdlib only)
 python experiment.py
 ```
 
-The script runs 6 phases:
+The script runs 7 phases:
 
 1. **Global limit:** 15 requests through Nginx → 10 pass, 5 blocked (429)
 2. **Local vs global:** same key hits api1 and api2 directly → global counter still enforces
 3. **429 headers:** show X-RateLimit-Limit and X-RateLimit-Remaining per request
-4. **Fail-open:** instructions to stop Redis and observe fail-open behavior
+4. **Fail-open + auto-recovery:** stop Redis, observe fail-open, restart Redis, observe automatic resumption
 5. **Per-key limits:** trial=3, standard=10, premium=50 — verified
-6. **Algorithm comparison:** fixed/sliding/token bucket trade-off table
+6. **Boundary attack:** live demo of fixed-window double-rate exploit at window rollover
+7. **Sliding window formula:** O(1) approximation with live numbers and algorithm comparison table
 
 ### Break It
 
@@ -276,9 +308,9 @@ for i in range(20):
 
 ```bash
 docker compose stop redis
-# Now send requests — they should all pass with redis_available=false
+# Now send requests — they should all pass with X-Redis-Available: False
 curl http://localhost:8001/api/data?key=test
-# Restart
+# Restart — rate limiting resumes automatically, no server restart required
 docker compose start redis
 ```
 
@@ -290,6 +322,9 @@ docker compose exec redis redis-cli keys "ratelimit:*"
 
 # Watch a counter in real time
 watch -n1 "docker compose exec redis redis-cli get 'ratelimit:anonymous:$(python3 -c \"import time; print(int(time.time())//10)\")'"
+
+# See all active counters and TTLs via the stats endpoint
+curl -s http://localhost:8001/stats | python3 -m json.tool
 ```
 
 ### Teardown
@@ -309,7 +344,7 @@ docker compose down -v
    A: INCR and GET are separate commands — a race condition exists between them. Two concurrent requests both read count=9, both check 9 < 10, both proceed to INCR → count becomes 11. Lua scripts execute atomically on the Redis server: no other command runs between the INCR and the limit check. Redis is single-threaded for script execution.
 
 3. **Q: What happens when Redis is down? Should you fail open or closed?**
-   A: Depends on the API's security requirements. Fail-open (allow all traffic) preserves availability — a Redis blip doesn't cause user-visible errors. Used by most public APIs. Fail-closed (block all traffic) prevents abuse during outages — required for financial or security-critical endpoints. A hybrid approach uses a local in-memory counter as a fallback (each server enforces limit/N).
+   A: Depends on the API's security requirements. Fail-open (allow all traffic) preserves availability — a Redis blip doesn't cause user-visible errors. Used by most public APIs. Fail-closed (block all traffic) prevents abuse during outages — required for financial or security-critical endpoints. A hybrid approach uses a local in-memory counter as a fallback (each server enforces limit/N). With automatic recovery, the server probes Redis on every fail-open request and resumes rate limiting the moment Redis comes back.
 
 4. **Q: What is the fixed window boundary problem?**
    A: A client can send 2× the rate limit in a short period by making L requests at the end of one window and L requests at the start of the next. Both windows see exactly L requests and allow them — but in the 2× window_size seconds between them, 2L requests passed. Sliding window counter fixes this by weighting the previous window's count by the fraction of time elapsed.
@@ -331,3 +366,9 @@ docker compose down -v
 
 10. **Q: Walk me through a Stripe API request that gets rate limited.**
     A: (1) Client sends POST /v1/charges with API key sk_live_xxx. (2) API server extracts key from Authorization header. (3) Server executes Lua script: INCR ratelimit:sk_live_xxx:{window}. (4) Redis returns count=101. Limit for this key is 100. (5) Server returns 429 with headers: X-RateLimit-Limit=100, X-RateLimit-Remaining=0, Retry-After=7 (seconds until window resets). (6) Client SDK reads Retry-After, sleeps 7 seconds, retries. (7) Next window: count=1 → allowed.
+
+11. **Q: How do you implement a token bucket in Redis atomically?**
+    A: Store two fields per key: `tokens` (current fill level) and `last_refill` (Unix timestamp). On each request, run a Lua script that reads both, computes elapsed time, refills tokens at rate R up to capacity B, then consumes 1 token if available and writes back — all atomically. The Lua script prevents the TOCTOU race between reading the current token count and writing the decremented value.
+
+12. **Q: How do sliding window counter and token bucket compare for a burstable API?**
+    A: Both use O(1) Redis memory. Sliding window counter approximates a rolling sum over the last N seconds — it smooths boundary spikes but does not explicitly model burst capacity. Token bucket explicitly allows bursting up to B tokens accumulated during idle periods, then enforces average rate R. For an API where clients legitimately batch requests occasionally, token bucket is more permissive and feels more natural. Sliding window counter is simpler to implement and reason about at scale (Cloudflare's choice).

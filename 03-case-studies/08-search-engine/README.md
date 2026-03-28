@@ -33,6 +33,7 @@ Before drawing any architecture, scope the problem explicitly. Interviewers rewa
 - Personalization? Same query can return different results for different users.
 - Near-real-time indexing (seconds) or batch (hours)?
 - Do we need to support phrase queries (`"machine learning"`) and proximity queries?
+- Semantic / vector search (meaning-based) or keyword-only?
 
 **Non-functional scope questions:**
 - Latency target: P99 < 100ms? At what RPS?
@@ -193,6 +194,8 @@ BM25(t,d) = IDF(t) × (tf × (k1+1)) / (tf + k1 × (1 - b + b × |d|/avgdl))
 
 **Near-real-time indexing:** Lucene's `IndexWriter` flushes in-memory buffers to a new searchable segment every 1 second by default (configurable via `refresh_interval`). The segment is searchable immediately after flush — before `fsync`. Full durability uses fsync on a longer interval (5s default in Elasticsearch). This gives ~1s indexing latency with minimal I/O overhead.
 
+**refresh_interval trade-off for bulk loads:** setting `refresh_interval=-1` disables automatic refresh during a bulk load. Elasticsearch no longer creates many small segments per second, yielding 3–10× higher ingest throughput. The production pattern: set `-1` before loading, restore to `1s` and call `_forcemerge` when done.
+
 ### 4.4 Query Understanding: Spell Correction and Query Expansion
 
 **Spell correction:**
@@ -257,6 +260,35 @@ BM25(t,d) = IDF(t) × (tf × (k1+1)) / (tf + k1 × (1 - b + b × |d|/avgdl))
 - Elasticsearch uses a distributed consensus mechanism (similar to Raft via Zen Discovery / Cluster State Manager) to elect a single primary per shard. A quorum of master-eligible nodes must agree.
 - Write fencing: Elasticsearch uses `sequence numbers` (per-shard monotonic counters) and `primary terms` to detect and reject writes from stale primaries after a partition heals.
 
+### 4.7 Vector Search and Semantic Retrieval (Modern FAANG Requirement)
+
+Keyword search fails on semantic intent: a query for "fast car" misses documents about "high-speed vehicles." Vector search addresses this by encoding both queries and documents as dense vectors and retrieving by similarity.
+
+**How it works:**
+1. **Embedding model** (e.g., BERT, sentence-transformers, OpenAI `text-embedding-ada-002`) encodes each document chunk into a dense vector of 768–1536 dimensions.
+2. At query time, the query is encoded into the same vector space.
+3. **Approximate Nearest Neighbor (ANN)** search finds the top-K most similar document vectors by cosine similarity or dot product.
+
+**ANN algorithms:**
+- **HNSW (Hierarchical Navigable Small World):** graph-based index. Each node connects to M neighbors at multiple layers. Query traverses the graph greedily. O(log N) expected query time; build time is O(N log N). Used by Elasticsearch `dense_vector` field, pgvector, Milvus, Weaviate.
+- **IVF-PQ (Inverted File + Product Quantization):** clusters vectors into Voronoi cells (IVF), then compresses residuals with product quantization. Lower memory than HNSW; slightly lower recall. Used by FAISS.
+- **Recall vs. latency trade-off:** ANN algorithms trade recall for speed. HNSW at `ef_search=100` achieves ~95% recall at ~5ms for 10M vectors; increasing `ef_search` raises recall toward 100% at higher latency cost.
+
+**Hybrid search (keyword + vector):**
+- BM25 and ANN retrieval have complementary failure modes: BM25 misses semantic matches; ANN misses exact keyword matches.
+- **Reciprocal Rank Fusion (RRF):** `score(d) = Σ 1/(k + rank_i(d))` across result lists from each retriever. Simple, parameter-free, and empirically strong.
+- Production systems (Google, Bing, Amazon) use hybrid retrieval as the standard approach. BM25 handles navigational/exact queries; vector retrieval handles conversational/semantic queries.
+
+**Retrieval-Augmented Generation (RAG):**
+- Modern search-adjacent systems retrieve top-K chunks via hybrid search, then pass them as context to an LLM to synthesize an answer.
+- Vector store is the retrieval backbone: chunk documents → embed → store in HNSW index → query at read time.
+- Relevant at FAANG interviews when the question involves "AI-powered search" or "question answering over documents."
+
+**Scale challenges for vector search:**
+- A 1T-document corpus with 768-dimensional float32 vectors = ~3 PB of raw embedding storage (768 × 4 bytes × 1T). Product quantization reduces this 8–32×.
+- HNSW graphs are memory-resident for fast traversal; IVF-PQ is more disk-friendly.
+- **Sharding strategy:** unlike inverted indexes (shard by document hash), vector indexes benefit from clustering-aware sharding: documents with similar embeddings on the same shard → higher intra-shard recall → fewer shards to query per request.
+
 ---
 
 ## How It Actually Works
@@ -272,13 +304,13 @@ From the Elasticsearch "Inside the Architecture" series:
 
 **Lucene** (Apache): the open-source library underlying Elasticsearch, Solr, and many commercial systems. Key abstractions: `IndexWriter` (build), `IndexSearcher` (query), `Analyzer` (tokenize/normalize), `Similarity` (BM25 scoring), `Codec` (compressed segment format). 25+ years old and still the dominant full-text search library.
 
-Source: Dean & Ghemawat "MapReduce: Simplified Data Processing on Large Clusters" (OSDI 2004); Page et al. "The PageRank Citation Ranking" (1998); Elasticsearch "How Full-Text Search Works" (2024 docs); Lucene in Action (2nd ed.); Elasticsearch distributed IDF blog (2014).
+Source: Dean & Ghemawat "MapReduce: Simplified Data Processing on Large Clusters" (OSDI 2004); Page et al. "The PageRank Citation Ranking" (1998); Elasticsearch "How Full-Text Search Works" (2024 docs); Lucene in Action (2nd ed.); Elasticsearch distributed IDF blog (2014); Malkov & Yashunin "Efficient and robust approximate nearest neighbor search using HNSW" (2018).
 
 ---
 
 ## Hands-on Lab
 
-**Time:** ~25 minutes
+**Time:** ~30 minutes
 **Services:** `elasticsearch` (8.13.4), `indexer` (Python)
 
 ### Setup
@@ -342,6 +374,21 @@ curl -X GET "http://localhost:9200/products/_search?search_type=dfs_query_then_f
   -H 'Content-Type: application/json' -d '{"query": {"match": {"title": "premium"}}}'
 ```
 
+**Measure refresh_interval impact manually:**
+
+```bash
+# Check current segment count
+curl -s "http://localhost:9200/products/_stats/segments" | python3 -m json.tool | grep '"count"'
+
+# Disable refresh and bulk index 1000 more docs, then re-enable
+curl -X PUT "http://localhost:9200/products/_settings" \
+  -H 'Content-Type: application/json' -d '{"index": {"refresh_interval": "-1"}}'
+# ... index docs ...
+curl -X PUT "http://localhost:9200/products/_settings" \
+  -H 'Content-Type: application/json' -d '{"index": {"refresh_interval": "1s"}}'
+curl -X POST "http://localhost:9200/products/_refresh"
+```
+
 ### Observe
 
 ```bash
@@ -378,7 +425,7 @@ docker compose down -v
    A: BM25 IDF requires knowing the global document frequency of a term across all shards. Each shard only knows its local `df`. For rare terms (low `df`), local IDF estimates can deviate significantly across shards, causing ranking inconsistencies. Solutions: (1) `dfs_query_then_fetch` — coordinator collects per-term `df` from all shards first (extra round-trip, ~5ms overhead); (2) accept the approximation for large corpora where local IDF converges to global IDF statistically.
 
 5. **Q: How do you handle near-real-time indexing?**
-   A: Lucene's IndexWriter flushes to a new in-memory segment periodically (default: every 1 second in Elasticsearch). The segment is searchable immediately after flush — before fsync. Full disk durability uses fsync on a longer interval (5s default). The `refresh_interval` setting controls this trade-off: setting it to `-1` during bulk indexing improves throughput 5–10× at the cost of searchability during the load.
+   A: Lucene's IndexWriter flushes to a new in-memory segment periodically (default: every 1 second in Elasticsearch). The segment is searchable immediately after flush — before fsync. Full disk durability uses fsync on a longer interval (5s default). The `refresh_interval` setting controls this trade-off: setting it to `-1` during bulk indexing improves throughput 3–10× at the cost of searchability during the load.
 
 6. **Q: What is field boosting and when do you use it?**
    A: Field boosting multiplies the BM25 score for matches in that field. `title^3` means a title match scores 3× as high as a body match. Used when some fields are inherently more important (product title vs description, article headline vs body). In production, boost values are often learned via LTR rather than set by hand, because hand-tuned boosts rarely generalize across query types.
@@ -400,3 +447,6 @@ docker compose down -v
 
 12. **Q: What happens when a very popular term (like "javascript") is queried?**
     A: Its posting list may have tens of millions of entries. Lucene uses the **Block WAND** (Weak AND) algorithm: posting lists are traversed in sorted order and candidates below a dynamic minimum score threshold are skipped using skip lists embedded in the posting list structure. This reduces the number of docs fully scored from O(posting list size) to O(results needed), making popular-term queries viable at low latency.
+
+13. **Q: What is vector search and when would you use it instead of BM25?**
+    A: Vector search encodes documents and queries as dense embeddings (768–1536 float32 dimensions) using a neural model (BERT, sentence-transformers). At query time, Approximate Nearest Neighbor (ANN) search — typically HNSW — retrieves the K documents with highest cosine similarity. Use vector search when semantic intent matters: "how to reduce latency" should match documents about "performance optimization" even if those exact words don't appear. BM25 handles exact keyword matches better; vector search handles paraphrase and intent. Production systems use **hybrid retrieval**: run both BM25 and ANN independently, then fuse results with Reciprocal Rank Fusion (RRF): `score(d) = Σ 1/(k + rank_i(d))`. HNSW recall at 95% requires ~5ms for 10M vectors — feasible within a 100ms budget alongside BM25 retrieval.

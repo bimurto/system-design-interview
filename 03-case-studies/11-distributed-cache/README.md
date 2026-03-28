@@ -6,12 +6,11 @@
 
 ## The Problem at Scale
 
-Twitter caches 40TB of data in Redis. Discord handles 5 million messages per second with Redis as their primary hot store. At this scale, understanding Redis internals — not just the API — determines whether your cache survives production.
+Twitter caches 40TB of data in Redis. Discord handles millions of messages per second with Redis as their primary hot store. At this scale, understanding Redis internals — not just the API — determines whether your cache survives production.
 
 | Metric | Value |
 |---|---|
 | Twitter Redis cluster | ~40TB total, thousands of nodes |
-| Discord messages/second | 5 million |
 | Redis ops/second (single node) | ~500K (simple operations) |
 | Redis pipeline throughput | 10-100× higher |
 | Typical P99 GET latency | 0.1–0.5ms |
@@ -85,7 +84,7 @@ The challenge: Redis is fast in isolation. At scale, you hit limits — single-t
 
 Redis is single-threaded for command processing (as of Redis 6, I/O is multithreaded, but command execution is still single-threaded per instance). This seems like a limitation but is actually a strength:
 
-**No lock contention:** hash tables, sorted sets, and other data structures are accessed from a single goroutine. No mutex, no CAS, no cache-line ping-pong. The data structure operations are pure, fast, and lock-free.
+**No lock contention:** hash tables, sorted sets, and other data structures are accessed from a single thread. No mutex, no CAS, no cache-line ping-pong. The data structure operations are pure, fast, and lock-free.
 
 **Predictable latency:** a single-threaded event loop (epoll/kqueue) processes commands in FIFO order. P99 latency is bounded by the longest single command. Avoid O(N) commands (KEYS *, SMEMBERS large-set) which block the event loop.
 
@@ -110,8 +109,9 @@ When `maxmemory` is set and Redis is full, it must evict a key before accepting 
 | Policy | Best For |
 |---|---|
 | `allkeys-lru` | General cache (most common choice) |
-| `allkeys-lfu` | Workloads with hot/cold key patterns |
+| `allkeys-lfu` | Workloads with hot/cold key patterns (viral content) |
 | `volatile-lru` | Mixed cache+persistent data (only evict TTL-bearing keys) |
+| `volatile-lfu` | Mixed use with hot/cold patterns and persistent keys |
 | `volatile-ttl` | When you want short-lived keys evicted first |
 | `noeviction` | When you CANNOT lose data (use with monitoring) |
 
@@ -153,7 +153,44 @@ When `maxmemory` is set and Redis is full, it must evict a key before accepting 
 
 **HyperLogLog:** 12KB of memory for any cardinality estimate with < 1% error. Twitter uses HyperLogLog to count unique impressions per tweet without storing 1TB of user IDs.
 
-### 5. Cluster Resharding: Hash Slot Migration with Zero Downtime
+### 5. Cache Write Strategies: Cache-Aside, Write-Through, Write-Behind
+
+How data flows between your application, cache, and database is as important as what you cache.
+
+**Cache-aside (lazy loading):**
+- Read: check cache → on miss, read from DB → populate cache → return.
+- Write: write directly to DB, invalidate (or update) the cache entry.
+- Pro: only cached data that is actually read enters the cache; no wasted memory.
+- Con: cache miss on cold start or after expiry causes a DB read on every request until the key is repopulated. Risk of thundering herd on popular keys.
+- Use case: the default pattern for most read-heavy services (Twitter timelines, product pages).
+
+**Write-through:**
+- Write: write to cache and DB synchronously in the same request.
+- Read: always hits cache (no cold misses after first write).
+- Pro: cache is always consistent with DB; no stale reads.
+- Con: write latency increases (must wait for both cache and DB). Writes for data never read still populate cache (wasted memory).
+- Use case: session stores, user preference data — small, frequently read after write.
+
+**Write-behind (write-back):**
+- Write: write to cache only; DB write is asynchronous (background flush).
+- Read: always hits cache.
+- Pro: write latency is sub-millisecond (only cache write in the hot path). Batches DB writes for efficiency.
+- Con: data in cache but not yet in DB is lost on cache node failure. Requires a durable write queue (e.g., Redis AOF or a separate queue).
+- Use case: high-write workloads where some data loss is tolerable (analytics counters, like counts).
+
+**Refresh-ahead:**
+- Pro-actively reload cache entries before they expire, based on predicted access patterns.
+- Con: complex to implement; may reload data that is never accessed again.
+
+**Interview decision matrix:**
+
+| Strategy | Read latency | Write latency | Consistency | Data loss risk |
+|---|---|---|---|---|
+| Cache-aside | High on miss | Low | Eventual | None (DB is source) |
+| Write-through | Low | High | Strong | None |
+| Write-behind | Low | Very low | Eventual | Yes (unflushed writes) |
+
+### 6. Cluster Resharding: Hash Slot Migration with Zero Downtime
 
 When adding a new node to a Redis Cluster, hash slots must be migrated from existing nodes to the new node. Redis does this with zero downtime:
 
@@ -171,7 +208,7 @@ Key insight: migration is done key-by-key, not slot-at-a-time. A slot with 1M ke
 
 **Twitter's 40TB Redis** (QCon 2014 talk by Yao Yu): Twitter runs Redis for timeline caching, session storage, and rate limiting. They use `allkeys-lfu` policy for timeline caches (viral tweets are accessed constantly and should never be evicted). They run thousands of Redis instances across multiple data centers, with automatic failover via Zookeeper.
 
-**Discord's "How Discord Stores Billions of Messages"** (blog post, 2017): Discord initially used Redis for message storage. Redis sorted sets stored message IDs per channel (ZADD); message content in Redis hashes. As Discord grew to 100M daily active users, they migrated to Cassandra for long-term message storage while keeping Redis for the "hot" recent messages (last 50 per channel). Their Redis cluster processes 5M messages/second using pipelining and connection pooling.
+**Discord's message caching** (Engineering Blog, 2017): Discord used Redis for hot message storage — sorted sets stored message IDs per channel; message content in Redis hashes. As Discord grew to 100M daily active users, they migrated long-term message storage to Cassandra while keeping Redis for the most recent messages per channel (cache-aside pattern). Their Redis cluster processed millions of reads per second using pipelining and connection pooling.
 
 Key insight from both: Redis's bottleneck at scale is network throughput and connection count, not CPU. Pipelining and connection pooling are the first optimizations to make.
 
@@ -206,14 +243,15 @@ docker run --rm --network 11-distributed-cache_default \
   python:3.11-slim sh -c "pip install redis --quiet && python /experiment.py"
 ```
 
-The script runs 6 phases:
+The script runs 7 phases:
 
 1. **Pipeline:** 1000 individual GETs vs 1000 pipelined GETs — show speedup
-2. **Eviction:** fill redis-1 past maxmemory=2MB → show LRU eviction
+2. **Eviction:** fill redis-1 past maxmemory → show LRU eviction, hot vs cold key survival
 3. **Pub/sub:** 3 subscribers, publisher sends 20 messages — all receive all
 4. **Distributed lock:** acquire/release/contest with Lua script
 5. **RDB snapshot:** BGSAVE timing with 5,000 pre-filled keys
-6. **Cluster slots:** show hash slot → node mapping for sample keys
+6. **Cluster slots:** show hash slot → node mapping, hash tag co-location, CROSSSLOT error
+7. **Hot key problem:** uneven load simulation and mitigation strategies
 
 ### Break It
 
@@ -299,3 +337,6 @@ docker compose down -v
 
 10. **Q: What is HyperLogLog and when would you use it for caching?**
     A: HyperLogLog is a probabilistic cardinality estimator. `PFADD` adds an item; `PFCOUNT` returns an estimate of unique items seen. Memory: exactly 12KB regardless of cardinality. Error rate: < 1%. Use case: count unique views per video at YouTube scale. Storing 1B distinct user IDs in a set would take ~8GB; HyperLogLog estimates the same count in 12KB. The trade-off is approximation — not suitable for billing, suitable for analytics.
+
+11. **Q: When would you choose cache-aside vs write-through vs write-behind?**
+    A: Cache-aside is the default for read-heavy workloads — the application manages cache population on miss. It avoids polluting the cache with data that is never re-read, but causes a latency spike on the first read after a miss or expiry. Write-through keeps the cache always populated after a write, at the cost of higher write latency — best for data that is always read immediately after being written (user sessions, profile settings). Write-behind minimizes write latency by making the DB write asynchronous — best for high-write, tolerance-for-loss workloads like analytics counters or like counts. The key interview point: write-behind requires a durable write queue to avoid losing unflushed writes on cache node failure.

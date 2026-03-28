@@ -15,12 +15,17 @@ What this demonstrates:
   8. Deep pagination gotcha: from+size vs search_after
   9. Fuzzy search and prefix/autocomplete queries
   10. Index vs search latency benchmark
+  11. Score explanation with _explain API
+  12. Synonym search with a custom synonym token filter
+  13. Hybrid BM25 + dense vector kNN search with HNSW and RRF
 """
 
 import json
 import time
 import random
 import math
+import struct
+import hashlib
 import subprocess
 from collections import defaultdict
 
@@ -31,8 +36,10 @@ except ImportError:
     subprocess.run(["pip", "install", "elasticsearch", "-q"], check=True)
     from elasticsearch import Elasticsearch, helpers
 
-ES_HOST = "http://localhost:9200"
-INDEX   = "products"
+ES_HOST       = "http://localhost:9200"
+INDEX         = "products"
+SYNONYM_INDEX = "products_synonyms"
+HYBRID_INDEX  = "products_hybrid"
 
 
 def section(title):
@@ -197,6 +204,56 @@ def generate_products(n=5000):
             "in_stock":    random.choice([True, True, True, False]),
         })
     return products
+
+
+VECTOR_DIMS = 8  # Tiny dimensionality for local demo (real embeddings: 768–1536)
+
+# Keyword-to-dimension mapping so semantically related terms share signal
+SEMANTIC_AXES = {
+    "wireless":     0,
+    "bluetooth":    0,
+    "cable":        0,
+    "portable":     1,
+    "compact":      1,
+    "travel":       1,
+    "professional": 2,
+    "studio":       2,
+    "expert":       2,
+    "noise":        3,
+    "quiet":        3,
+    "silent":       3,
+    "headphones":   4,
+    "earbuds":      4,
+    "speaker":      5,
+    "audio":        5,
+    "music":        5,
+    "smart":        6,
+    "home":         6,
+    "hub":          6,
+}
+
+
+def text_to_vector(text: str) -> list[float]:
+    """
+    Deterministic pseudo-embedding for demo purposes.
+
+    Real-world: call an embedding model (OpenAI text-embedding-3-small,
+    Sentence-Transformers, etc.) and store the resulting float vector.
+    Here we project keyword occurrences onto VECTOR_DIMS semantic axes and
+    L2-normalise the result so cosine similarity is equivalent to dot product.
+    """
+    vec = [0.0] * VECTOR_DIMS
+    for token in text.lower().split():
+        dim = SEMANTIC_AXES.get(token)
+        if dim is not None:
+            vec[dim] += 1.0
+    # Add a tiny deterministic noise so zero-vectors are not all identical
+    digest = hashlib.md5(text.encode()).digest()
+    for i in range(VECTOR_DIMS):
+        vec[i] += struct.unpack("B", bytes([digest[i % 16]]))[0] / 256.0
+    # L2-normalise
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
 
 
 def main():
@@ -758,6 +815,374 @@ def main():
   This alone can make bulk load 2–5x faster.
 """)
 
+    # ── Phase 11: Score explanation with _explain ─────────────────
+    section("Phase 11: Score Explanation — Why Did This Doc Rank Here?")
+
+    print(f"""
+  The _explain API reveals the complete BM25 calculation for a
+  (query, document) pair.  This is indispensable when you need to:
+    • Debug why a highly-relevant document is ranked low
+    • Understand the contribution of each term to the final score
+    • Tune k1 / b / field boosts by seeing the actual arithmetic
+    • Demonstrate relevance to stakeholders during a search review
+""")
+
+    # Pick the top-scoring doc from a fresh BM25 query
+    resp_explain_seed = es.search(
+        index=INDEX,
+        query={"multi_match": {"query": "wireless headphones", "fields": ["name^2", "description"]}},
+        size=1,
+    )
+    if resp_explain_seed["hits"]["hits"]:
+        top_doc_id = resp_explain_seed["hits"]["hits"][0]["_id"]
+        top_doc_name = resp_explain_seed["hits"]["hits"][0]["_source"]["name"]
+
+        explain_resp = es.explain(
+            index=INDEX,
+            id=top_doc_id,
+            query={"multi_match": {"query": "wireless headphones", "fields": ["name^2", "description"]}},
+        )
+
+        expl = explain_resp.get("explanation", {})
+
+        def _fmt_explain(node, indent=0):
+            """Recursively print the score tree from _explain."""
+            prefix = "  " * indent
+            desc   = node.get("description", "")
+            value  = node.get("value", 0.0)
+            # Trim long descriptions for readability
+            if len(desc) > 80:
+                desc = desc[:77] + "..."
+            print(f"  {prefix}{value:.4f}  {desc}")
+            for child in node.get("details", []):
+                _fmt_explain(child, indent + 1)
+
+        print(f"  Top document: '{top_doc_name}' (id={top_doc_id})")
+        print(f"  _explain score tree for 'wireless headphones':\n")
+        _fmt_explain(expl)
+    else:
+        print("  (no results found for explain query)")
+
+    print(f"""
+  Reading the _explain tree:
+    • Root node = final score (sum of per-field contributions)
+    • Each field branch = boost × BM25(term, field)
+    • IDF leaf  = log((N - df + 0.5) / (df + 0.5) + 1)
+    • TF leaf   = tf × (k1+1) / (tf + k1 × (1-b + b×|D|/avgdl))
+
+  Common debugging patterns:
+    Low score despite good match → IDF too low (term too common in corpus)
+    Score dominated by one field → field boost too aggressive
+    Expected match missing       → check analyzer mismatch (term vs match)
+
+  Interview answer: "I use _explain to audit BM25 arithmetic on specific
+  docs, then adjust k1/b via index settings or add function_score to
+  blend in signals like recency or popularity without reindexing."
+""")
+
+    # ── Phase 12: Synonym search ───────────────────────────────────
+    section("Phase 12: Synonym Search — Expanding Query Vocabulary")
+
+    print(f"""
+  Synonym search solves vocabulary mismatch: the user searches
+  "earphones" but documents use "headphones" and "earbuds".
+
+  Two strategies:
+    Index-time synonyms:  stored as extra tokens at index time.
+      Pro:  fast query execution (no extra work at search time).
+      Con:  requires reindex whenever the synonym list changes.
+            Also bloats the index (synonym tokens counted in TF/IDF).
+
+    Query-time synonyms:  expanded during query analysis.
+      Pro:  update the synonym list and new queries see it immediately.
+      Con:  slightly slower query path; synonym expansion happens on the
+            coordinator node, not distributed to shards.
+
+  Synonym explosion risk:
+    A synonym ring like: earphones, headphones, earbuds, cans, monitors
+    applied at index time to a 10M-doc corpus adds 4 extra posting list
+    entries per matching document, multiplied across all synonyms.
+    At pathological scale (e.g., medical codes with 100-way synonym sets)
+    this can grow the index 10–20× and make merges extremely expensive.
+    Mitigation: prefer query-time synonyms for large rings; keep synonym
+    sets focused (≤ 5 terms per concept); monitor _cat/indices?v for
+    store.size growth after synonym list changes.
+""")
+
+    # Create index with synonym filter (query-time expansion)
+    if es.indices.exists(index=SYNONYM_INDEX):
+        es.indices.delete(index=SYNONYM_INDEX)
+
+    es.indices.create(
+        index=SYNONYM_INDEX,
+        settings={
+            "number_of_shards":   1,
+            "number_of_replicas": 0,
+            "analysis": {
+                "filter": {
+                    "synonym_filter": {
+                        "type": "synonym",
+                        "synonyms": [
+                            # Explicit one-way mappings (=>): query term → index term
+                            # Commutative rings: left side expands to all on right
+                            "earphones, earbuds, headphones",
+                            "notebook => laptop",
+                            "sofa, couch, settee",
+                            "tv, television, telly",
+                        ],
+                        "lenient": True,  # ignore malformed synonym rules
+                    }
+                },
+                "analyzer": {
+                    "synonym_analyzer": {
+                        "type":      "custom",
+                        "tokenizer": "standard",
+                        "filter":    ["lowercase", "synonym_filter"],
+                    }
+                },
+            },
+        },
+        mappings={
+            "properties": {
+                "name":        {"type": "text", "analyzer": "synonym_analyzer"},
+                "description": {"type": "text", "analyzer": "synonym_analyzer"},
+                "category":    {"type": "keyword"},
+                "price":       {"type": "float"},
+                "rating":      {"type": "float"},
+                "in_stock":    {"type": "boolean"},
+            }
+        },
+    )
+
+    # Index a small representative set of product docs
+    synonym_products = [
+        {"name": "Wireless Headphones Pro",       "description": "Over-ear headphones with ANC", "category": "Electronics", "price": 299.0,  "rating": 4.7, "in_stock": True},
+        {"name": "Bluetooth Earbuds Sport",        "description": "In-ear earbuds for workouts",  "category": "Electronics", "price": 89.99,  "rating": 4.3, "in_stock": True},
+        {"name": "Studio Monitor Headphones",      "description": "Professional flat-response headphones for mixing", "category": "Electronics", "price": 450.0, "rating": 4.9, "in_stock": False},
+        {"name": "Gaming Laptop 16-inch",          "description": "High-performance laptop for gaming", "category": "Electronics", "price": 1299.0, "rating": 4.5, "in_stock": True},
+        {"name": "Smart TV 55-inch 4K",            "description": "OLED television with HDR and smart OS", "category": "Electronics", "price": 799.0,  "rating": 4.6, "in_stock": True},
+        {"name": "Outdoor Bluetooth Speaker",      "description": "Waterproof portable speaker with 20h battery", "category": "Electronics", "price": 129.0, "rating": 4.2, "in_stock": True},
+        {"name": "Leather Sofa 3-Seat",            "description": "Premium couch for living room comfort", "category": "Furniture",    "price": 899.0, "rating": 4.4, "in_stock": True},
+    ]
+    syn_actions = [
+        {"_index": SYNONYM_INDEX, "_id": i, "_source": p}
+        for i, p in enumerate(synonym_products)
+    ]
+    helpers.bulk(es, syn_actions)
+    es.indices.refresh(index=SYNONYM_INDEX)
+
+    synonym_queries = [
+        ("earphones",   "should expand to headphones + earbuds"),
+        ("notebook",    "should expand to laptop (one-way =>)"),
+        ("telly",       "should expand to television + TV"),
+        ("couch",       "should expand to sofa + settee"),
+    ]
+
+    for query_text, note in synonym_queries:
+        resp = es.search(
+            index=SYNONYM_INDEX,
+            query={"multi_match": {"query": query_text, "fields": ["name", "description"]}},
+            size=4,
+        )
+        hits  = resp["hits"]["hits"]
+        total = resp["hits"]["total"]["value"]
+        print(f"  Query '{query_text}' ({note}): {total} matches")
+        for hit in hits:
+            print(f"    score={hit['_score']:.2f}  {hit['_source']['name']}")
+        print()
+
+    # Verify synonym expansion with the analyze API
+    analyze_resp = es.indices.analyze(
+        index=SYNONYM_INDEX,
+        analyzer="synonym_analyzer",
+        text="earphones",
+    )
+    expanded = [t["token"] for t in analyze_resp["tokens"]]
+    print(f"  _analyze 'earphones' through synonym_analyzer → {expanded}")
+    print(f"  (All three tokens are indexed/queried, so any form matches)\n")
+
+    # ── Phase 13: Hybrid BM25 + dense vector kNN with HNSW + RRF ──
+    section("Phase 13: Hybrid Search — BM25 + kNN (HNSW) with RRF")
+
+    print(f"""
+  Hybrid search combines two complementary retrieval signals:
+
+    BM25 (sparse)  — keyword relevance
+      Strength: exact term matching, rare/specific terms, high precision
+      Weakness: vocabulary mismatch ("earphones" ≠ "headphones"),
+                no understanding of semantic intent
+
+    kNN / dense vector (dense)  — semantic similarity
+      Strength: intent matching regardless of exact wording,
+                handles synonyms and paraphrasing naturally
+      Weakness: can retrieve semantically close but factually wrong docs;
+                requires embedding model and vector index (HNSW)
+
+  Reciprocal Rank Fusion (RRF):
+    Given rank r_bm25 and r_knn for the same document:
+      rrf_score = 1/(k + r_bm25) + 1/(k + r_knn)
+    where k=60 is the smoothing constant (default in ES 8.8+).
+
+    Why RRF beats score normalisation:
+      • BM25 scores and cosine similarity are on different scales.
+        Score normalisation requires knowing the global min/max which
+        is impractical in a sharded cluster.
+      • RRF uses only rank ordering (ordinal), not raw scores —
+        robust to score distribution differences between retrievers.
+      • Adding a third retriever (e.g., colBERT re-ranker) is trivial:
+        rrf_score += 1/(k + r_reranker)
+
+  HNSW (Hierarchical Navigable Small World):
+    ES stores dense_vector fields in an HNSW graph per shard.
+    HNSW provides approximate nearest-neighbour search in O(log N)
+    by navigating a hierarchy of skip-list-like layers.
+    Trade-off: ef_construction controls build quality (higher = slower
+    index, better recall); ef_search controls query recall vs latency.
+    At ef_construction=128, recall@10 is typically >95% vs brute-force.
+""")
+
+    # Build a separate index with dense_vector mapping
+    if es.indices.exists(index=HYBRID_INDEX):
+        es.indices.delete(index=HYBRID_INDEX)
+
+    es.indices.create(
+        index=HYBRID_INDEX,
+        settings={
+            "number_of_shards":   1,
+            "number_of_replicas": 0,
+        },
+        mappings={
+            "properties": {
+                "name":        {"type": "text", "analyzer": "standard"},
+                "description": {"type": "text", "analyzer": "standard"},
+                "category":    {"type": "keyword"},
+                "price":       {"type": "float"},
+                "rating":      {"type": "float"},
+                "in_stock":    {"type": "boolean"},
+                "embedding": {
+                    "type":       "dense_vector",
+                    "dims":       VECTOR_DIMS,
+                    "index":      True,           # build HNSW graph
+                    "similarity": "cosine",
+                    "index_options": {
+                        "type":             "hnsw",
+                        "m":                16,   # max edges per node
+                        "ef_construction":  100,  # build-time beam width
+                    },
+                },
+            }
+        },
+    )
+
+    # Index the same small representative set, adding embedding vectors
+    hybrid_actions = []
+    for i, p in enumerate(synonym_products):
+        doc = dict(p)
+        doc["embedding"] = text_to_vector(p["name"] + " " + p["description"])
+        hybrid_actions.append({"_index": HYBRID_INDEX, "_id": i, "_source": doc})
+    helpers.bulk(es, hybrid_actions)
+    es.indices.refresh(index=HYBRID_INDEX)
+
+    print(f"  Indexed {len(synonym_products)} docs into '{HYBRID_INDEX}' with {VECTOR_DIMS}-dim HNSW vectors.\n")
+
+    # Run BM25-only, kNN-only, and hybrid (RRF) for comparison
+    hybrid_test_cases = [
+        {
+            "label":      "BM25 only — 'earphones for studio mixing'",
+            "query_text": "earphones for studio mixing",
+        },
+        {
+            "label":      "kNN only — semantic via embedding",
+            "query_text": "earphones for studio mixing",
+        },
+        {
+            "label":      "Hybrid RRF — BM25 + kNN combined",
+            "query_text": "earphones for studio mixing",
+        },
+    ]
+
+    query_text = "earphones for studio mixing"
+    query_vec  = text_to_vector(query_text)
+
+    # ── BM25 only
+    bm25_resp = es.search(
+        index=HYBRID_INDEX,
+        query={"multi_match": {"query": query_text, "fields": ["name^2", "description"]}},
+        size=4,
+    )
+    print(f"  BM25-only results for '{query_text}':")
+    for rank, hit in enumerate(bm25_resp["hits"]["hits"], 1):
+        print(f"    #{rank}  score={hit['_score']:.4f}  {hit['_source']['name']}")
+
+    # ── kNN only (approximate nearest-neighbour via HNSW)
+    knn_resp = es.search(
+        index=HYBRID_INDEX,
+        knn={
+            "field":          "embedding",
+            "query_vector":   query_vec,
+            "k":              4,
+            "num_candidates": 20,  # ef_search equivalent: candidates per shard
+        },
+        size=4,
+    )
+    print(f"\n  kNN-only results (HNSW cosine, {VECTOR_DIMS}-dim):")
+    for rank, hit in enumerate(knn_resp["hits"]["hits"], 1):
+        print(f"    #{rank}  score={hit['_score']:.4f}  {hit['_source']['name']}")
+
+    # ── Hybrid: BM25 + kNN via RRF (rank_rrf)
+    # ES 8.8+ supports the `rank` parameter for RRF at the query level.
+    # Both `query` and `knn` results are merged using RRF with k=60.
+    hybrid_resp = es.search(
+        index=HYBRID_INDEX,
+        query={
+            "multi_match": {
+                "query":  query_text,
+                "fields": ["name^2", "description"],
+            }
+        },
+        knn={
+            "field":          "embedding",
+            "query_vector":   query_vec,
+            "k":              4,
+            "num_candidates": 20,
+        },
+        rank={"rrf": {"rank_constant": 60, "rank_window_size": 20}},
+        size=4,
+    )
+    print(f"\n  Hybrid RRF results (BM25 + kNN, rank_constant=60):")
+    for rank, hit in enumerate(hybrid_resp["hits"]["hits"], 1):
+        # _score in RRF mode is the RRF score, not BM25 or cosine
+        print(f"    #{rank}  rrf_score={hit['_score']:.4f}  {hit['_source']['name']}")
+
+    print(f"""
+  Interpreting the results:
+    BM25-only: strong when the query exactly matches indexed terms.
+      May miss 'Studio Monitor Headphones' if user typed 'earphones'.
+    kNN-only:  strong for semantic intent; surfaces docs with similar
+      semantic axes (noise+studio+headphones) even without exact tokens.
+    Hybrid RRF: typically outperforms either alone — the rank fusion
+      promotes docs that appear in both result lists, which are usually
+      the most relevant.
+
+  Production hybrid search stack (e.g., Shopify, Uber, Airbnb):
+    1. Offline: fine-tune or use a pre-trained embedding model
+    2. Ingest:  call embedding API → store vector in dense_vector field
+    3. Query:   send user query → embedding API → get query vector
+    4. Hybrid:  ES rank.rrf combines BM25 + kNN in a single request
+    5. Re-rank: optional LLM-based cross-encoder re-ranking on top-20
+
+  HNSW tuning levers:
+    m (max edges/node):     higher = better recall, bigger index (16–64)
+    ef_construction:        higher = better recall, slower indexing (100–200)
+    num_candidates (query): higher = better recall, slower query (10–100)
+    Rule of thumb: start with m=16, ef_construction=128, tune recall offline.
+
+  When to use hybrid vs BM25 vs kNN alone:
+    Keyword-heavy (product codes, names)  → BM25 dominates; hybrid = small gain
+    Intent-heavy (conversational, Q&A)    → kNN dominates; hybrid = small gain
+    Mixed (most e-commerce / enterprise)  → hybrid wins clearly
+""")
+
     # ── Summary ───────────────────────────────────────────────────
     section("Summary — Search System Architecture Decisions")
 
@@ -801,9 +1226,17 @@ def main():
 
   Decision framework:
     ≤ 5M rows, simple queries              → Postgres tsvector + GIN index
-    > 5M rows, relevance tuning, facets    → Elasticsearch
+    > 5M rows, relevance tuning, facets    → Elasticsearch (BM25)
     Managed, best UX, latency-sensitive    → Algolia (SaaS cost)
     Semantic / vector similarity search    → pgvector or Elasticsearch kNN
+    Mixed intent + keyword (most prod)     → Hybrid BM25+kNN with RRF
+
+  Sync strategy (primary DB → ES):
+    Dual-write:  app writes DB + ES in same request
+                 simple, but partial failures leave them out of sync
+    CDC (Change Data Capture): Debezium tails the DB WAL → Kafka →
+                 ES connector; ES is eventually consistent but never
+                 diverges silently; preferred for FAANG-scale systems
 
   Next: ../10-rate-limiting-algorithms/
 """)

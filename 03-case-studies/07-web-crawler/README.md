@@ -4,6 +4,24 @@
 
 ---
 
+## Clarify Requirements First (3–5 min)
+
+Before designing anything, ask the interviewer these questions. The answers change the architecture significantly.
+
+| Question | Why it matters |
+|---|---|
+| What is the crawl scope — the entire public web, or a bounded domain set? | Full-web crawl needs 500+ distributed workers; bounded domain crawl can run on a single machine. |
+| Do we need to re-crawl for freshness, or is this a one-time snapshot? | Re-crawl requires a priority queue and freshness scoring; one-time only needs a BFS frontier. |
+| Should we respect robots.txt and Crawl-delay? | Yes unless told otherwise — politeness is a legal/ethical baseline. |
+| What do downstream consumers need — raw HTML, structured data, or a search index? | Raw HTML → object storage (S3/GCS). Search index → need a separate indexing pipeline. |
+| Do we need to handle JavaScript-rendered pages (SPAs)? | Headless-browser rendering is ~100× more expensive per page; needs a separate worker tier. |
+| What is the latency requirement for newly discovered URLs appearing in the index? | News crawlers want minutes; general crawlers accept hours-to-days. |
+| What freshness SLA is required for already-indexed pages? | Drives the re-crawl cycle length (Google: ~2 weeks, news: ~minutes). |
+
+**Typical senior answer:** "I'll assume we're crawling the full public web (~5B pages) with a 14-day re-crawl cycle, respecting robots.txt, storing raw HTML for a downstream indexer, and not handling JS rendering in the first version."
+
+---
+
 ## The Problem at Scale
 
 A web crawler must systematically download and index the entire public web. Google's crawler (Googlebot) must keep an index of ~5 billion pages fresh, requiring continuous re-crawling on a ~2-week cycle.
@@ -46,7 +64,7 @@ A naive single-threaded crawler fetching one page per second would take 158 year
 | Pages/second | 400M / 86,400s | ~4,630 RPS |
 | Inbound bandwidth | 4,630 × 50KB | ~225 MB/s |
 | URL frontier RAM (hash set) | 5B × 64B/URL | ~320 GB |
-| URL frontier RAM (Bloom filter) | 5B, 1% FPR | ~6 GB |
+| URL frontier RAM (Bloom filter) | 5B, 1% FPR | ~5.7 GB |
 | Raw HTML storage | 5B × 50KB | ~250 TB |
 | S3 storage cost | 250TB × $0.023/GB/month | ~$5,750/month |
 | Crawler workers | 4,630 RPS / 10 RPS per worker | ~463 workers |
@@ -72,29 +90,34 @@ A naive single-threaded crawler fetching one page per second would take 158 year
 │    low-priority   (new/unknown domains, deep pages)              │
 └──────────────────────┬──────────────────────────────────────────┘
                        │ partitioned by domain hash
-          ┌────────────▼────────────┐
-          │    Crawler Workers       │  (100s of instances)
-          │  1. Check robots.txt     │
-          │  2. Apply politeness     │
-          │  3. Fetch HTML           │
-          │  4. Extract links        │
-          │  5. Normalize URLs       │
+          ┌────────────▼────────────┐       ┌─────────────────────┐
+          │    Crawler Workers       │◄──────│  robots.txt Cache   │
+          │  (100s of instances)     │       │  (Redis, 24h TTL)   │
+          │                          │       └─────────────────────┘
+          │  1. Normalize URL        │
+          │  2. Check Bloom filter   │
+          │  3. Check robots.txt     │
+          │  4. Apply politeness     │
+          │  5. Fetch HTML           │
+          │  6. Extract + normalize  │
+          │     outbound links       │
           └─────┬──────────┬────────┘
                 │          │
      ┌──────────▼──┐  ┌────▼──────────────┐
      │ Bloom Filter │  │  Content Store     │
-     │ (Redis/Spark)│  │  (S3/GCS raw HTML) │
-     │ "seen this?" │  │  + metadata in DB  │
-     └──────────────┘  └────────────────────┘
+     │ (Redis/Spark)│  │  (S3/GCS raw HTML  │
+     │ "seen this?" │  │   in WARC format)  │
+     └──────────────┘  │  + metadata in DB  │
+                       └────────────────────┘
 ```
 
 **URL Frontier:** A priority queue of URLs to crawl. Implemented as Kafka topics (one per priority tier), partitioned by domain hash so each crawler worker "owns" a set of domains and can enforce per-domain rate limiting locally.
 
-**Bloom Filter:** A probabilistic set answering "have we seen this URL?". At 5B URLs a hash set costs ~320GB; a Bloom filter with 1% FPR costs ~6GB. False positives (occasionally skipping a valid new URL) are acceptable.
+**Bloom Filter:** A probabilistic set answering "have we seen this URL?". At 5B URLs a hash set costs ~320GB; a Bloom filter with 1% FPR costs ~5.7GB (using k=7 hash functions). False positives (occasionally skipping a valid new URL) are acceptable.
 
 **Crawler Workers:** Stateless Python/Go processes. Each worker pulls URLs from its assigned Kafka partitions, checks robots.txt (cached per domain), waits for politeness delay, fetches, and emits links back to the frontier.
 
-**Content Store:** Raw HTML goes to object storage (S3). Structured metadata (URL, fetch time, status, content hash) goes to Postgres/Cassandra for the indexing pipeline to consume.
+**Content Store:** Raw HTML goes to object storage (S3) in **WARC format** (Web ARChive — an ISO standard container that bundles the HTTP request, response headers, and raw body into a single record, allowing exact replay). Structured metadata (URL, fetch time, status, content hash) goes to Postgres/Cassandra for the indexing pipeline to consume.
 
 ---
 
@@ -352,7 +375,7 @@ docker compose down -v
 ## Interview Checklist
 
 1. **Q: How do you avoid re-crawling the same URL twice?**
-   A: Bloom filter. At 5B URLs a hash set needs ~320GB RAM; a Bloom filter with 1% FPR needs ~6GB. We accept the 1% false positive rate (occasionally skipping a new URL) as it's much cheaper than storing every URL. URLs are normalized before insertion (lowercase, sorted params, no fragments) to collapse duplicates.
+   A: Bloom filter. At 5B URLs a hash set needs ~320GB RAM; a Bloom filter with 1% FPR needs ~5.7GB (formula: `m = -n × ln(p) / (ln 2)²`, with k=7 optimal hash functions). We accept the 1% false positive rate (occasionally skipping a new URL) as it's much cheaper than storing every URL. URLs are normalized before insertion (lowercase, sorted params, no fragments) to collapse duplicates.
 
 2. **Q: How do you ensure you're not overloading a small website?**
    A: Three layers: (1) fetch and respect robots.txt Crawl-delay, (2) per-domain rate limiting in each worker (minimum gap between requests to same domain), (3) domain partitioning assigns each domain to one worker so rate limiting is local with no coordination overhead.
@@ -376,7 +399,7 @@ docker compose down -v
    A: URL deduplication (Bloom filter) handles exact URL matches. For near-duplicate content (same article, different URLs): compute SimHash (a locality-sensitive hash) of page content. Two pages with Hamming distance < 3 on their SimHash are near-duplicates. Store canonical URL in Postgres with `canonical_url` column.
 
 9. **Q: What is your storage architecture for 250TB of raw HTML?**
-   A: Raw HTML in WARC format (Web ARChive) on object storage (S3). 250TB at $0.023/GB/month = $5,750/month for storage. Each WARC file contains multiple pages. Metadata (URL, fetch time, content hash, HTTP headers) in Postgres for querying. Index pipeline reads from S3, not from Postgres directly.
+   A: Raw HTML in WARC format (Web ARChive — ISO standard; bundles HTTP request + response headers + body into one replayable record) on object storage (S3). 250TB at $0.023/GB/month = $5,750/month for storage. Each WARC file contains multiple pages batched together to reduce S3 PUT costs. Metadata (URL, fetch time, content hash, HTTP headers) in Postgres for querying. Index pipeline reads from S3, not from Postgres directly.
 
 10. **Q: Walk me through what happens when the crawler discovers a new URL.**
     A: (1) Link extractor parses href from fetched HTML. (2) URL is normalized (lowercase, sorted params, no fragment). (3) Check Bloom filter — if "seen", discard. (4) If not seen, add to Bloom filter. (5) Compute `hash(domain) % partitions` to find target Kafka partition. (6) Produce URL to frontier Kafka topic. (7) Worker assigned to that partition eventually consumes the URL, checks robots.txt cache, waits for politeness delay, fetches, and repeats.

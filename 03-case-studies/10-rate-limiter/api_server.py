@@ -6,7 +6,7 @@ Endpoints:
   GET /health                → 200 OK
   GET /api/data              → 200 OK or 429 Too Many Requests
   GET /api/data?key=<api_key>→ rate limited by api_key (key-level limits)
-  GET /stats                 → current rate limit counters
+  GET /stats                 → current rate limit counters for known keys
 
 Rate limiting uses a Lua script for atomic check-and-increment.
 
@@ -78,6 +78,10 @@ _redis_client = None
 _lua_script = None
 REDIS_AVAILABLE = False
 
+# Sentinel used in headers during fail-open: indicates rate limiting is
+# suspended, not that 0 requests remain. Avoids misleading clients.
+FAIL_OPEN_REMAINING = "unlimited"
+
 
 def _connect_redis():
     """Attempt to (re)connect to Redis. Returns True on success."""
@@ -105,14 +109,15 @@ def _connect_redis():
 _connect_redis()
 
 
-def check_rate_limit(api_key: str) -> tuple[bool, int, int, int]:
+def check_rate_limit(api_key: str) -> tuple[bool, int | None, int | None, int]:
     """
     Returns (allowed, current_count, limit, window_reset_ts).
 
+    current_count and limit are None when Redis is unavailable (fail-open).
     window_reset_ts is the Unix timestamp when the current window ends —
     used to populate Retry-After and X-RateLimit-Reset headers.
 
-    If Redis is unavailable: fail-open (allowed=True, count=0, limit=0).
+    If Redis is unavailable: fail-open (allowed=True, count=None, limit=None).
     Automatically retries Redis connection on each call while unavailable.
     """
     global REDIS_AVAILABLE
@@ -124,7 +129,7 @@ def check_rate_limit(api_key: str) -> tuple[bool, int, int, int]:
     if not REDIS_AVAILABLE:
         # Attempt reconnect — recovers automatically when Redis comes back
         if not _connect_redis():
-            return True, 0, 0, window_reset_ts  # still unavailable: fail-open
+            return True, None, None, window_reset_ts  # still unavailable: fail-open
 
     redis_key = f"ratelimit:{api_key}"
 
@@ -136,7 +141,7 @@ def check_rate_limit(api_key: str) -> tuple[bool, int, int, int]:
     except Exception:
         # Redis became unavailable mid-request: fail-open and mark for reconnect
         REDIS_AVAILABLE = False
-        return True, 0, 0, window_reset_ts
+        return True, None, None, window_reset_ts
 
 
 @app.route("/health")
@@ -156,12 +161,22 @@ def api_data():
     now = int(time.time())
     retry_after = max(0, reset_ts - now)
 
+    # During fail-open, limit and count are None.
+    # Use sentinel strings so clients can detect the fail-open state
+    # rather than seeing misleading numeric values (e.g., "0 remaining").
+    if limit is None:
+        limit_header     = "unavailable"
+        remaining_header = FAIL_OPEN_REMAINING
+    else:
+        limit_header     = str(limit)
+        remaining_header = str(max(0, limit - count))
+
     headers = {
-        "X-RateLimit-Limit": str(limit),
-        "X-RateLimit-Remaining": str(max(0, limit - count)),
-        "X-RateLimit-Reset": str(reset_ts),   # Unix timestamp: window end
-        "X-Server": SERVER_ID,
-        "X-Redis-Available": str(REDIS_AVAILABLE),
+        "X-RateLimit-Limit":     limit_header,
+        "X-RateLimit-Remaining": remaining_header,
+        "X-RateLimit-Reset":     str(reset_ts),   # Unix timestamp: window end
+        "X-Server":              SERVER_ID,
+        "X-Redis-Available":     str(REDIS_AVAILABLE),
     }
 
     if not allowed:
@@ -225,6 +240,32 @@ def stats():
             }
         except Exception:
             keys_info[key_name] = {"error": "lookup_failed"}
+
+    # Also surface any other active ratelimit:* keys (e.g. experiment keys)
+    try:
+        all_redis_keys = _redis_client.keys("ratelimit:*")
+        known_prefixes = {f"ratelimit:{k}" for k, _, _ in all_keys}
+        for rkey in sorted(all_redis_keys):
+            # Skip keys already covered by the static list above
+            if any(rkey.startswith(p + ":") for p in known_prefixes):
+                continue
+            # Parse key name from "ratelimit:{name}:{window_id}"
+            parts = rkey.split(":", 2)
+            if len(parts) == 3:
+                dyn_name = parts[1]
+                try:
+                    count = _redis_client.get(rkey)
+                    ttl = _redis_client.ttl(rkey)
+                    keys_info[dyn_name] = {
+                        "count": int(count) if count else 0,
+                        "limit": "(dynamic)",
+                        "ttl_remaining": ttl,
+                        "redis_key": rkey,
+                    }
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     return jsonify({"keys": keys_info, "server": SERVER_ID, "now": now})
 
