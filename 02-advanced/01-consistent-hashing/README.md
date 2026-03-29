@@ -133,8 +133,9 @@ owning 50%+ of the ring by chance. Mitigation: use replicas ≥ 100. Monitor per
 
 **Node removal cascades all keys to one neighbor:** when a node is removed, all its keys move to the single clockwise
 neighbor (if RF=1). If that neighbor was already at capacity, it may be overwhelmed. Mitigation: use replication (RF ≥
+
 2) so keys are spread across many neighbors; in Cassandra, bootstrapping a replacement node before decommissioning the
-old one avoids this.
+   old one avoids this.
 
 **Node crash during data migration:** after adding a node, there is a window where the ring says the new node owns
 certain keys but those keys haven't been migrated yet. Reads to the new node return misses or stale data. Mitigation:

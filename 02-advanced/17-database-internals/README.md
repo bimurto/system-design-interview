@@ -63,7 +63,8 @@ rewritten multiple times during compaction across levels.
 
 Two dominant compaction strategies:
 
-- **Size-Tiered Compaction Strategy (STCS):** merges SSTables of similar size into one larger SSTable. Write amplification
+- **Size-Tiered Compaction Strategy (STCS):** merges SSTables of similar size into one larger SSTable. Write
+  amplification
   is low (fewer rewrites), but space amplification is high — multiple overlapping SSTables of the same key range coexist
   temporarily, doubling disk usage during compaction. Used by Cassandra as the default for write-heavy workloads.
 - **Leveled Compaction Strategy (LCS / RocksDB default):** SSTables at each level have non-overlapping key ranges and a
@@ -152,8 +153,9 @@ python experiment.py
 
 The script runs four phases: (1) WAL anatomy — shows the Postgres WAL LSN advancing with each write; (2) B-tree vs
 sequential write throughput — inserts 10k rows in random-key order vs sequential-key order, measuring the difference; (
+
 3) MVCC observation — two concurrent transactions observe different row versions; (4) simulated LSM-tree — a pure-Python
-memtable + SSTable implementation showing compaction merging multiple sorted files into one.
+   memtable + SSTable implementation showing compaction merging multiple sorted files into one.
 
 ### Teardown
 

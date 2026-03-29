@@ -252,8 +252,9 @@ endpoint names, status codes, and service names, never user IDs, request IDs, or
 deployments, `job_id` for batch systems) creates continuous series churn. Each new value creates a new time series that
 Prometheus must index, then eventually compact. The TSDB's index is optimised for reads, not for constant key rotation.
 A fleet with 1000 pods rolling every hour creates 24,000 new series per day — even if the steady-state count is only
+
 1000. Churn is more dangerous than a large but stable label set. Mitigate by normalising to stable labels (
-`deployment_name` instead of `pod_id`).
+      `deployment_name` instead of `pod_id`).
 
 **Alert fatigue from poor SLO calibration:** Setting SLOs too tight (p99 < 50ms for a database-backed endpoint) causes
 constant alerts that on-call engineers learn to ignore. SLOs should reflect the real user experience threshold — what

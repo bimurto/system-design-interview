@@ -437,7 +437,7 @@ docker compose down -v
     picks up event, queries follow list from cache (or Postgres read replica). (4) For each regular follower:
     `ZADD timeline:{follower_id} {timestamp} {tweet_id}` via Redis pipeline; `ZREMRANGEBYRANK` to trim to 800 entries. (
     5) Celebrity followers are skipped — they pull at read time. Total fan-out: ~200ms for avg user (200 followers),
-    bounded for celebrities by the hybrid approach.
+       bounded for celebrities by the hybrid approach.
 
 11. **Q: What happens if the Kafka publish step fails after the DB write succeeds?**
     A: The tweet is durably stored in Postgres but never fanned out. Options: (a) Outbox pattern — write the tweet and

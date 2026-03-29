@@ -154,9 +154,10 @@ key after the DB write (not before), and retry deletion on failure.
 trending product listing, a global configuration map. Even with 100% cache hit rate, a single Redis node handling
 millions of requests per second for one key becomes a CPU and network throughput bottleneck. Solutions: (1) local
 in-process L1 cache — absorbs reads at the application level before they reach Redis; staleness bounded by local TTL. (
+
 2) Key sharding — replicate the value under N keys (`config:0` … `config:N-1`) and route readers to
-`config:hash(client_id) % N`. (3) Redis read replicas — route hot reads to replicas; writes to primary. (4) For
-public/cacheable content, push to CDN edge nodes (zero Redis involvement).
+   `config:hash(client_id) % N`. (3) Redis read replicas — route hot reads to replicas; writes to primary. (4) For
+   public/cacheable content, push to CDN edge nodes (zero Redis involvement).
 
 ## Interview Talking Points
 

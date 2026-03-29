@@ -367,6 +367,7 @@ comparison (standard vs stemming), (7) the NRT 1-second refresh delay demonstrat
 failure vs `search_after` cursor pagination, (9) fuzzy/typo-tolerant search and prefix autocomplete, (10) index vs
 search latency benchmark, (11) score explanation with the `_explain` API (reading the BM25 score tree to debug
 relevance), (12) synonym search with a custom synonym token filter (vocabulary expansion, synonym explosion risk), and (
+
 13) hybrid BM25 + dense vector kNN search with an HNSW index and Reciprocal Rank Fusion (RRF) score combination.
 
 ### Break It

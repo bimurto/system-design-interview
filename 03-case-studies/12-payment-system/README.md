@@ -592,9 +592,10 @@ docker compose down -v
 
 9. **Q: What is your strategy for idempotency key expiry?**
    A: 24-hour window is standard. After 24 hours, the same idempotency_key is treated as a new request. This handles: (
-   1) clients that generate a new key per retry (correct), (2) clients that reuse keys across days (they get a new
-   charge — client bug, not server bug). Keys older than 24 hours are pruned from Redis (TTL) and marked as expired in
-   Postgres (not deleted — audit trail).
+    1) clients that generate a new key per retry (correct), (2) clients that reuse keys across days (they get a new
+       charge — client bug, not server bug). Keys older than 24 hours are pruned from Redis (TTL) and marked as expired
+       in
+       Postgres (not deleted — audit trail).
 
 10. **Q: Walk me through a Stripe charge from API call to settlement.**
     A: (1) Merchant calls POST /v1/charges with amount, source (card token), idempotency_key. (2) Stripe checks

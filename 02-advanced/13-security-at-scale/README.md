@@ -361,7 +361,8 @@ docker compose down
   rollover window: publish both the old and new public keys in the JWKS endpoint simultaneously, start signing with the
   new private key only after all caches have expired (wait at least one cache TTL), then remove the old public key.
   Skipping the overlap window causes a fleet-wide 401 storm during rotation.
-- **Ambient credential abuse via IMDS/SSRF.** Cloud instances expose a metadata endpoint at `169.254.169.254` (AWS IMDSv1,
+- **Ambient credential abuse via IMDS/SSRF.** Cloud instances expose a metadata endpoint at `169.254.169.254` (AWS
+  IMDSv1,
   GCP, Azure) that returns temporary IAM credentials to any process on the host — including a server-side request
   forgery (SSRF) attacker who can trick your service into fetching an arbitrary URL. An attacker who can reach the
   metadata endpoint can steal cloud credentials and escalate to full account access. Fix: block outbound traffic to

@@ -86,13 +86,13 @@ cluster. The solution is a purpose-built real-time geospatial index in Redis.
 Assume 40% of daily rides occur in 4 peak hours across time zones; within a single peak window demand
 concentrates further — a reasonable model is 10% of daily rides in a single 1-hour window:
 
-| Metric                   | Calculation                              | Peak value   |
-|--------------------------|------------------------------------------|--------------|
-| Peak rides/hour          | 25M/day × 10% in busiest hour            | 2.5M/hr      |
-| Peak match requests/s    | 2.5M / 3600s                             | ~700 req/s   |
-| Peak location updates/s  | 4M drivers × 1/4s (unchanged)            | 1M/s         |
-| Peak ETA computations/s  | 700 × 15 candidates each                 | ~10,500/s    |
-| ETA cache saves ~80%     | 10,500 × 0.2 = 2,100 actual ETA calls/s | 2,100/s      |
+| Metric                  | Calculation                             | Peak value |
+|-------------------------|-----------------------------------------|------------|
+| Peak rides/hour         | 25M/day × 10% in busiest hour           | 2.5M/hr    |
+| Peak match requests/s   | 2.5M / 3600s                            | ~700 req/s |
+| Peak location updates/s | 4M drivers × 1/4s (unchanged)           | 1M/s       |
+| Peak ETA computations/s | 700 × 15 candidates each                | ~10,500/s  |
+| ETA cache saves ~80%    | 10,500 × 0.2 = 2,100 actual ETA calls/s | 2,100/s    |
 
 The ETA service (not Redis) is the peak-hour bottleneck: 2,100 road-network queries/second
 requires horizontal scaling behind a load balancer, with the 30-second ETA cache in Redis
@@ -332,35 +332,35 @@ sends parallel queries and merges results, adding ~1ms of fan-out latency.
 
 This section consolidates the major trade-offs an interviewer expects you to articulate:
 
-| Decision                            | Chosen approach                          | Alternative                         | Why this choice                                                                              |
-|-------------------------------------|------------------------------------------|-------------------------------------|----------------------------------------------------------------------------------------------|
-| Real-time index store               | Redis (in-memory sorted set + GEOADD)    | PostGIS, Elasticsearch, custom trie | Sub-millisecond reads, 4M drivers in ~264 MB RAM; PostGIS too slow at 100K queries/s        |
-| Ingest path                         | Driver → Kafka → Redis consumer          | Driver → Redis directly             | Kafka decouples burst ingest from write latency; provides replay buffer on consumer failure  |
-| Location ordering                   | Kafka partition by driver_id             | Single-partition global ordering    | Per-driver ordering prevents stale writes; global ordering bottlenecks at 1M/s              |
-| Driver protocol                     | WebSocket (persistent)                   | HTTP polling every 4s               | WebSocket: 1M persistent sockets vs 250K new TCP connections/second; 10× more efficient     |
-| Geo indexing strategy               | Geohash-encoded sorted set (Redis)       | R-tree, k-d tree, quad-tree         | Redis GEOSEARCH is O(N+log M); no external dependency; built-in sharding via Redis Cluster   |
-| Driver availability tracking        | Separate Redis hash, heartbeat sorted set| TTL per Redis key; in geo index      | Per-key TTL fires 1M expiry events/4s overwhelming Redis expiry thread; sorted set is O(log N+K) |
-| Match ranking metric                | ETA (road network)                       | Euclidean / Haversine distance       | Urban geography makes distance a poor proxy for arrival time; rivers/one-ways skew results  |
-| Surge pricing grid                  | H3 hexagons (~460m, resolution 8)        | Square grid, Voronoi cells           | Hexagons: equal distance to all 6 neighbours, eliminating directional bias in demand calc    |
-| Consistency model for geo index     | Eventual (Kafka lag up to 4s)            | Synchronous write, strong consistency| 4s lag is tolerable; strong consistency would require synchronous Driver → Redis writes, eliminating Kafka buffer |
+| Decision                        | Chosen approach                           | Alternative                           | Why this choice                                                                                                   |
+|---------------------------------|-------------------------------------------|---------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| Real-time index store           | Redis (in-memory sorted set + GEOADD)     | PostGIS, Elasticsearch, custom trie   | Sub-millisecond reads, 4M drivers in ~264 MB RAM; PostGIS too slow at 100K queries/s                              |
+| Ingest path                     | Driver → Kafka → Redis consumer           | Driver → Redis directly               | Kafka decouples burst ingest from write latency; provides replay buffer on consumer failure                       |
+| Location ordering               | Kafka partition by driver_id              | Single-partition global ordering      | Per-driver ordering prevents stale writes; global ordering bottlenecks at 1M/s                                    |
+| Driver protocol                 | WebSocket (persistent)                    | HTTP polling every 4s                 | WebSocket: 1M persistent sockets vs 250K new TCP connections/second; 10× more efficient                           |
+| Geo indexing strategy           | Geohash-encoded sorted set (Redis)        | R-tree, k-d tree, quad-tree           | Redis GEOSEARCH is O(N+log M); no external dependency; built-in sharding via Redis Cluster                        |
+| Driver availability tracking    | Separate Redis hash, heartbeat sorted set | TTL per Redis key; in geo index       | Per-key TTL fires 1M expiry events/4s overwhelming Redis expiry thread; sorted set is O(log N+K)                  |
+| Match ranking metric            | ETA (road network)                        | Euclidean / Haversine distance        | Urban geography makes distance a poor proxy for arrival time; rivers/one-ways skew results                        |
+| Surge pricing grid              | H3 hexagons (~460m, resolution 8)         | Square grid, Voronoi cells            | Hexagons: equal distance to all 6 neighbours, eliminating directional bias in demand calc                         |
+| Consistency model for geo index | Eventual (Kafka lag up to 4s)             | Synchronous write, strong consistency | 4s lag is tolerable; strong consistency would require synchronous Driver → Redis writes, eliminating Kafka buffer |
 
 ---
 
 ## Failure Modes and Scale Challenges
 
-| Failure                               | Impact                                                     | Mitigation                                                                             |
-|---------------------------------------|------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| Redis primary failover                | 10-30s where `GEOSEARCH` fails; drivers invisible          | Redis Sentinel/Cluster with replica promotion; circuit breaker returns cached results  |
-| Kafka consumer lag                    | Geo index shows stale driver positions (up to minutes old) | Consumer group lag alerting; auto-scale consumer group; reduce batch sizes             |
-| Kafka–Redis consumer network partition| Consumer cannot write to Redis; geo index freezes in place | Consumer retries with backoff; Kafka retains messages (24h TTL) for replay on recovery |
-| Location Service overload             | Location updates dropped                                   | Rate-limit at 1 update/driver/2s; Kafka acts as buffer, absorbs bursts                 |
-| ETA service down                      | Matching falls back to distance-only ranking               | Circuit breaker; cache last-known ETAs; distance as fallback metric                    |
-| PostGIS failover                      | Historical queries fail; real-time matching unaffected     | Read replicas; Redis is source of truth for real-time, PostGIS is read-heavy           |
-| Driver GPS spoofing                   | Driver appears at fake location to cherry-pick rides       | Server-side velocity check; cross-validate with cell tower data; ML anomaly detection  |
-| "Cold start" in a new city            | No drivers → no rides → no drivers (chicken-and-egg)       | Seed market with incentivized supply; pre-compute ETAs for common routes               |
-| Surge pricing race condition          | Two workers compute surge simultaneously; last-write-wins  | Redis Lua script for atomic read-modify-write; partition surge computation by cell     |
-| Split-brain: Redis replica divergence | Two dispatch nodes see different driver positions          | Quorum reads via Redis Cluster; accept eventual consistency within one update interval |
-| Mass driver disconnect (shift change) | 10–20% of drivers go OFFLINE simultaneously; GEOSEARCH returns 0 in affected cells | Radius expansion (1→2→5→10km); pre-warm adjacent cell caches; display "drivers coming" UX |
+| Failure                                | Impact                                                                             | Mitigation                                                                                |
+|----------------------------------------|------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------|
+| Redis primary failover                 | 10-30s where `GEOSEARCH` fails; drivers invisible                                  | Redis Sentinel/Cluster with replica promotion; circuit breaker returns cached results     |
+| Kafka consumer lag                     | Geo index shows stale driver positions (up to minutes old)                         | Consumer group lag alerting; auto-scale consumer group; reduce batch sizes                |
+| Kafka–Redis consumer network partition | Consumer cannot write to Redis; geo index freezes in place                         | Consumer retries with backoff; Kafka retains messages (24h TTL) for replay on recovery    |
+| Location Service overload              | Location updates dropped                                                           | Rate-limit at 1 update/driver/2s; Kafka acts as buffer, absorbs bursts                    |
+| ETA service down                       | Matching falls back to distance-only ranking                                       | Circuit breaker; cache last-known ETAs; distance as fallback metric                       |
+| PostGIS failover                       | Historical queries fail; real-time matching unaffected                             | Read replicas; Redis is source of truth for real-time, PostGIS is read-heavy              |
+| Driver GPS spoofing                    | Driver appears at fake location to cherry-pick rides                               | Server-side velocity check; cross-validate with cell tower data; ML anomaly detection     |
+| "Cold start" in a new city             | No drivers → no rides → no drivers (chicken-and-egg)                               | Seed market with incentivized supply; pre-compute ETAs for common routes                  |
+| Surge pricing race condition           | Two workers compute surge simultaneously; last-write-wins                          | Redis Lua script for atomic read-modify-write; partition surge computation by cell        |
+| Split-brain: Redis replica divergence  | Two dispatch nodes see different driver positions                                  | Quorum reads via Redis Cluster; accept eventual consistency within one update interval    |
+| Mass driver disconnect (shift change)  | 10–20% of drivers go OFFLINE simultaneously; GEOSEARCH returns 0 in affected cells | Radius expansion (1→2→5→10km); pre-warm adjacent cell caches; display "drivers coming" UX |
 
 ---
 

@@ -234,7 +234,8 @@ from scratch. This is the event sourcing superpower — the event log is the gro
   events. Design events to be backward-compatible: add optional fields, never remove required ones. For breaking
   changes, introduce a new event type (order.created.v2) or use an upcaster in the consumer."
 - "Event versioning in practice: I include a `schema_version` field in every event envelope. When a breaking change is
-  needed, I add an upcaster — a small function that sits at the consumer's deserialization boundary and maps old payloads
+  needed, I add an upcaster — a small function that sits at the consumer's deserialization boundary and maps old
+  payloads
   to the current shape. The projection handler only ever sees the latest shape, and the upcaster chain accumulates
   version-specific transforms. This is more maintainable than scattering `if version == 1` checks through domain logic.
   For cross-team contracts, I enforce compatibility at the Schema Registry layer (BACKWARD mode) so producers cannot

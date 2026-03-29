@@ -247,7 +247,7 @@ docker compose down -v
   blog series on Stack Overflow's architecture.
 - **Google:** Uses weighted least-connections internally (via Maglev, their software load balancer) and combines active
   health checks with real-time traffic signals to remove unhealthy backends within seconds — source: Maglev paper, NSDI
-  2016.
+    2016.
 
 ## Common Mistakes
 

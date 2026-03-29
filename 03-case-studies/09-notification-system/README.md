@@ -64,16 +64,16 @@ forks:
 
 ### Capacity Estimation
 
-| Metric                      | Calculation                      | Result         |
-|-----------------------------|----------------------------------|----------------|
-| Push RPS                    | 350M / 86,400s                   | ~4,050 RPS     |
-| Email RPS                   | 150M / 86,400s                   | ~1,735 RPS     |
-| SMS RPS                     | 50M / 86,400s                    | ~580 RPS       |
-| In-app RPS                  | 450M / 86,400s                   | ~5,200 RPS     |
-| Kafka partition count       | ~35K peak RPS / 1K per partition | ~35 partitions |
-| User preferences in Redis   | 500M users × 50B                 | ~25 GB         |
-| Idempotency key store (24h) | 1B keys × 100B                   | ~100 GB        |
-| Kafka retention (1 day)     | 1B events/day × 200B × 3 replicas | ~600 GB/day   |
+| Metric                      | Calculation                       | Result         |
+|-----------------------------|-----------------------------------|----------------|
+| Push RPS                    | 350M / 86,400s                    | ~4,050 RPS     |
+| Email RPS                   | 150M / 86,400s                    | ~1,735 RPS     |
+| SMS RPS                     | 50M / 86,400s                     | ~580 RPS       |
+| In-app RPS                  | 450M / 86,400s                    | ~5,200 RPS     |
+| Kafka partition count       | ~35K peak RPS / 1K per partition  | ~35 partitions |
+| User preferences in Redis   | 500M users × 50B                  | ~25 GB         |
+| Idempotency key store (24h) | 1B keys × 100B                    | ~100 GB        |
+| Kafka retention (1 day)     | 1B events/day × 200B × 3 replicas | ~600 GB/day    |
 
 ---
 
@@ -507,9 +507,11 @@ docker compose --profile experiment down -v
     `expires_at = now + 10 min`. (2) Auth service produces notification event with
     `{type: transactional, channel: email, user_id, message: "OTP: 123456", idempotency_key: hash(event_id), expires_at}`. (
     3) Notification service produces to `notifications-transactional` Kafka topic. (4) Email worker picks up within
-    seconds (transactional has dedicated consumer). (5) Worker checks preferences (email enabled?), checks dedup, checks
-    `expires_at` (drop if expired), calls SendGrid API. (6) User receives email in < 5 seconds. On failure, retry up to
-    5 times with backoff. If all fail → DLQ + alert on-call.
+       seconds (transactional has dedicated consumer). (5) Worker checks preferences (email enabled?), checks dedup,
+       checks
+       `expires_at` (drop if expired), calls SendGrid API. (6) User receives email in < 5 seconds. On failure, retry up
+       to
+       5 times with backoff. If all fail → DLQ + alert on-call.
 
 11. **Q: How would you design for a celebrity with 50M followers posting content?**
     A: Use a hybrid fan-out strategy. Flag celebrity accounts (above a threshold, e.g., 1M followers) in the social

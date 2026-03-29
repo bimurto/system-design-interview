@@ -233,7 +233,14 @@ A user's events may be spread across multiple partitions (if keyed by a hash oth
 sees events for the same user arriving in non-event-time order. This is why watermarks are per-partition and the global
 watermark is the minimum across all partitions.
 
-**Operator chaining breaks watermark propagation (Flink gotcha):** Flink fuses consecutive operators into a single JVM thread (operator chaining) to avoid serialization overhead. This is usually a win, but it can silently break watermark propagation when a chained operator performs blocking I/O (e.g., a synchronous database lookup). The upstream source advances its watermark, but the chained operator is blocked, so the watermark is never forwarded downstream — all windows stall as if a partition went idle. The fix is to either (a) break the chain at the blocking operator (`operator.disableChaining()`) so it runs in its own thread, or (b) replace the synchronous call with Flink's `AsyncDataStream.unorderedWait()` so the operator never blocks. In interviews, mention this when discussing why end-to-end watermark latency can exceed the configured `allowed_lateness` even in a healthy job.
+**Operator chaining breaks watermark propagation (Flink gotcha):** Flink fuses consecutive operators into a single JVM
+thread (operator chaining) to avoid serialization overhead. This is usually a win, but it can silently break watermark
+propagation when a chained operator performs blocking I/O (e.g., a synchronous database lookup). The upstream source
+advances its watermark, but the chained operator is blocked, so the watermark is never forwarded downstream — all
+windows stall as if a partition went idle. The fix is to either (a) break the chain at the blocking operator (
+`operator.disableChaining()`) so it runs in its own thread, or (b) replace the synchronous call with Flink's
+`AsyncDataStream.unorderedWait()` so the operator never blocks. In interviews, mention this when discussing why
+end-to-end watermark latency can exceed the configured `allowed_lateness` even in a healthy job.
 
 ## Interview Talking Points
 

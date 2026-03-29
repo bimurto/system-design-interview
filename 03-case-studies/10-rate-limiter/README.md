@@ -3,6 +3,7 @@
 **Prerequisites:** `../../02-advanced/09-rate-limiting-algorithms/`, `../../02-advanced/07-distributed-caching/`
 
 **Interview time budget:** ~45 minutes total
+
 - Clarify Requirements: 3–5 min
 - Capacity Estimation: 3–5 min
 - High-Level Design: 10 min
@@ -12,27 +13,30 @@
 
 ## 1. Clarify Requirements
 
-Start by narrowing the problem. Interviewers want to see you distinguish between what must be precise vs. what can be approximate.
+Start by narrowing the problem. Interviewers want to see you distinguish between what must be precise vs. what can be
+approximate.
 
 **Key questions to ask (and expected answers for FAANG context):**
 
-| Question | Why it matters |
-|---|---|
-| Who enforces the limit — gateway, service, or client SDK? | Determines where Redis lives in the request path |
-| Per IP, per API key, per user, or all three? | Each adds a Redis key per request |
-| Fixed-window, sliding-window, or token bucket? | Affects memory, burst behaviour, and Redis key count |
-| Fail open or fail closed when Redis is down? | Safety vs. availability trade-off |
-| Synchronous check (< 1ms) or async/best-effort? | Synchronous requires intra-DC Redis; async allows local counting |
-| Exact global enforcement or approximate? | Exact → central counter; approximate → local counting + sync |
-| Multi-region? | Central Redis adds cross-region latency; local counting with sync is the only viable option |
+| Question                                                  | Why it matters                                                                              |
+|-----------------------------------------------------------|---------------------------------------------------------------------------------------------|
+| Who enforces the limit — gateway, service, or client SDK? | Determines where Redis lives in the request path                                            |
+| Per IP, per API key, per user, or all three?              | Each adds a Redis key per request                                                           |
+| Fixed-window, sliding-window, or token bucket?            | Affects memory, burst behaviour, and Redis key count                                        |
+| Fail open or fail closed when Redis is down?              | Safety vs. availability trade-off                                                           |
+| Synchronous check (< 1ms) or async/best-effort?           | Synchronous requires intra-DC Redis; async allows local counting                            |
+| Exact global enforcement or approximate?                  | Exact → central counter; approximate → local counting + sync                                |
+| Multi-region?                                             | Central Redis adds cross-region latency; local counting with sync is the only viable option |
 
 **Functional requirements (agreed):**
+
 - Enforce rate limits per API key, per IP, per endpoint
 - Support multiple limit tiers (trial, standard, premium)
 - Return 429 Too Many Requests with informative headers
 - Allow configuring different limits without code deployments
 
 **Non-functional requirements:**
+
 - Rate limit check must add < 1ms to request latency
 - Globally consistent: same API key seen by any server consumes the same quota
 - Fault tolerant: if rate limit store is unavailable, define clear fail behaviour
@@ -203,11 +207,11 @@ seconds and re-registers the Lua script on reconnect.
 
 **Redis HA options to reduce outage frequency:**
 
-| Option | Failover time | Data loss | Complexity |
-|---|---|---|---|
-| Redis Sentinel (1 primary + 2 replicas) | ~30s automatic | Up to 1s of writes | Low |
-| Redis Cluster (3 primary shards) | ~10s automatic | Up to 1s per shard | Medium |
-| Redis Enterprise Active-Active | Near-zero | Possible CRDT merge conflicts | High |
+| Option                                  | Failover time  | Data loss                     | Complexity |
+|-----------------------------------------|----------------|-------------------------------|------------|
+| Redis Sentinel (1 primary + 2 replicas) | ~30s automatic | Up to 1s of writes            | Low        |
+| Redis Cluster (3 primary shards)        | ~10s automatic | Up to 1s per shard            | Medium     |
+| Redis Enterprise Active-Active          | Near-zero      | Possible CRDT merge conflicts | High       |
 
 For rate limiting, losing 1s of counter increments during failover is acceptable — a brief counter reset does not cause
 harm (a client gets a short reprieve, not a free pass indefinitely).
@@ -261,7 +265,8 @@ consume 1 token if available.
 
 ### 4.6 Sliding Window Log: Exact but Expensive
 
-The sliding window log is the only algorithm that provides an exact sliding window — no approximation error. Each request
+The sliding window log is the only algorithm that provides an exact sliding window — no approximation error. Each
+request
 is stored as a timestamped entry in a Redis sorted set (ZADD). On each new request:
 
 ```lua
@@ -550,7 +555,8 @@ docker compose down -v
 14. **Q: A client's SDK is hammering your API with retries after hitting 429. What header prevents this?**
     A: `Retry-After` (RFC 7231). The value is the number of seconds the client must wait before retrying. A well-behaved
     SDK sleeps exactly `Retry-After` seconds instead of applying exponential backoff. Without this header, all clients
-    that hit the 429 at the same moment will retry at independently randomised intervals — many will collide again at the
+    that hit the 429 at the same moment will retry at independently randomised intervals — many will collide again at
+    the
     window boundary (thundering herd). With `Retry-After` set to the exact seconds until window reset, all clients
     spread their retries across the new window as they each back off by the same duration. Also include
     `X-RateLimit-Reset` (Unix timestamp of window end) so SDKs that prefer absolute time can use it instead.
@@ -560,6 +566,7 @@ docker compose down -v
     budget. The only scalable approach is local counting per region with periodic synchronization (every 1–10s). Each
     region enforces the full limit independently; the sync aggregates counts globally to detect sustained multi-region
     abuse. During the sync gap, a globally distributed client can briefly exceed the limit by up to N_regions×limit.
-    This is acceptable for rate limiting (brief over-counting is not catastrophic) but not for billing or quota enforcement
+    This is acceptable for rate limiting (brief over-counting is not catastrophic) but not for billing or quota
+    enforcement
     where exact counting is required. For billing-grade accuracy across regions, you need async event streaming
     (Kafka/Kinesis) with a global aggregator — at the cost of eventual consistency and higher system complexity.

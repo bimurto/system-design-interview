@@ -172,10 +172,12 @@ time.
 
 **Bloom filter saturation:** If more items are added than the designed capacity, the bit array fills up and the false
 positive rate rises sharply — approaching 100% as the array becomes all 1s. The **fill ratio** (fraction of bits set to
+
 1) is the key operational metric: at the optimal operating point the fill ratio is ~0.5 (maximum entropy); above 0.8 the
-filter is significantly degraded; at 1.0 every query returns "probably yes". Solution: monitor the actual insertion
-count against the designed capacity; provision a new Bloom filter when approaching capacity. Redis BF supports scaling
-with `BF.RESERVE` expansion factors.
+   filter is significantly degraded; at 1.0 every query returns "probably yes". Solution: monitor the actual insertion
+   count against the designed capacity; provision a new Bloom filter when approaching capacity. Redis BF supports
+   scaling
+   with `BF.RESERVE` expansion factors.
 
 **HyperLogLog small cardinality error:** For very small sets (< 2.5×m where m=16384 registers), HyperLogLog switches to
 an exact linear counting algorithm internally. This transition can cause a discontinuity in estimates around

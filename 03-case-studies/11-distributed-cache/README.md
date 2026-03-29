@@ -29,18 +29,22 @@ network RTT, cluster routing. Understanding these limits lets you design around 
 Before designing, nail down the scope. These are the questions an interviewer expects at a FAANG interview:
 
 **Functional scope**
+
 - What is the primary workload? Read-heavy (timeline cache), write-heavy (session store), or mixed?
-- What data structures are needed beyond key-value strings? (sorted sets for leaderboards, HyperLogLog for unique counts)
+- What data structures are needed beyond key-value strings? (sorted sets for leaderboards, HyperLogLog for unique
+  counts)
 - Do clients need pub/sub or streaming? Or is this purely a cache?
 - Is persistence required, or is this a pure in-process cache that cold-starts from the source of truth?
 
 **Scale and SLOs**
+
 - What is the dataset size? (10GB? 10TB? 40TB?)
 - What is the target throughput? (ops/s per node, aggregate across cluster)
 - What is the latency SLO? (P50, P99 GET latency — sub-millisecond is the standard ask)
 - What is the acceptable cache miss rate? (impacts DB headroom sizing)
 
 **Availability and durability**
+
 - What is the tolerable data loss window on a node crash? (0s? 1s? minutes?)
 - Can the cache be cold-started from the backing DB on a full cluster failure?
 - Multi-region? Active-active or active-passive replication across DCs?
@@ -68,16 +72,16 @@ P99 < 1ms, 1s acceptable data loss, multi-region active-passive.
 
 ### Step 3 — Capacity Estimation (3–5 min)
 
-| Metric                      | Calculation                                    | Result              |
-|-----------------------------|------------------------------------------------|---------------------|
-| Memory per cached item      | 100B key + 200B value + 64B overhead           | ~364B               |
-| Items per GB                | 1GB / 364B                                     | ~2.7M items         |
-| Redis nodes for 40TB        | 40TB / (64GB per node × 0.75 headroom)         | ~834 nodes          |
-| Ops/s per node              | 500K simple ops/s                              | —                   |
-| Nodes for 5M ops/s          | 5M / 500K                                      | 10 nodes minimum    |
-| Network per node (get/set)  | 500K ops/s × avg 300B payload                  | ~150MB/s (~1.2Gbps) |
-| Replication bandwidth       | 150MB/s × 1 replica per master                 | ~150MB/s per master |
-| COW memory spike (BGSAVE)   | Working set × 50% (write-heavy workload)       | Up to 1.5× RSS      |
+| Metric                     | Calculation                              | Result              |
+|----------------------------|------------------------------------------|---------------------|
+| Memory per cached item     | 100B key + 200B value + 64B overhead     | ~364B               |
+| Items per GB               | 1GB / 364B                               | ~2.7M items         |
+| Redis nodes for 40TB       | 40TB / (64GB per node × 0.75 headroom)   | ~834 nodes          |
+| Ops/s per node             | 500K simple ops/s                        | —                   |
+| Nodes for 5M ops/s         | 5M / 500K                                | 10 nodes minimum    |
+| Network per node (get/set) | 500K ops/s × avg 300B payload            | ~150MB/s (~1.2Gbps) |
+| Replication bandwidth      | 150MB/s × 1 replica per master           | ~150MB/s per master |
+| COW memory spike (BGSAVE)  | Working set × 50% (write-heavy workload) | Up to 1.5× RSS      |
 
 **Interviewer signal:** knowing that network bandwidth (not CPU) is the Redis bottleneck at scale, and that BGSAVE
 can spike memory by 50%, separates senior from mid-level candidates.
@@ -278,12 +282,14 @@ destination handles commands after.
 Understanding failure modes is the difference between a good and great FAANG interview answer.
 
 **Master node crash (no replica):**
+
 - All keys on that node's slot range are inaccessible.
 - Cluster enters `cluster_state: fail` if `cluster-require-full-coverage yes` (default).
 - With `cluster-require-full-coverage no`, surviving nodes continue serving their slots.
 - Mitigation: always run at least one replica per master. For write-heavy shards, run two replicas.
 
 **Master crash with replica (failover):**
+
 - Remaining masters detect the failure after `cluster-node-timeout` ms (default 15s).
 - Replica with the most up-to-date replication offset is elected master.
 - Writes during the 15s window are lost if they were not yet replicated (async replication).
@@ -291,6 +297,7 @@ Understanding failure modes is the difference between a good and great FAANG int
 - Redis Enterprise and Valkey offer semi-synchronous replication to reduce the loss window.
 
 **Network partition (split-brain):**
+
 - If a master is partitioned from the majority, it keeps serving writes locally.
 - Majority side elects a new master from the replica.
 - On partition heal, the old master (minority side) detects a higher config epoch and demotes itself.
@@ -299,35 +306,38 @@ Understanding failure modes is the difference between a good and great FAANG int
   writes if it loses contact with replicas, preventing split-brain write divergence.
 
 **Memory OOM (maxmemory reached, noeviction policy):**
+
 - All new write commands return `OOM command not allowed when used memory > maxmemory` error.
 - Application must handle `ResponseError` and implement backpressure.
 - Mitigation: use `allkeys-lru` or `allkeys-lfu` so Redis evicts automatically. Monitor
   `evicted_keys` counter — a non-zero value means the cache is under pressure.
 
 **Cache stampede (thundering herd):**
+
 - Hot key expires; N concurrent threads all miss simultaneously and all query the backing DB.
 - At scale (10K req/s hitting a single expired key) this can cascade into a DB outage.
 - Mitigations:
-  - **Probabilistic Early Recomputation (PER):** refresh before TTL expires, with probability
-    proportional to `compute_time / TTL_remaining`. Eliminates the expiry window entirely.
-  - **Mutex / single-flight:** first thread acquires a lock and populates; others wait or return stale.
-  - **Stale-while-revalidate:** return the stale cached value immediately; async refresh in background.
-  - **Jittered TTLs:** add `random(0, TTL * 0.1)` to TTLs to prevent synchronized expiration of
-    many keys written at the same time (e.g., after a cache warm-up).
+    - **Probabilistic Early Recomputation (PER):** refresh before TTL expires, with probability
+      proportional to `compute_time / TTL_remaining`. Eliminates the expiry window entirely.
+    - **Mutex / single-flight:** first thread acquires a lock and populates; others wait or return stale.
+    - **Stale-while-revalidate:** return the stale cached value immediately; async refresh in background.
+    - **Jittered TTLs:** add `random(0, TTL * 0.1)` to TTLs to prevent synchronized expiration of
+      many keys written at the same time (e.g., after a cache warm-up).
 
 **Hot key (single-slot bottleneck):**
+
 - One key or slot receives disproportionate traffic; that node's CPU and network saturate.
 - A single Redis node handles ~500K ops/s. One viral key driving 1M reads/s will saturate one node.
 - Mitigations: client-side caching (local LRU), key sharding (N replicated copies), replica reads.
 
-| Failure Mode          | Detection Signal                        | Mitigation                                     |
-|-----------------------|-----------------------------------------|------------------------------------------------|
-| Master crash          | `cluster_state: fail`, CLUSTERDOWN err  | Replica per master, reduce node-timeout        |
-| Split-brain writes    | Config epoch mismatch on heal           | `min-replicas-to-write 1`                      |
-| OOM / eviction        | `evicted_keys` counter, OOM errors      | `allkeys-lru`, increase maxmemory or add nodes |
-| Cache stampede        | DB spike on popular key TTL expiry      | PER, mutex, stale-while-revalidate, jitter     |
-| Hot key               | One node CPU high, others idle          | Client cache, key sharding, replica reads      |
-| Slow command blocking | P99 latency spike on all keys on node   | Ban O(N) commands; use SCAN, SSCAN, HSCAN      |
+| Failure Mode          | Detection Signal                       | Mitigation                                     |
+|-----------------------|----------------------------------------|------------------------------------------------|
+| Master crash          | `cluster_state: fail`, CLUSTERDOWN err | Replica per master, reduce node-timeout        |
+| Split-brain writes    | Config epoch mismatch on heal          | `min-replicas-to-write 1`                      |
+| OOM / eviction        | `evicted_keys` counter, OOM errors     | `allkeys-lru`, increase maxmemory or add nodes |
+| Cache stampede        | DB spike on popular key TTL expiry     | PER, mutex, stale-while-revalidate, jitter     |
+| Hot key               | One node CPU high, others idle         | Client cache, key sharding, replica reads      |
+| Slow command blocking | P99 latency spike on all keys on node  | Ban O(N) commands; use SCAN, SSCAN, HSCAN      |
 
 ---
 

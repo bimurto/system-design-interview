@@ -489,4 +489,4 @@ docker compose down -v
     `{type: "receipt", msg_id: "abc123", status: "sent"}`. (6) Bob connects hours later → auth handler queries
     `SELECT * FROM messages WHERE recipient='bob' AND status='sent'`. (7) Server delivers ciphertext to Bob's device. (
     8) Bob's app decrypts with his private key. (9) Server updates status='delivered', sends ACK2 to Alice. (10) Bob
-    opens chat → app sends read event → ACK3 to Alice.
+       opens chat → app sends read event → ACK3 to Alice.

@@ -349,7 +349,7 @@ docker compose down -v
   limiting. Their "Twemproxy" (proxy for Redis/Memcached clusters) was widely used before Redis Cluster became
   production-ready. Their hot-tweet problem (a celebrity tweet gets millions of likes in seconds) is solved by local
   in-process caching in each API server for the hottest keys. Source: Twitter Engineering, "Caching with Twemproxy,"
-  2012.
+    2012.
 - **Snapchat's Mustache:** Snapchat built "Mustache," a distributed cache layer on top of Redis Cluster, to handle their
   high-cardinality user data (each user's snap count, story views, etc.). Their hot key problem arises when a
   celebrity's story goes viral; their solution is per-key read replicas that can be spun up dynamically. Source:

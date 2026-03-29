@@ -328,8 +328,8 @@ services:
     image: python:3.11-slim
   nginx:
     image: nginx:alpine
-    ports: ["8080:80"]
-    depends_on: [app1, app2, app3]
+    ports: [ "8080:80" ]
+    depends_on: [ app1, app2, app3 ]
 ```
 
 Use a proper nginx.conf with upstream round-robin to all 3 app containers.
@@ -775,8 +775,8 @@ real-time search (NRT), index vs search latency trade-off.
 - [ ] **Step 2: Write docker-compose.yml** — Elasticsearch + Kibana.
 
 - [ ] **Step 3: Write experiment.py** — (1) index 10K product documents. (2) full-text search with relevance scoring. (
-  3) faceted search (filter by category + price range + rating). (4) geo-search (find products near coordinates). (5)
-  show how custom analyzer affects tokenization.
+    3) faceted search (filter by category + price range + rating). (4) geo-search (find products near coordinates). (5)
+       show how custom analyzer affects tokenization.
 
 - [ ] **Step 4: Verify + Commit** — `feat: add search systems advanced topic`
 

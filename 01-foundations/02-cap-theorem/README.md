@@ -32,7 +32,8 @@ errors). Neither is universally superior; the choice depends on the application'
 
 > **Important nuance:** A "partition" is not only a full network split. High latency between nodes (e.g., >100ms
 > round-trip) is functionally equivalent to a partition if your system requires synchronous replication: writes either
-> block indefinitely or time out. In practice, CAP's partition case is triggered by any condition that prevents nodes from
+> block indefinitely or time out. In practice, CAP's partition case is triggered by any condition that prevents nodes
+> from
 > coordinating within a bounded time.
 
 ## How It Works
