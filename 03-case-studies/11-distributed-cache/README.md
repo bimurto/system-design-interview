@@ -24,7 +24,33 @@ network RTT, cluster routing. Understanding these limits lets you design around 
 
 ---
 
-## Requirements
+## Step 1 — Clarify Requirements (3–5 min)
+
+Before designing, nail down the scope. These are the questions an interviewer expects at a FAANG interview:
+
+**Functional scope**
+- What is the primary workload? Read-heavy (timeline cache), write-heavy (session store), or mixed?
+- What data structures are needed beyond key-value strings? (sorted sets for leaderboards, HyperLogLog for unique counts)
+- Do clients need pub/sub or streaming? Or is this purely a cache?
+- Is persistence required, or is this a pure in-process cache that cold-starts from the source of truth?
+
+**Scale and SLOs**
+- What is the dataset size? (10GB? 10TB? 40TB?)
+- What is the target throughput? (ops/s per node, aggregate across cluster)
+- What is the latency SLO? (P50, P99 GET latency — sub-millisecond is the standard ask)
+- What is the acceptable cache miss rate? (impacts DB headroom sizing)
+
+**Availability and durability**
+- What is the tolerable data loss window on a node crash? (0s? 1s? minutes?)
+- Can the cache be cold-started from the backing DB on a full cluster failure?
+- Multi-region? Active-active or active-passive replication across DCs?
+
+**The typical answer for a FAANG-scale cache:** read-heavy (95% reads), 40TB dataset, 5M ops/s aggregate,
+P99 < 1ms, 1s acceptable data loss, multi-region active-passive.
+
+---
+
+## Step 2 — Requirements
 
 ### Functional
 
@@ -40,19 +66,25 @@ network RTT, cluster routing. Understanding these limits lets you design around 
 - Memory-efficient storage (minimize overhead per key)
 - Cluster-mode: no single point of failure per shard
 
-### Capacity Estimation
+### Step 3 — Capacity Estimation (3–5 min)
 
-| Metric                 | Calculation                            | Result           |
-|------------------------|----------------------------------------|------------------|
-| Memory per cached item | 100B key + 200B value + 64B overhead   | ~364B            |
-| Items per GB           | 1GB / 364B                             | ~2.7M items      |
-| Redis nodes for 40TB   | 40TB / (64GB per node × 0.75 headroom) | ~834 nodes       |
-| Ops/s per node         | 500K simple ops/s                      | —                |
-| Nodes for 5M ops/s     | 5M / 500K                              | 10 nodes minimum |
+| Metric                      | Calculation                                    | Result              |
+|-----------------------------|------------------------------------------------|---------------------|
+| Memory per cached item      | 100B key + 200B value + 64B overhead           | ~364B               |
+| Items per GB                | 1GB / 364B                                     | ~2.7M items         |
+| Redis nodes for 40TB        | 40TB / (64GB per node × 0.75 headroom)         | ~834 nodes          |
+| Ops/s per node              | 500K simple ops/s                              | —                   |
+| Nodes for 5M ops/s          | 5M / 500K                                      | 10 nodes minimum    |
+| Network per node (get/set)  | 500K ops/s × avg 300B payload                  | ~150MB/s (~1.2Gbps) |
+| Replication bandwidth       | 150MB/s × 1 replica per master                 | ~150MB/s per master |
+| COW memory spike (BGSAVE)   | Working set × 50% (write-heavy workload)       | Up to 1.5× RSS      |
+
+**Interviewer signal:** knowing that network bandwidth (not CPU) is the Redis bottleneck at scale, and that BGSAVE
+can spike memory by 50%, separates senior from mid-level candidates.
 
 ---
 
-## High-Level Architecture
+## Step 4 — High-Level Architecture
 
 ```
   Application Servers
@@ -87,7 +119,7 @@ cluster client caches this mapping locally. On `MOVED` error (wrong node), clien
 
 ---
 
-## Deep Dives
+## Step 5 — Deep Dives
 
 ### 1. Redis Single-Threaded Model: Why It's Fast
 
@@ -241,6 +273,62 @@ Key insight: migration is done key-by-key, not slot-at-a-time. A slot with 1M ke
 slot takes milliseconds. During migration, the source node handles commands that arrive before the key is migrated; the
 destination handles commands after.
 
+### 7. Failure Modes and Mitigations
+
+Understanding failure modes is the difference between a good and great FAANG interview answer.
+
+**Master node crash (no replica):**
+- All keys on that node's slot range are inaccessible.
+- Cluster enters `cluster_state: fail` if `cluster-require-full-coverage yes` (default).
+- With `cluster-require-full-coverage no`, surviving nodes continue serving their slots.
+- Mitigation: always run at least one replica per master. For write-heavy shards, run two replicas.
+
+**Master crash with replica (failover):**
+- Remaining masters detect the failure after `cluster-node-timeout` ms (default 15s).
+- Replica with the most up-to-date replication offset is elected master.
+- Writes during the 15s window are lost if they were not yet replicated (async replication).
+- Mitigation: reduce `cluster-node-timeout` to 3–5s for faster failover. Accept ~3s write loss.
+- Redis Enterprise and Valkey offer semi-synchronous replication to reduce the loss window.
+
+**Network partition (split-brain):**
+- If a master is partitioned from the majority, it keeps serving writes locally.
+- Majority side elects a new master from the replica.
+- On partition heal, the old master (minority side) detects a higher config epoch and demotes itself.
+- All writes accepted by the minority-side master during the partition are discarded.
+- Mitigation: `min-replicas-to-write` and `min-replicas-max-lag` force the master to stop accepting
+  writes if it loses contact with replicas, preventing split-brain write divergence.
+
+**Memory OOM (maxmemory reached, noeviction policy):**
+- All new write commands return `OOM command not allowed when used memory > maxmemory` error.
+- Application must handle `ResponseError` and implement backpressure.
+- Mitigation: use `allkeys-lru` or `allkeys-lfu` so Redis evicts automatically. Monitor
+  `evicted_keys` counter — a non-zero value means the cache is under pressure.
+
+**Cache stampede (thundering herd):**
+- Hot key expires; N concurrent threads all miss simultaneously and all query the backing DB.
+- At scale (10K req/s hitting a single expired key) this can cascade into a DB outage.
+- Mitigations:
+  - **Probabilistic Early Recomputation (PER):** refresh before TTL expires, with probability
+    proportional to `compute_time / TTL_remaining`. Eliminates the expiry window entirely.
+  - **Mutex / single-flight:** first thread acquires a lock and populates; others wait or return stale.
+  - **Stale-while-revalidate:** return the stale cached value immediately; async refresh in background.
+  - **Jittered TTLs:** add `random(0, TTL * 0.1)` to TTLs to prevent synchronized expiration of
+    many keys written at the same time (e.g., after a cache warm-up).
+
+**Hot key (single-slot bottleneck):**
+- One key or slot receives disproportionate traffic; that node's CPU and network saturate.
+- A single Redis node handles ~500K ops/s. One viral key driving 1M reads/s will saturate one node.
+- Mitigations: client-side caching (local LRU), key sharding (N replicated copies), replica reads.
+
+| Failure Mode          | Detection Signal                        | Mitigation                                     |
+|-----------------------|-----------------------------------------|------------------------------------------------|
+| Master crash          | `cluster_state: fail`, CLUSTERDOWN err  | Replica per master, reduce node-timeout        |
+| Split-brain writes    | Config epoch mismatch on heal           | `min-replicas-to-write 1`                      |
+| OOM / eviction        | `evicted_keys` counter, OOM errors      | `allkeys-lru`, increase maxmemory or add nodes |
+| Cache stampede        | DB spike on popular key TTL expiry      | PER, mutex, stale-while-revalidate, jitter     |
+| Hot key               | One node CPU high, others idle          | Client cache, key sharding, replica reads      |
+| Slow command blocking | P99 latency spike on all keys on node   | Ban O(N) commands; use SCAN, SSCAN, HSCAN      |
+
 ---
 
 ## How It Actually Works
@@ -290,7 +378,7 @@ docker run --rm --network 11-distributed-cache_default \
   python:3.11-slim sh -c "pip install redis --quiet && python /experiment.py"
 ```
 
-The script runs 7 phases:
+The script runs 8 phases:
 
 1. **Pipeline:** 1000 individual GETs vs 1000 pipelined GETs — show speedup
 2. **Eviction:** fill redis-1 past maxmemory → show LRU eviction, hot vs cold key survival
@@ -299,6 +387,7 @@ The script runs 7 phases:
 5. **RDB snapshot:** BGSAVE timing with 5,000 pre-filled keys
 6. **Cluster slots:** show hash slot → node mapping, hash tag co-location, CROSSSLOT error
 7. **Hot key problem:** uneven load simulation and mitigation strategies
+8. **Cache stampede:** no protection vs mutex vs Probabilistic Early Recomputation (PER)
 
 ### Break It
 
@@ -423,3 +512,22 @@ docker compose down -v
     write latency by making the DB write asynchronous — best for high-write, tolerance-for-loss workloads like analytics
     counters or like counts. The key interview point: write-behind requires a durable write queue to avoid losing
     unflushed writes on cache node failure.
+
+12. **Q: What are the failure modes of a Redis Cluster and how do you mitigate them?**
+    A: Three key failure modes: (1) Master crash — if a replica exists, automatic failover within `cluster-node-timeout`
+    ms (default 15s) promotes the replica; writes during that window are lost. Reduce timeout to 3–5s to shorten the
+    loss window. (2) Network partition / split-brain — the minority-side master keeps accepting writes that are
+    discarded when the partition heals. Use `min-replicas-to-write 1` to force the master to stop accepting writes when
+    it cannot replicate. (3) Cache stampede — hot key expires; all concurrent threads miss and hammer the DB
+    simultaneously. Mitigate with Probabilistic Early Recomputation (refresh before expiry with probability ∝
+    1/TTL_remaining), mutex-based single-flight, or stale-while-revalidate. Bonus: jitter TTLs on initial load to
+    avoid synchronized expiry of bulk-loaded keys.
+
+13. **Q: How would you prevent a cache stampede at Twitter scale?**
+    A: The best production answer combines three techniques: (1) **Jittered TTLs** — when populating cache, add
+    `random(0, TTL * 0.1)` so keys don't expire at the same second (prevents synchronized stampedes on bulk loads).
+    (2) **Probabilistic Early Recomputation (PER)** — recompute the value before it expires, with probability
+    proportional to `delta * beta * -log(rand()) > TTL_remaining`. One thread refreshes early; others see valid
+    cached data throughout. No lock, no stale window. (3) **Stale-while-revalidate** for cases where brief staleness
+    is acceptable — return the cached value immediately and asynchronously refresh. The mutex/single-flight pattern
+    is simpler but adds tail latency (threads waiting for the single refresher).

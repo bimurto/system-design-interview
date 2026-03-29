@@ -51,3 +51,5 @@ services:
     environment:
       - AUTH_HOST=auth-service
       - API_HOST=api-service
+    mem_limit: 128m
+    restart: unless-stopped

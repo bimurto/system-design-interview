@@ -5,19 +5,34 @@ services:
       POSTGRES_DB: payments
       POSTGRES_USER: app
       POSTGRES_PASSWORD: secret
+    # No named volume: `docker compose down -v` wipes state intentionally for lab resets.
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U app -d payments" ]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   redis:
     image: redis:7
+    # Append-only file disabled: persistence not needed for this lab.
+    command: redis-server --save "" --appendonly no
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
 
   payment-service:
     image: python:3.11-slim
@@ -31,6 +46,8 @@ services:
       REDIS_URL: redis://redis:6379
     volumes:
       - ./payment_service.py:/payment_service.py
+      # pip cache volume: avoids re-downloading packages on every `docker compose up`.
+      - pip-cache:/root/.cache/pip
     command: >
       sh -c "pip install flask psycopg2-binary redis --quiet && python /payment_service.py"
     ports:
@@ -41,4 +58,12 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+volumes:
+  pip-cache:

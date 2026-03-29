@@ -11,10 +11,11 @@ What this demonstrates:
   6. Simulate timeout + retry: same key → safe, idempotent
   7. Refund: reverse original charge, verify ledger still balanced
   8. Double-refund prevention: second refund on same txn → rejected
+  9. Reconcile endpoint: server-side invariant verification
 
 Run:
   docker compose up -d
-  # Wait ~30s for payment-service to be healthy
+  # Wait ~45s for payment-service to be healthy
   python experiment.py
 """
 
@@ -36,7 +37,7 @@ def section(title: str):
     print("=" * 62)
 
 
-def wait_for_service(url: str, max_wait: int = 60):
+def wait_for_service(url: str, max_wait: int = 90):
     print(f"  Waiting for payment service at {url} ...")
     for i in range(max_wait):
         try:
@@ -45,7 +46,7 @@ def wait_for_service(url: str, max_wait: int = 60):
             return
         except Exception:
             time.sleep(1)
-    raise RuntimeError("Payment service not ready")
+    raise RuntimeError("Payment service not ready after 90s — is docker compose up?")
 
 
 def post_json(path: str, data: dict) -> tuple[int, dict]:
@@ -116,16 +117,18 @@ def phase1_double_entry():
     credits = sum(float(e["amount"]) for e in entries if e["entry_type"] == "credit")
     print(f"\n  Total debits:  ${debits:.2f}")
     print(f"  Total credits: ${credits:.2f}")
-    print(f"  Balanced:      {abs(debits - credits) < 0.001}")
+    balanced = abs(debits - credits) < 0.001
+    print(f"  Balanced:      {balanced}")
+    assert balanced, "ERROR: debit/credit totals do not match for this transaction"
 
     print(f"""
   Double-entry rule:
-  Every charge creates EXACTLY TWO entries:
+  Every charge creates EXACTLY TWO ledger entries:
     1. Debit  customer account  (money leaves customer)
     2. Credit merchant account  (money arrives at merchant)
 
-  The SUM of all amounts x sign must equal ZERO.
-  This is the fundamental invariant of accounting.
+  SUM(credits) - SUM(debits) == 0 for any closed set of entries.
+  This is the 500-year-old double-entry bookkeeping invariant.
 """)
 
     return idem_key, txn_id
@@ -138,6 +141,12 @@ def phase2_idempotency(idem_key: str, original_txn_id: str):
   Scenario: client sends POST /charge, network times out.
   Client retries with the SAME idempotency_key.
   Server must return the SAME result — no second charge.
+
+  Implementation:
+    Redis L1 cache  →  O(1) lookup, < 1ms
+    Postgres UNIQUE →  authoritative fallback, ~5ms
+    Both scoped to (customer_id, idempotency_key) to prevent
+    cross-merchant key collisions (Failure Mode 6).
 """)
 
     print(f"  Retrying charge with same key: {idem_key[:20]}...")
@@ -176,10 +185,18 @@ def phase3_concurrent_retries():
     print("""
   TOCTOU Race Explained:
   10 threads all arrive simultaneously with the same idempotency_key.
-  All 10 do a SELECT and see "not found" — the pre-check does NOT stop them.
-  All 10 attempt an INSERT. Postgres's UNIQUE btree index latch ensures only
-  ONE insert commits. The other 9 get UniqueViolation → fetch and return the
-  winner's row. Result: exactly 1 charge, all 10 threads return the same txn_id.
+  All 10 do a SELECT and may see "not found" — the pre-check does NOT
+  stop them. All 10 attempt an INSERT. Postgres's UNIQUE btree index
+  latch ensures ONLY ONE insert commits. The other 9 get UniqueViolation,
+  roll back, then fetch and return the winner's row.
+
+  Result: exactly 1 charge in the DB, all 10 threads return the same
+  transaction_id. This is why the UNIQUE constraint — not the pre-check
+  SELECT — is the correctness guarantee.
+
+  Note: all 10 responses come back as HTTP 200 (some 201 for the winner,
+  200 for duplicates) because a duplicate is a successful idempotent
+  outcome, not an error.
 """)
 
     idem_key = f"concurrent-test-{uuid.uuid4()}"
@@ -187,6 +204,7 @@ def phase3_concurrent_retries():
     lock = threading.Lock()
 
     def attempt_charge():
+        t0 = time.monotonic()
         status, body = post_json("/charge", {
             "amount": "50.00",
             "currency": "USD",
@@ -194,32 +212,47 @@ def phase3_concurrent_retries():
             "idempotency_key": idem_key,
             "description": "Concurrent test",
         })
+        elapsed_ms = (time.monotonic() - t0) * 1000
         with lock:
-            all_responses.append((status, body))
+            all_responses.append((status, body, elapsed_ms))
 
     print(f"  Launching 10 concurrent threads, all with idempotency_key={idem_key[:16]}...")
+    t_start = time.monotonic()
     threads = [threading.Thread(target=attempt_charge) for _ in range(10)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=15)
+    total_ms = (time.monotonic() - t_start) * 1000
 
-    success_responses = [(s, b) for s, b in all_responses if s in (200, 201)]
-    error_responses = [(s, b) for s, b in all_responses if s not in (200, 201)]
+    success_responses = [(s, b, ms) for s, b, ms in all_responses if s in (200, 201)]
+    error_responses = [(s, b, ms) for s, b, ms in all_responses if s not in (200, 201)]
 
-    print(f"  Threads completed: {len(all_responses)}/10")
-    print(f"  Successful responses (200/201): {len(success_responses)}")
-    print(f"  Error responses (4xx/5xx):      {len(error_responses)}")
+    print(f"  Threads completed: {len(all_responses)}/10  (wall time: {total_ms:.0f}ms)")
+    print(f"  2xx responses (winner + idempotent duplicates): {len(success_responses)}")
+    print(f"  Unexpected error responses (4xx/5xx):           {len(error_responses)}")
+    if error_responses:
+        for s, b, ms in error_responses:
+            print(f"    HTTP {s}: {b}")
+
+    # Show per-response breakdown
+    print(f"\n  Per-response breakdown:")
+    for i, (s, b, ms) in enumerate(all_responses, 1):
+        txn_obj = b.get("transaction") or b
+        tid = (txn_obj.get("transaction_id") or "")[:8]
+        dup = b.get("status") == "duplicate"
+        print(f"    Thread {i:2d}: HTTP {s}, duplicate={str(dup):<5}, "
+              f"txn_id={tid}..., latency={ms:.0f}ms")
 
     # Collect all transaction IDs from all responses (including duplicate=True ones)
     txn_ids = set()
-    for _, body in success_responses:
+    for s, body, _ in success_responses:
         txn_obj = body.get("transaction") or body
         tid = txn_obj.get("transaction_id", "")
         if tid:
             txn_ids.add(tid)
 
-    print(f"  Unique transaction IDs across all responses: {len(txn_ids)}")
+    print(f"\n  Unique transaction IDs across all {len(success_responses)} responses: {len(txn_ids)}")
 
     # Ground truth: count ledger entries in the DB for this key
     if txn_ids:
@@ -239,9 +272,11 @@ def phase4_failed_charge():
     section("Phase 4: Failed Charge — No Ledger Entry Created")
 
     print("""
-  A charge with amount=0 or amount<0 should fail validation.
-  No transaction record, no ledger entries.
-  This verifies atomicity: partial state never persists.
+  A charge with amount=0, amount<0, or missing required fields must fail.
+  No transaction record, no ledger entries are persisted.
+
+  This verifies ATOMICITY: the DB transaction rolls back entirely.
+  There is NO partial state (a debit without a matching credit).
 """)
 
     test_cases = [
@@ -261,6 +296,7 @@ def phase4_failed_charge():
     print(f"  {'Test case':<30} {'HTTP':>6}  {'Expected':>10}  {'Pass':>6}")
     print(f"  {'-'*30}  {'-'*6}  {'-'*10}  {'-'*6}")
 
+    all_passed = True
     for payload, note in test_cases:
         # Capture ledger count BEFORE the POST
         _, ledger_before = get_json("/ledger")
@@ -275,11 +311,17 @@ def phase4_failed_charge():
 
         entries_created = count_after - count_before
         passed = status >= 400 and entries_created == 0
+        if not passed:
+            all_passed = False
         print(f"  {note:<30}  {status:>6}  {'4xx+no entry':>10}  {'YES' if passed else 'NO':>6}  {error}")
 
-    print("""
+    print(f"""
   All invalid charges return 4xx — no ledger entries created.
-  The database transaction is either committed fully or rolled back.
+  {'ALL PASSED' if all_passed else 'SOME FAILED — check above'}
+
+  Key point: the Postgres transaction (INSERT transactions +
+  INSERT ledger_entries) is either fully committed or fully
+  rolled back. There is no "half-charged" state possible.
 """)
 
 
@@ -288,8 +330,13 @@ def phase5_reconciliation():
 
     print("""
   Reconciliation: the fundamental accounting invariant.
-  Sum of all debits + all credits = 0 (when debits are negative).
-  Equivalently: total_credits - total_debits = 0.
+  SUM(credits) - SUM(debits) = 0 across ALL entries.
+  Equivalently: SUM(amount * sign) = 0 where credit=+1, debit=-1.
+
+  This invariant must hold after every operation:
+    - After a charge: +credit cancels -debit
+    - After a refund: the reversal entries cancel the originals
+    - Always, forever
 
   Run 5 more charges, then verify the entire ledger sums to zero.
 """)
@@ -323,14 +370,15 @@ def phase5_reconciliation():
     net_sum = ledger.get("net_sum", "?")
     check = ledger.get("accounting_check", "?")
 
-    print(f"\n  Ledger summary:")
+    print(f"\n  Ledger summary (per account):")
     print(f"  {'Account':<25} {'Credits':>12}  {'Debits':>12}  {'Count':>8}")
     print(f"  {'-'*25}  {'-'*12}  {'-'*12}  {'-'*8}")
     for b in balances:
         print(f"  {b['account_id']:<25}  {b['total_credits']:>12}  "
               f"{b['total_debits']:>12}  {b['entry_count']:>8}")
 
-    print(f"\n  Net sum of all ledger entries: {net_sum}")
+    print(f"\n  Total ledger entries visible: {len(entries)}")
+    print(f"  Net sum of all ledger entries: {net_sum}")
     print(f"  Accounting invariant:          {check}")
 
     if check == "ZERO":
@@ -338,17 +386,28 @@ def phase5_reconciliation():
     else:
         print(f"\n  RECONCILIATION FAILED: {net_sum} imbalance detected!")
 
+    print(f"""
+  SQL equivalent (run directly on DB to verify):
+    SELECT SUM(amount * CASE WHEN entry_type='credit' THEN 1 ELSE -1 END) AS net
+    FROM ledger_entries;
+    -- Should always return 0.00
+""")
+
 
 def phase6_timeout_simulation():
     section("Phase 6: Timeout Simulation — Safe Retry")
 
     print("""
-  Scenario: client sends POST /charge, server processes it (charge succeeds)
-  but the response is lost in transit (network timeout).
+  Scenario: client sends POST /charge, server processes it (charge succeeds,
+  DB committed) but the response is lost in transit (network timeout).
   Client retries with the SAME idempotency_key.
 
-  Without idempotency: customer gets charged twice.
-  With idempotency:    server returns original response, no second charge.
+  Without idempotency: customer gets charged twice. Catastrophic.
+  With idempotency:    server returns the ORIGINAL response. No second charge.
+
+  Key insight: the idempotency guarantee is tied to the DB COMMIT, not the
+  HTTP response. Even if the process crashes between COMMIT and HTTP 201,
+  the retry correctly finds the committed row and returns it.
 """)
 
     idem_key = f"timeout-sim-{uuid.uuid4()}"
@@ -366,7 +425,7 @@ def phase6_timeout_simulation():
     print(f"          HTTP {status1}, transaction_id={txn_id1[:8] if txn_id1 else 'N/A'}...")
 
     # Simulate: client didn't receive the response, retries
-    print(f"  Step 2: Client retries (same idem_key, 'didn't receive response') ...")
+    print(f"  Step 2: Client retries (same idem_key, simulating lost response) ...")
     status2, result2 = post_json("/charge", {
         "amount": "75.00",
         "currency": "USD",
@@ -380,8 +439,8 @@ def phase6_timeout_simulation():
     print(f"          HTTP {status2}, duplicate={is_dup}, transaction_id={txn_id2[:8] if txn_id2 else 'N/A'}...")
 
     ids_match = txn_id1 and txn_id2 and txn_id1 == txn_id2
-    print(f"\n  Transaction IDs match: {ids_match}")
-    print(f"  Customer charged:      1x (NOT 2x)")
+    print(f"\n  Transaction IDs match: {ids_match}  (same txn, no duplicate)")
+    print(f"  Customer charged:      {'1x (CORRECT)' if ids_match else '2x (ERROR!)'}")
     print(f"  Result:                {'CORRECT — idempotent' if ids_match else 'ERROR — duplicate charge!'}")
 
 
@@ -389,10 +448,23 @@ def phase7_refund():
     section("Phase 7: Refund — Reversing the Ledger Entries")
 
     print("""
-  A refund creates a new transaction that REVERSES the original entries.
-  Original: debit customer $50, credit merchant $50
-  Refund:   credit customer $50, debit merchant $50
-  Net:      ledger sum still = 0
+  A refund creates a NEW transaction that REVERSES the original entries.
+  The original entries are NEVER modified (immutable ledger).
+
+  Original charge entries:
+    DEBIT  customer-refund  $50.00  (money left customer)
+    CREDIT merchant-001     $50.00  (money arrived at merchant)
+
+  Refund entries (new transaction):
+    CREDIT customer-refund  $50.00  (money returns to customer)
+    DEBIT  merchant-001     $50.00  (money leaves merchant)
+
+  Net across all four entries: 0.00
+  The accounting invariant holds before AND after the refund.
+
+  The original transaction is marked status='refunded' atomically
+  inside the same DB transaction as the refund entries, preventing
+  the original from being refunded a second time.
 """)
 
     # Create original charge
@@ -406,6 +478,11 @@ def phase7_refund():
     })
     txn_id = result.get("transaction_id", "")
     print(f"  Original charge: HTTP {status}, txn={txn_id[:8] if txn_id else 'N/A'}...")
+
+    # Fetch and show ledger before refund
+    _, txn_before = get_json(f"/transaction/{txn_id}")
+    entries_before = txn_before.get("ledger_entries", [])
+    print(f"  Ledger entries before refund: {len(entries_before)}")
 
     # Issue refund
     refund_key = f"refund-{uuid.uuid4()}"
@@ -432,12 +509,18 @@ def phase8_double_refund_prevention(txn_id: str, original_refund_key: str):
 
     print("""
   A completed refund must not be applied a second time.
-  The original transaction is marked 'refunded' after the first refund.
-  A second refund attempt on the same transaction_id must be rejected.
+  The original transaction is atomically marked 'refunded' inside
+  the same DB transaction that inserts the refund ledger entries.
 
   Two sub-cases:
-    a) Same idempotency_key as the first refund → idempotent (return original refund result)
-    b) Different idempotency_key → rejected (transaction already refunded)
+    a) Same idempotency_key as the first refund
+       → idempotent: return the original refund result, no new entries
+    b) Different idempotency_key on an already-refunded transaction
+       → rejected with 4xx: transaction status is not 'completed'
+
+  The guard is the status field check BEFORE inserting refund entries,
+  all within a single ACID transaction. Concurrent refund attempts
+  are serialized by the Postgres row lock on the original transaction row.
 """)
 
     if not txn_id:
@@ -452,7 +535,7 @@ def phase8_double_refund_prevention(txn_id: str, original_refund_key: str):
     })
     is_dup_a = result_a.get("status") in ("duplicate_refund", "refunded")
     print(f"          HTTP {status_a}, status={result_a.get('status')}")
-    print(f"          Idempotent (no second refund): {is_dup_a}")
+    print(f"          Idempotent (no second refund applied): {is_dup_a}")
 
     # Case b: New idempotency_key — should be rejected because txn is already refunded
     new_refund_key = f"refund-second-{uuid.uuid4()}"
@@ -462,11 +545,42 @@ def phase8_double_refund_prevention(txn_id: str, original_refund_key: str):
         "idempotency_key": new_refund_key,
     })
     rejected = status_b in (400, 409, 422)
-    print(f"          HTTP {status_b}, error={result_b.get('error', result_b.get('detail', ''))}")
+    error_msg = result_b.get("error", result_b.get("detail", ""))
+    print(f"          HTTP {status_b}, error='{error_msg}'")
     print(f"          Rejected (correct — already refunded): {rejected}")
 
     overall = is_dup_a and rejected
     print(f"\n  Result: {'CORRECT — double-refund prevented' if overall else 'ERROR — check above'}")
+
+
+def phase9_reconcile_endpoint():
+    section("Phase 9: /reconcile Endpoint — Server-Side Integrity Check")
+
+    print("""
+  The /reconcile endpoint runs the full invariant check on the server:
+    1. SUM(signed ledger amounts) == 0  (double-entry invariant)
+    2. Every transaction has exactly 2 ledger entries
+    3. No orphaned ledger entries (entries with no parent transaction)
+
+  In production, this runs as a background job (every hour or continuously
+  via a Flink streaming job on the ledger event stream). Any non-zero sum
+  triggers an immediate PagerDuty alert — it means money is missing.
+""")
+
+    status, result = get_json("/reconcile")
+    print(f"  HTTP {status}")
+    if status == 200:
+        print(f"  Net sum:            {result.get('net_sum', '?')}")
+        print(f"  Accounting check:   {result.get('accounting_check', '?')}")
+        print(f"  Total entries:      {result.get('total_entries', '?')}")
+        print(f"  Total transactions: {result.get('total_transactions', '?')}")
+        txns_missing = result.get("transactions_missing_entries", 0)
+        print(f"  Txns missing 2 entries: {txns_missing} (expected 0)")
+        ok = (result.get("accounting_check") == "ZERO" and txns_missing == 0)
+        print(f"\n  Result: {'RECONCILIATION PASSED' if ok else 'RECONCILIATION FAILED — investigate!'}")
+    else:
+        print(f"  Response: {result}")
+        print(f"  (Endpoint may not be implemented — see /ledger for manual check)")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -479,12 +593,19 @@ def main():
                             ^
                        Redis (idempotency_key cache, 24h TTL)
 
-  Invariants:
-    1. Every charge = 1 debit + 1 credit (double-entry)
+  Invariants demonstrated:
+    1. Every charge = 1 debit + 1 credit (double-entry bookkeeping)
     2. Same idempotency_key -> same response (no duplicate charge)
-    3. Failed charges create NO ledger entries (atomicity)
-    4. SUM of all ledger entries = 0 (reconciliation)
-    5. A refunded transaction cannot be refunded again (double-refund guard)
+    3. Concurrent duplicates -> DB UNIQUE constraint ensures exactly-once
+    4. Failed charges create NO ledger entries (atomicity / rollback)
+    5. SUM of all ledger entries = 0 (reconciliation invariant)
+    6. A refunded transaction cannot be refunded again (status guard)
+
+  Key design decisions:
+    - Postgres UNIQUE (customer_id, idempotency_key) is the correctness guard
+    - Redis idempotency cache is a performance optimization, NOT correctness
+    - Ledger entries are IMMUTABLE — corrections are new reversal entries
+    - All charge operations (txn + 2 ledger entries + outbox) are one ACID txn
 """)
 
     wait_for_service(BASE_URL)
@@ -503,19 +624,29 @@ def main():
         txn_id, refund_key = refund_result
         phase8_double_refund_prevention(txn_id, refund_key)
 
+    phase9_reconcile_endpoint()
+
     section("Lab Complete")
     print("""
   Summary:
   - Double-entry: every charge = 1 debit + 1 credit (sum always zero)
   - Idempotency key: retries return original response — no double charges
-  - Concurrent retries: DB UNIQUE constraint + ON CONFLICT ensures exactly-1
-  - Invalid charges: Postgres transaction rolled back, no partial ledger state
-  - Reconciliation: sum of all entries = 0 is a verifiable system invariant
+  - Concurrent retries: Postgres UNIQUE constraint enforces exactly-once
+  - Invalid charges: DB transaction rolled back, no partial ledger state
+  - Reconciliation: SUM(signed amounts) = 0 is a verifiable invariant
   - Refund: creates reverse entries, ledger remains balanced
   - Double-refund: second refund on same txn is rejected (status guard)
 
   This is the core of Stripe, PayPal, and every financial system.
   The accounting invariant (sum=0) is the ultimate integration test.
+
+  Manual verification commands:
+    # Ledger sum (must be 0.00):
+    docker compose exec db psql -U app -d payments -c \\
+      "SELECT SUM(amount * CASE WHEN entry_type='credit' THEN 1 ELSE -1 END) FROM ledger_entries;"
+
+    # Idempotency keys in Redis:
+    docker compose exec redis redis-cli keys "idem:*"
 """)
 
 

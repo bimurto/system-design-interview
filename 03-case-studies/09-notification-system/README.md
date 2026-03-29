@@ -73,6 +73,7 @@ forks:
 | Kafka partition count       | ~35K peak RPS / 1K per partition | ~35 partitions |
 | User preferences in Redis   | 500M users × 50B                 | ~25 GB         |
 | Idempotency key store (24h) | 1B keys × 100B                   | ~100 GB        |
+| Kafka retention (1 day)     | 1B events/day × 200B × 3 replicas | ~600 GB/day   |
 
 ---
 

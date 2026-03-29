@@ -20,6 +20,7 @@ Run:
   python experiment.py
 """
 
+import math
 import random
 import threading
 import time
@@ -871,8 +872,6 @@ def phase8_cache_stampede():
     # ── Scenario C: Probabilistic Early Recomputation (PER) ──────────────────
     print(f"\n  Scenario C: PER — recompute before expiry, zero stampede window")
 
-    import math
-
     def per_get(r_conn: redis.Redis, key: str, ttl: int, beta: float = 1.0):
         """
         PER-aware cache get.
@@ -967,7 +966,7 @@ def main():
     4. Distributed lock     — atomic Lua check-and-set (single-node Redlock)
     5. RDB snapshot         — BGSAVE timing, COW mechanics, AOF trade-offs
     6. Cluster hash slots   — key routing, hash tags, cross-slot MGET limits
-    7. Hot key problem       — uneven load symptoms and mitigation patterns
+    7. Hot key problem      — uneven load symptoms and mitigation patterns
     8. Cache stampede       — thundering herd prevention (PER vs mutex vs none)
 """)
 
@@ -980,6 +979,7 @@ def main():
     phase5_rdb_snapshot()
     phase6_cluster_slots_and_hash_tags()
     phase7_hot_key_problem()
+    phase8_cache_stampede()
 
     section("Lab Complete — Key Takeaways")
     print("""

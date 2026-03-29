@@ -8,7 +8,8 @@ Phase 3: Count-Min Sketch — manual Python implementation
 Phase 4: Top-K — Redis TOPK.ADD/TOPK.LIST
 Phase 5: Bloom Filter Saturation — "break it" demo
 Phase 6: MinHash — Jaccard similarity estimation
-Phase 7: Comparison Summary
+Phase 7: T-Digest — p99/p999 latency percentile estimation
+Phase 8: Comparison Summary
 """
 
 import os
@@ -100,6 +101,8 @@ class BloomFilter:
 
     def fill_ratio(self):
         """Fraction of bits set to 1. Approaches 1.0 as filter saturates."""
+        # popcount via bin() per byte — straightforward and correct for Python;
+        # for production code use numpy.unpackbits or bitarray for 10-100x speed.
         return sum(bin(b).count('1') for b in self._bytes) / self.m
 
     def false_positive_rate(self, n_inserted):
@@ -193,9 +196,10 @@ def phase1_bloom_filter():
     print(f"    BF.EXISTS user:500   → {exists_yes} (should be 1 — true member)")
     print(f"    BF.EXISTS user:99999 → {exists_no}  (probably 0 — not added; 1 = false positive)")
 
-    # Info
+    # Info — BF.INFO returns an alternating key/value list; build a dict for
+    # safe lookup rather than assuming fixed field order across Redis versions.
     info = r.execute_command("BF.INFO", "bf:users")
-    info_dict = dict(zip(info[::2], info[1::2]))
+    info_dict = {info[i]: info[i + 1] for i in range(0, len(info) - 1, 2)}
     print(f"    Filter size (bits): {info_dict.get('Size', 'N/A')}")
     print(f"    Items inserted:     {info_dict.get('Number of items inserted', 'N/A')}")
 
@@ -351,11 +355,13 @@ def phase3_count_min_sketch():
   Depth sizing: for delta=1% failure probability, depth >= ln(100) = 5
 """)
 
-    # Simulate 150K events: some URLs are very popular (power-law distribution)
+    # Build an event stream: 100K background events spread across 500 URLs
+    # (flat baseline), then inject 50K extra hits for 10 "popular" pages
+    # to create a realistic power-law distribution (~150K total events).
     N = 100_000
     urls = [f"page_{i % 500}" for i in range(N)]  # 500 unique URLs, flat distribution
     popular = [f"page_{i}" for i in range(10)]
-    urls += popular * 5000  # popular pages appear ~5000 extra times
+    urls += popular * 5000  # popular pages appear ~5000 extra times each
     random.shuffle(urls)
 
     true_counts: dict[str, int] = defaultdict(int)
@@ -652,8 +658,13 @@ def phase6_minhash():
             mh_other_32.update(w)
         est_32 = mh_base_32.jaccard(mh_other_32)
 
-        err_128 = abs(est_128 - true_j) / max(true_j, 0.001) * 100
-        print(f"  {label:<16} {true_j:>14.3f} {est_128:>14.3f} {est_32:>13.3f} {err_128:>+11.1f}%")
+        # For 0% overlap (true_j == 0), report absolute error instead of
+        # relative error to avoid division by zero and misleading percentages.
+        if true_j == 0:
+            err_128_str = f"{abs(est_128 - true_j):.3f} (abs)"
+        else:
+            err_128_str = f"{(est_128 - true_j) / true_j * 100:+.1f}%"
+        print(f"  {label:<16} {true_j:>14.3f} {est_128:>14.3f} {est_32:>13.3f} {err_128_str:>12}")
 
     print(f"""
   Key observations:
@@ -672,30 +683,243 @@ def phase6_minhash():
 """)
 
 
+# ── Phase 7: T-Digest — Percentile Estimation ────────────────────────────
+
+class TDigest:
+    """
+    Minimal T-Digest implementation for teaching purposes.
+
+    T-Digest (Dunning & Ertl 2019) maintains a sorted list of 'centroids'
+    (mean, weight) instead of raw values. Centroids near the tails (0th and
+    100th percentiles) are kept small (high resolution); centroids near the
+    median are allowed to grow larger (lower resolution there). This gives
+    accurate tail percentile estimates — exactly what matters for p99/p999
+    latency monitoring — while using O(compression) memory regardless of
+    stream size.
+
+    Error bound: absolute error at quantile q is O(1/compression) for q near
+    0 or 1, and O(1) centroids for the median. In practice, with
+    compression=100, p99 error is typically <0.5%.
+
+    NOTE: This is a pedagogical implementation (add-and-merge only).
+    Production libraries: tdigest (Python), t-digest (Java/Go), Redis TDIGEST.
+    """
+    def __init__(self, compression=100):
+        self.compression = compression
+        # Each centroid: [mean, weight]
+        self.centroids: list[list[float]] = []
+        self._n = 0  # total weight
+
+    def add(self, value: float, weight: float = 1.0):
+        """Insert a value and merge centroids that exceed the size limit."""
+        self.centroids.append([value, weight])
+        self._n += weight
+        # Compress only periodically — batching is more efficient than
+        # compressing after every insert.
+        if len(self.centroids) > self.compression * 10:
+            self._compress()
+
+    def _compress(self):
+        """Merge centroids that fit within the T-Digest size function."""
+        if not self.centroids:
+            return
+        self.centroids.sort(key=lambda c: c[0])
+        merged: list[list[float]] = []
+        q_limit = 1.0 / self.compression
+        q_cumulative = 0.0
+        current_mean, current_weight = self.centroids[0]
+
+        for mean, weight in self.centroids[1:]:
+            q_center = (q_cumulative + current_weight / 2.0) / self._n
+            # Size limit: centroids near the median are allowed to be larger.
+            # k(q) = compression * (q*(1-q)) — larger near median, small at tails.
+            k_limit = self.compression * q_center * (1.0 - q_center)
+            if current_weight + weight <= max(1.0, k_limit):
+                # Merge: weighted average of means
+                current_mean = (current_mean * current_weight + mean * weight) / (current_weight + weight)
+                current_weight += weight
+            else:
+                merged.append([current_mean, current_weight])
+                q_cumulative += current_weight / self._n
+                current_mean, current_weight = mean, weight
+
+        merged.append([current_mean, current_weight])
+        self.centroids = merged
+
+    def percentile(self, q: float) -> float:
+        """Estimate the q-th quantile (0.0–1.0)."""
+        if not self.centroids:
+            raise ValueError("T-Digest is empty")
+        self._compress()
+        self.centroids.sort(key=lambda c: c[0])
+        target = q * self._n
+        cumulative = 0.0
+        for i, (mean, weight) in enumerate(self.centroids):
+            if cumulative + weight >= target:
+                # Linear interpolation within centroid
+                if i == 0 or cumulative == 0:
+                    return mean
+                prev_mean = self.centroids[i - 1][0]
+                frac = (target - cumulative) / weight
+                return prev_mean + frac * (mean - prev_mean)
+            cumulative += weight
+        return self.centroids[-1][0]
+
+    @property
+    def memory_bytes(self):
+        # Each centroid: 2 floats × 8 bytes
+        return len(self.centroids) * 16
+
+
+def phase7_tdigest():
+    section("Phase 7: T-Digest — Percentile Estimation (p99 / p999)")
+    print("""
+  T-Digest (Dunning & Ertl, 2019) estimates quantiles/percentiles from a
+  data stream using O(compression) memory — independent of stream size.
+
+  Why it matters for FAANG interviews:
+    "What is the p99 latency of your service?" requires percentile estimation
+    over millions of request latency samples. Storing every sample is expensive.
+    T-Digest gives p99/p999 accuracy with ~1-2 KB of memory.
+
+  Key insight: centroids near the tails (p0, p100) are kept SMALL (many
+  centroids, high resolution). Centroids near the median are allowed to be
+  LARGE (fewer centroids, lower resolution). This matches the engineering
+  reality: nobody pages on p50 latency; p99 and p999 are what matter.
+
+  Error guarantee: at quantile q, absolute error ≤ O(1/compression).
+    At q=0.99, compression=100 → error ≤ ~1%.
+    Redis TDIGEST uses compression=100 by default.
+
+  Contrast with histogram buckets (Prometheus, StatsD):
+    Histograms pre-allocate fixed buckets (e.g., ≤1ms, ≤5ms, ≤10ms, ...).
+    Error at a percentile depends on bucket granularity — often 10-20% error.
+    T-Digest adapts bucket sizes to the data distribution, concentrating
+    precision where it matters (tails).
+
+  T-Digest is MERGEABLE: shard-level T-Digests can be combined to produce
+  global percentile estimates. Redis TDIGEST.MERGE works exactly this way.
+""")
+
+    # Generate a bimodal latency distribution:
+    #   "fast path": 90% of requests, mean ~10ms
+    #   "slow path": 10% of requests, mean ~200ms (cold cache, GC pause, etc.)
+    import statistics
+    NUM_SAMPLES = 50_000
+    random.seed(42)
+    fast_path = [max(0.1, random.gauss(10, 3)) for _ in range(int(NUM_SAMPLES * 0.90))]
+    slow_path = [max(10.0, random.gauss(200, 50)) for _ in range(int(NUM_SAMPLES * 0.10))]
+    latencies = fast_path + slow_path
+    random.shuffle(latencies)
+
+    print(f"  Simulating {len(latencies):,} request latency samples (bimodal: 90% fast / 10% slow path):")
+    print(f"    Fast path: ~N(10ms, σ=3ms)   Slow path: ~N(200ms, σ=50ms)")
+
+    # Exact quantiles (ground truth, expensive in practice)
+    sorted_latencies = sorted(latencies)
+    n = len(sorted_latencies)
+    def exact_percentile(q):
+        idx = q * (n - 1)
+        lo, hi = int(idx), min(int(idx) + 1, n - 1)
+        return sorted_latencies[lo] + (idx - lo) * (sorted_latencies[hi] - sorted_latencies[lo])
+
+    # T-Digest with compression=100
+    td = TDigest(compression=100)
+    for v in latencies:
+        td.add(v)
+    td._compress()
+
+    # Redis TDIGEST (if available — redis-stack includes it)
+    redis_tdigest_available = False
+    try:
+        r.delete("tdigest:latency")
+        r.execute_command("TDIGEST.CREATE", "tdigest:latency", "COMPRESSION", 100)
+        batch_size = 500
+        for i in range(0, len(latencies), batch_size):
+            r.execute_command("TDIGEST.ADD", "tdigest:latency",
+                              *[f"{v:.4f}" for v in latencies[i:i + batch_size]])
+        redis_tdigest_available = True
+    except Exception:
+        pass
+
+    percentiles = [0.50, 0.90, 0.95, 0.99, 0.999]
+    print(f"\n  {'Percentile':>12}  {'Exact (ms)':>12}  {'T-Digest (ms)':>15}  {'Error %':>9}", end="")
+    if redis_tdigest_available:
+        print(f"  {'Redis TDIGEST':>15}", end="")
+    print()
+
+    sep = f"  {'─'*12}  {'─'*12}  {'─'*15}  {'─'*9}"
+    if redis_tdigest_available:
+        sep += f"  {'─'*15}"
+    print(sep)
+
+    for q in percentiles:
+        exact = exact_percentile(q)
+        est   = td.percentile(q)
+        err   = abs(est - exact) / exact * 100 if exact > 0 else 0.0
+        line  = f"  {'p' + str(int(q * 1000)):>12}  {exact:>12.2f}  {est:>15.2f}  {err:>+8.2f}%"
+        if redis_tdigest_available:
+            redis_est = float(r.execute_command("TDIGEST.QUANTILE", "tdigest:latency", q)[0])
+            redis_err = abs(redis_est - exact) / exact * 100 if exact > 0 else 0.0
+            line += f"  {redis_est:>12.2f} ({redis_err:.1f}%)"
+        print(line)
+
+    exact_mem_kb = n * 8 / 1024   # 8 bytes per float64 sample
+    td_mem_kb = td.memory_bytes / 1024
+    print(f"\n  Memory comparison for {n:,} latency samples:")
+    print(f"    All samples stored:  {exact_mem_kb:,.0f} KB (exact, but unbounded growth)")
+    print(f"    T-Digest:            {td_mem_kb:.1f} KB ({exact_mem_kb / td_mem_kb:.0f}x smaller, O(compression) space)")
+    print(f"    Centroids used:      {len(td.centroids)} (compression=100)")
+
+    print(f"""
+  T-Digest vs histogram buckets (Prometheus-style):
+    Histogram: pre-defined bucket boundaries (≤1ms, ≤5ms, ≤10ms, ≤50ms, ≤100ms, ≤500ms)
+      → p99 interpolated from the bucket containing the 99th percentile
+      → If p99 falls in the ≤500ms bucket (range 100-500ms), error can be hundreds of %
+      → Bucket boundaries must be chosen ahead of time; wrong choice = large error
+    T-Digest: adapts bucket boundaries to the data distribution
+      → Guaranteed small error at tails regardless of distribution shape
+      → Mergeability: aggregate across replicas / time windows exactly as histograms do
+
+  Real-world uses:
+    Redis TDIGEST: p99 API latency monitoring, SLA reporting
+    Netflix: latency percentile tracking across microservices (built on T-Digest)
+    Elasticsearch: percentile aggregations use T-Digest internally
+    Prometheus histograms: NOT T-Digest — use pre-defined buckets (less accurate at tails)
+      → When asked "how does Prometheus compute p99?", this distinction matters.
+
+  Interview angle: "We need sub-second p99 latency SLA. How do you track this at scale?"
+    → T-Digest per replica, merged via TDIGEST.MERGE hourly for global view
+    → Store compressed digest (~2KB) rather than raw samples (~400MB per hour)
+""")
+
+
 # ── Summary ───────────────────────────────────────────────────────────────
 
-def phase7_summary():
-    section("Phase 7: Comparison Summary")
+def phase8_summary():
+    section("Phase 8: Comparison Summary")
     print(f"""
-  {'Structure':<22} {'Question':<35} {'Memory':<20} {'Error'}
-  {'─'*22} {'─'*35} {'─'*20} {'─'*15}
-  {'Bloom Filter':<22} {'Is item in set?':<35} {'O(n)→sub-linear':<20} {'FP only, no delete'}
-  {'Cuckoo Filter':<22} {'Is item in set? (deletable)':<35} {'O(n)→sub-linear':<20} {'FP only, supports delete'}
-  {'HyperLogLog':<22} {'How many distinct items?':<35} {'O(1) ~12KB':<20} {'±0.81%, mergeable'}
-  {'Count-Min Sketch':<22} {'How often does item appear?':<35} {'O(w×d)':<20} {'Over-estimate only'}
-  {'Top-K':<22} {'What are the K most frequent?':<35} {'O(K)':<20} {'Approx rank'}
-  {'MinHash':<22} {'How similar are two sets?':<35} {'O(k) ~512B':<20} {'±1/sqrt(k)'}
+  {'Structure':<22} {'Question':<38} {'Memory':<20} {'Error'}
+  {'─'*22} {'─'*38} {'─'*20} {'─'*24}
+  {'Bloom Filter':<22} {'Is item in set?':<38} {'O(n)→sub-linear':<20} {'FP only, no delete'}
+  {'Cuckoo Filter':<22} {'Is item in set? (deletable)':<38} {'O(n)→sub-linear':<20} {'FP only, supports delete'}
+  {'HyperLogLog':<22} {'How many distinct items?':<38} {'O(1) ~12KB':<20} {'±0.81%, mergeable'}
+  {'Count-Min Sketch':<22} {'How often does item appear?':<38} {'O(w×d)':<20} {'Over-estimate only'}
+  {'Top-K':<22} {'What are the K most frequent?':<38} {'O(K)':<20} {'Approx rank'}
+  {'MinHash':<22} {'How similar are two sets?':<38} {'O(k) ~512B':<20} {'±1/sqrt(k), symmetric'}
+  {'T-Digest':<22} {'What is the p99/p999 latency?':<38} {'O(compression)~2KB':<20} {'<1% at tails, mergeable'}
 
   Key insight: trade exact answers for dramatically less memory.
   Acceptable for analytics, monitoring, recommendations.
   NOT acceptable for financial counts, exact billing, legal compliance.
 
   Quick sizing cheat-sheet (memorize for interviews):
-    Bloom filter 1% FPR, 100M items  → ~120 MB bits, k=7 hash functions
+    Bloom filter 1% FPR, 100M items   → ~120 MB bits, k=7 hash functions
     Bloom filter 0.1% FPR, 100M items → ~180 MB bits, k=10 hash functions
     HyperLogLog any cardinality        → 12 KB, ±0.81% error
     Count-Min Sketch 1% error, δ=1%   → width≥272, depth≥5
     MinHash 5% Jaccard error           → k=400 hashes, ~1.6 KB per set
+    T-Digest p99 latency               → ~2 KB (compression=100), <1% tail error
 
   Bloom filter false positive formula:
     FPR = (1 - e^(-kn/m))^k
@@ -717,6 +941,14 @@ def phase7_summary():
       → safe for "heavy hitter" detection; over-estimates harmless
     Top-K:                   may miss items near the K boundary
     MinHash:                 symmetric error, controlled by k
+    T-Digest:                symmetric, small absolute error at tails
+      → p99/p999 error <1% with compression=100
+
+  Mergeability summary (critical for distributed systems):
+    Mergeable:  HyperLogLog (PFMERGE), T-Digest (TDIGEST.MERGE), MinHash
+    Not directly mergeable: Bloom Filter (union via OR, but degrades FPR),
+                            Count-Min Sketch (element-wise addition)
+    Hard no:    Top-K (merging changes the rank ordering non-trivially)
 
   Next: ../../03-case-studies/01-url-shortener/
 """)

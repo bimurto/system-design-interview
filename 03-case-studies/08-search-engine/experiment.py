@@ -856,6 +856,7 @@ def main():
     phase5_spell_correction(es)
     phase6_faceted_search(es)
     phase7_bm25_explain_and_refresh(es)
+    phase8_vector_and_hybrid_search(es)
 
     section("Lab Complete")
     print("""
@@ -867,6 +868,7 @@ def main():
   - Suggest API: term-level spell correction using edit distance on index vocab
   - Aggregations: facets (category, price range) computed in one query pass
   - refresh_interval=-1 boosts bulk indexing throughput 3-10x vs default 1s
+  - Vector search: dense_vector + HNSW; hybrid RRF fuses BM25 + kNN rankings
 
   Next: 09-notification-system/ — fan-out delivery at 1B notifications/day
 """)

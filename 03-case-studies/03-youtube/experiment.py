@@ -10,6 +10,7 @@ What this demonstrates:
   5. Serve video with byte-range requests via Nginx (video seeking / HTTP 206)
   6. Increment view count in Redis (INCR), observe Postgres stays at 0
   7. Batch flush Redis counters to Postgres in a single pass
+  8. Benchmark Redis pipeline throughput vs naive per-call throughput
 
 Run:
   docker compose up -d
@@ -160,19 +161,23 @@ def phase1_upload(conn, minio_client):
     print(f"\n  Simulated video: {video_size_mb}MB, SHA-256: {checksum[:16]}...")
     print(f"  (SHA-256 enables exact deduplication: same bytes → skip re-transcoding)")
 
+    # Deduplication check: if a video with this hash already exists, skip upload
     object_name = f"raw/{checksum[:16]}.mp4"
+    try:
+        minio_client.stat_object(MINIO_BUCKET, object_name)
+        print(f"  Dedup hit: object already in MinIO — skipping upload, reusing segments")
+    except Exception:
+        start = time.perf_counter()
+        minio_client.put_object(
+            MINIO_BUCKET,
+            object_name,
+            io.BytesIO(video_data),
+            length=len(video_data),
+            content_type="video/mp4",
+        )
+        upload_ms = (time.perf_counter() - start) * 1000
+        print(f"  Uploaded to MinIO in {upload_ms:.0f}ms")
 
-    start = time.perf_counter()
-    minio_client.put_object(
-        MINIO_BUCKET,
-        object_name,
-        io.BytesIO(video_data),
-        length=len(video_data),
-        content_type="video/mp4",
-    )
-    upload_ms = (time.perf_counter() - start) * 1000
-
-    print(f"  Uploaded to MinIO in {upload_ms:.0f}ms")
     print(f"  Path: {MINIO_BUCKET}/{object_name}")
 
     # Store metadata in Postgres with status=processing
@@ -395,7 +400,13 @@ def phase4_hls_manifest(minio_client, video_id, quality_records, checksum):
 
 # ── Phase 5: Byte-range requests (video seeking) ─────────────────────────────
 
-def phase5_byte_range(minio_client, quality_records):
+def phase5_byte_range(quality_records):
+    """Demonstrate HTTP 206 Partial Content via Nginx → MinIO proxy.
+
+    Note: minio_client is not needed here — requests go through Nginx, which
+    proxies to MinIO and forwards byte-range headers. This mirrors production
+    where the CDN edge fetches segments from origin via HTTP range requests.
+    """
     section("Phase 5: Byte-Range Requests — HTTP 206 Partial Content")
 
     print("""
@@ -567,12 +578,14 @@ def phase7_batch_flush(conn, r):
 
     # Simulate 60 seconds of accumulated views (different popularity levels)
     view_counts = [50_000, 1_200, 300, 15_000, 750]
+    labels      = ["viral", "popular", "niche", "trending", "niche"]
     print(f"  Views accumulated in Redis over 60 seconds:\n")
     print(f"  {'Video ID':>10}  {'Title':<12}  {'Views':>10}  Category")
     print(f"  {'-'*10}  {'-'*12}  {'-'*10}  --------")
-    for vid, views, label in zip(video_ids, view_counts, ["viral", "popular", "niche", "trending", "niche"]):
+    # Use enumerate to avoid O(n) list.index() and handle duplicate IDs safely
+    for idx, (vid, views, label) in enumerate(zip(video_ids, view_counts, labels)):
         r.incrby(f"view_count:{vid}", views)
-        print(f"  {vid:>10}  {'Video #'+str(video_ids.index(vid)+1):<12}  {views:>10,}  {label}")
+        print(f"  {vid:>10}  {'Video #'+str(idx+1):<12}  {views:>10,}  {label}")
 
     # Batch flush: scan all view_count:* keys and flush in one pass
     print(f"\n  Running batch flush worker...")
@@ -612,6 +625,65 @@ def phase7_batch_flush(conn, r):
         print(f"  {vid_id:>10}  {title:<12}  {vc:>12,}")
 
 
+# ── Phase 8: Redis throughput benchmark ──────────────────────────────────────
+
+def phase8_redis_throughput(r):
+    section("Phase 8: Redis Throughput — Pipeline vs. Single-Call")
+
+    print("""
+  Redis pipeline batches multiple commands into one TCP round-trip.
+  This is the key to achieving millions of INCR ops/s from a single client.
+
+  Comparison:
+    Single-call:  each INCR pays a full network round-trip (~0.1–0.5ms each)
+    Pipeline:     N INCRs sent in one batch, one round-trip for all N
+""")
+
+    bench_key = "bench:view_count"
+    n = 10_000
+
+    # Warm-up
+    r.delete(bench_key)
+
+    # Single-call (non-pipelined)
+    start = time.perf_counter()
+    for _ in range(n):
+        r.incr(bench_key)
+    single_ms = (time.perf_counter() - start) * 1000
+    single_ops = n / (single_ms / 1000)
+
+    r.delete(bench_key)
+
+    # Pipelined
+    start = time.perf_counter()
+    pipe = r.pipeline()
+    for _ in range(n):
+        pipe.incr(bench_key)
+    pipe.execute()
+    pipe_ms = (time.perf_counter() - start) * 1000
+    pipe_ops = n / (pipe_ms / 1000)
+
+    r.delete(bench_key)
+
+    speedup = single_ms / pipe_ms if pipe_ms > 0 else float("inf")
+
+    print(f"  {n:,} INCR operations (localhost Redis):\n")
+    print(f"  {'Method':<20}  {'Time':>10}  {'Ops/s':>12}")
+    print(f"  {'-'*20}  {'-'*10}  {'-'*12}")
+    print(f"  {'Single-call':<20}  {single_ms:>9.0f}ms  {single_ops:>11,.0f}")
+    print(f"  {'Pipelined':<20}  {pipe_ms:>9.0f}ms  {pipe_ops:>11,.0f}")
+    print(f"\n  Pipeline speedup: {speedup:.1f}x faster")
+
+    print(f"""
+  Interview insight:
+    Even on localhost (no real network latency), pipelining is {speedup:.0f}x faster.
+    On a real network with 1ms RTT, single-call INCR tops out at ~1,000 ops/s.
+    Pipelined INCR saturates the Redis CPU: hundreds of thousands of ops/s.
+    YouTube's view counting works because Redis pipeline + per-60s flush
+    means zero Postgres writes per view regardless of traffic volume.
+""")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -643,9 +715,10 @@ def main():
     phase2_metadata(conn, video_id)
     quality_records, checksum = phase3_transcoding(conn, mc, video_id, video_data)
     phase4_hls_manifest(mc, video_id, quality_records, checksum)
-    phase5_byte_range(mc, quality_records)
+    phase5_byte_range(quality_records)   # HTTP calls go through Nginx, no minio_client needed
     phase6_view_count(conn, r, video_id)
     phase7_batch_flush(conn, r)
+    phase8_redis_throughput(r)
 
     conn.close()
 
@@ -659,6 +732,7 @@ def main():
   • Byte-range requests: HTTP 206 Partial Content enables seeking without full download
   • View counts: Redis INCR avoids per-view DB write; batch flush every 60s
   • AOF persistence: Redis durability — lose at most 1s of counts on crash
+  • Pipeline throughput: Redis pipeline is orders of magnitude faster than single-call INCR
 
   Next: 04-uber/ — real-time geospatial indexing with Redis GEORADIUS + PostGIS
 """)

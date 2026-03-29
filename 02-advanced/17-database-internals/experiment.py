@@ -491,8 +491,12 @@ def phase4_lsm_simulation():
             self.table_id = table_id
             self.bloom = BloomFilter(capacity=max(len(self.data), 1), fpr=0.01)
             for k, v in self.data:
-                if v is not None:
-                    self.bloom.add(k)
+                # Add ALL keys — including tombstones (v=None) — so that a
+                # tombstone SSTable is not skipped by the Bloom filter.  If we
+                # excluded tombstoned keys, get() would skip the tombstone SSTable
+                # and find the original value in an older SSTable, incorrectly
+                # treating a deleted key as live.
+                self.bloom.add(k)
             self._bloom_checks = 0
             self._bloom_hits = 0   # key was in bloom AND in data
             self._bloom_fp = 0     # key was in bloom but NOT in data (false positive)

@@ -431,7 +431,7 @@ pip install elasticsearch
 ES_URL=http://localhost:9200 python experiment.py
 ```
 
-The script runs 7 phases automatically:
+The script runs 8 phases automatically:
 
 1. **Manual inverted index:** build TF-IDF index over 200 docs in pure Python — shows the algorithm
 2. **Index 5,000 products:** bulk index into Elasticsearch with custom mapping
@@ -441,6 +441,8 @@ The script runs 7 phases automatically:
 6. **Faceted search:** category + brand + price range aggregations in one query
 7. **BM25 explain + refresh trade-off:** show exact BM25 computation breakdown and `refresh_interval` impact on indexing
    throughput
+8. **Vector search + hybrid RRF:** dense_vector kNN search in Elasticsearch 8; Reciprocal Rank Fusion merging BM25 and
+   kNN ranked lists
 
 ### Break It
 
@@ -594,3 +596,14 @@ docker compose down -v
     retrieval**: run both BM25 and ANN independently, then fuse results with Reciprocal Rank Fusion (RRF):
     `score(d) = Σ 1/(k + rank_i(d))`. HNSW recall at 95% requires ~5ms for 10M vectors — feasible within a 100ms budget
     alongside BM25 retrieval.
+
+14. **Q: What are the storage and operational challenges of adding vector search to a web-scale index?**
+    A: A 1T-document corpus with 768-dimensional float32 embeddings requires ~3 PB of raw embedding storage (768 × 4
+    bytes × 1T). Three mitigations: (1) **Product Quantization (IVF-PQ)** compresses embeddings 8–32× to ~100–375 TB
+    by approximating each vector as a product of sub-vector codebook entries — at the cost of ~1–3% recall loss. (2)
+    **HNSW graphs must be memory-resident** for fast traversal (random access patterns make disk-based traversal too
+    slow); IVF-PQ has better disk-friendliness because coarse quantization limits the search to a few Voronoi cells.
+    (3) **Sharding strategy changes**: unlike BM25 indexes (shard by document hash for uniform load), vector indexes
+    benefit from clustering-aware sharding — documents with similar embeddings on the same shard improve intra-shard
+    recall so fewer shards need to be queried per request. The operational complexity is the main reason most FAANG
+    systems start with BM25 and layer vector retrieval on top as a re-ranking signal rather than a primary retriever.

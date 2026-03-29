@@ -352,3 +352,18 @@ docker compose down
 - **Sharing the same JWT secret across environments.** A leaked test secret that matches the production secret allows
   token forgery against production. Use separate secrets per environment, rotate them independently, and use a secrets
   manager rather than hardcoding them in environment files.
+- **Inline policy logic instead of externalized policy engines.** Embedding authorisation rules as `if/else` branches
+  scattered across service code becomes unmaintainable as the number of roles, resources, and conditions grows. Use an
+  externalized policy engine (OPA with Rego, or AWS Cedar) to centralise policy as code — version-controlled, testable,
+  and auditable independently of application deployments.
+- **RS256 JWKS rotation pitfalls.** When rotating an RSA key pair, services that cache the JWKS response (e.g., a 1-hour
+  TTL) will reject tokens signed with the new private key until the cache expires. The correct pattern is a dual-key
+  rollover window: publish both the old and new public keys in the JWKS endpoint simultaneously, start signing with the
+  new private key only after all caches have expired (wait at least one cache TTL), then remove the old public key.
+  Skipping the overlap window causes a fleet-wide 401 storm during rotation.
+- **Ambient credential abuse via IMDS/SSRF.** Cloud instances expose a metadata endpoint at `169.254.169.254` (AWS IMDSv1,
+  GCP, Azure) that returns temporary IAM credentials to any process on the host — including a server-side request
+  forgery (SSRF) attacker who can trick your service into fetching an arbitrary URL. An attacker who can reach the
+  metadata endpoint can steal cloud credentials and escalate to full account access. Fix: block outbound traffic to
+  `169.254.169.254` at the host firewall or security-group level; prefer IMDSv2 (token-gated, PUT-then-GET) on AWS,
+  which is harder to exploit via SSRF.

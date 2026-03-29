@@ -381,8 +381,8 @@ def main():
       3. Token binding / Pushed Authorisation Requests (PAR) for sensitive endpoints
 """)
 
-    # ── Phase 9: Security Summary ─────────────────────────────────────────────
-    section("Phase 9: Security Properties — Full Summary")
+    # ── Phase 10: Security Summary ────────────────────────────────────────────
+    section("Phase 10: Security Properties — Full Summary")
     print("""
   Attacks demonstrated and mitigated:
   ┌──────────────────────────────────┬──────────────────────────────────────────────────┐

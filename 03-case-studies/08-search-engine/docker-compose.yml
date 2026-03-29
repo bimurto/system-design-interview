@@ -18,6 +18,12 @@ services:
       memlock:
         soft: -1
         hard: -1
+    deploy:
+      resources:
+        limits:
+          # JVM heap is 512m; allow headroom for OS buffers and mmap page cache.
+          memory: 1.5g
+          cpus: "2.0"
     volumes:
       # Named volume keeps index data across container restarts within a lab session.
       # Wiped on `docker compose down -v` (teardown step in the lab).
@@ -31,6 +37,8 @@ services:
 
   indexer:
     image: python:3.11-slim
+    # One-shot runner — do not restart on exit.
+    restart: "no"
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -39,6 +47,11 @@ services:
     working_dir: /app
     volumes:
       - ./experiment.py:/app/experiment.py
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "1.0"
     # Install deps then run experiment
     command: >
       sh -c "pip install elasticsearch --quiet && python experiment.py"

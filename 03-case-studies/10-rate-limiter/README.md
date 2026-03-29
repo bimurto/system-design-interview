@@ -2,45 +2,45 @@
 
 **Prerequisites:** `../../02-advanced/09-rate-limiting-algorithms/`, `../../02-advanced/07-distributed-caching/`
 
----
-
-## The Problem at Scale
-
-Stripe processes millions of API calls per day from thousands of merchants, each with different rate limits. A single
-global rate limiter must enforce per-API-key, per-endpoint, and per-IP limits across hundreds of API servers —
-consistently, without a central bottleneck.
-
-| Metric                   | Value                                      |
-|--------------------------|--------------------------------------------|
-| API servers              | 100s of instances                          |
-| Unique API keys          | Millions                                   |
-| API calls/day            | Hundreds of millions                       |
-| Rate limit check latency | < 1ms (Redis in-memory)                    |
-| Limit granularity        | Per API key, per endpoint, per IP          |
-| Window types             | Fixed window, sliding window, token bucket |
-
-The core challenge: if each of 100 API servers has its own in-memory counter, a client can send 100× the intended rate (
-10 req/s per server = 1,000 req/s globally). The counter must be globally shared.
+**Interview time budget:** ~45 minutes total
+- Clarify Requirements: 3–5 min
+- Capacity Estimation: 3–5 min
+- High-Level Design: 10 min
+- Deep Dive: 15–20 min
 
 ---
 
-## Requirements
+## 1. Clarify Requirements
 
-### Functional
+Start by narrowing the problem. Interviewers want to see you distinguish between what must be precise vs. what can be approximate.
 
+**Key questions to ask (and expected answers for FAANG context):**
+
+| Question | Why it matters |
+|---|---|
+| Who enforces the limit — gateway, service, or client SDK? | Determines where Redis lives in the request path |
+| Per IP, per API key, per user, or all three? | Each adds a Redis key per request |
+| Fixed-window, sliding-window, or token bucket? | Affects memory, burst behaviour, and Redis key count |
+| Fail open or fail closed when Redis is down? | Safety vs. availability trade-off |
+| Synchronous check (< 1ms) or async/best-effort? | Synchronous requires intra-DC Redis; async allows local counting |
+| Exact global enforcement or approximate? | Exact → central counter; approximate → local counting + sync |
+| Multi-region? | Central Redis adds cross-region latency; local counting with sync is the only viable option |
+
+**Functional requirements (agreed):**
 - Enforce rate limits per API key, per IP, per endpoint
 - Support multiple limit tiers (trial, standard, premium)
 - Return 429 Too Many Requests with informative headers
 - Allow configuring different limits without code deployments
 
-### Non-Functional
-
+**Non-functional requirements:**
 - Rate limit check must add < 1ms to request latency
 - Globally consistent: same API key seen by any server consumes the same quota
-- Fault tolerant: if rate limit store is unavailable, define clear fail behavior
+- Fault tolerant: if rate limit store is unavailable, define clear fail behaviour
 - No double-counting: concurrent requests from multiple servers must not bypass limits
 
-### Capacity Estimation
+---
+
+## 2. Capacity Estimation
 
 Baseline: Stripe-scale — 100K API RPS, 1M active API keys, 10s fixed window.
 
@@ -62,9 +62,13 @@ cost of a central INCR per request exceeds the budget.
 **Key expiry math:** with a 10s window, each counter TTL is 10s. Redis uses lazy expiry + background sweep. At 1M active
 keys × 100B = 100MB — comfortably below typical Redis instance RAM (8–64GB). No cleanup job needed.
 
+**Multi-region math:** if your API serves 3 regions (US, EU, APAC), a single Redis in US-East adds ~70ms RTT to every
+EU/APAC request just for the rate limit check. This exceeds the < 1ms budget by 70×. The only viable approach at
+multi-region scale is local counting per region with periodic synchronization — accepting approximate enforcement.
+
 ---
 
-## High-Level Architecture
+## 3. High-Level Design
 
 ```
   Client Request
@@ -105,9 +109,9 @@ balancing algorithm doesn't affect correctness.
 
 ---
 
-## Deep Dives
+## 4. Deep Dives
 
-### 1. Why Local Rate Limiting Fails at Scale
+### 4.1 Why Local Rate Limiting Fails at Scale
 
 **Per-server counter (wrong approach):**
 
@@ -131,7 +135,7 @@ Redis returns count=11 → server checks: 11 > 10 → deny 429
 
 All servers share one counter. Total across all servers ≤ limit. No coordination needed between servers.
 
-### 2. Redis Lua Script: Atomic Check-and-Increment
+### 4.2 Redis Lua Script: Atomic Check-and-Increment
 
 A naive (broken) implementation:
 
@@ -166,7 +170,7 @@ execution). No race window. The count returned by INCR is the authoritative valu
 **Why not MULTI/EXEC (Redis transactions)?** Transactions don't support conditional logic (if count > limit). Lua
 scripts support full conditional logic and execute atomically.
 
-### 3. Failure Modes: Fail Open vs Fail Closed
+### 4.3 Failure Modes: Fail Open vs Fail Closed
 
 When Redis is unavailable, every API server faces a binary choice:
 
@@ -197,7 +201,18 @@ When Redis is unavailable, every API server faces a binary choice:
 limiting resumes immediately with no operator action. An alternative is a background thread that polls Redis every few
 seconds and re-registers the Lua script on reconnect.
 
-### 4. Multi-Tier Rate Limiting
+**Redis HA options to reduce outage frequency:**
+
+| Option | Failover time | Data loss | Complexity |
+|---|---|---|---|
+| Redis Sentinel (1 primary + 2 replicas) | ~30s automatic | Up to 1s of writes | Low |
+| Redis Cluster (3 primary shards) | ~10s automatic | Up to 1s per shard | Medium |
+| Redis Enterprise Active-Active | Near-zero | Possible CRDT merge conflicts | High |
+
+For rate limiting, losing 1s of counter increments during failover is acceptable — a brief counter reset does not cause
+harm (a client gets a short reprieve, not a free pass indefinitely).
+
+### 4.4 Multi-Tier Rate Limiting
 
 Production systems layer multiple rate limits:
 
@@ -223,7 +238,7 @@ ratelimit:key:{api_key}:{window}     → API key-level
 ratelimit:key:{api_key}:charge:{win} → endpoint-level
 ```
 
-### 5. Sliding Window vs Fixed Window (Distributed)
+### 4.5 Sliding Window vs Fixed Window (Distributed)
 
 **Fixed window boundary problem:** A client sends 10 requests at t=9.9s (window 0) and 10 requests at t=10.1s (window
 1). Both windows see 10 requests → both allow. In 0.2 seconds, 20 requests passed through — double the intended rate.
@@ -244,7 +259,7 @@ R/second). Implemented in Redis with two fields: `tokens` (current bucket fill l
 of last refill). On each request, compute `elapsed = now - last_refill`, add `elapsed × R` tokens (capped at B), then
 consume 1 token if available.
 
-### 6. Sliding Window Log: Exact but Expensive
+### 4.6 Sliding Window Log: Exact but Expensive
 
 The sliding window log is the only algorithm that provides an exact sliding window — no approximation error. Each request
 is stored as a timestamped entry in a Redis sorted set (ZADD). On each new request:
@@ -273,7 +288,7 @@ experience and their Terms of Service audit. Memory is manageable at these limit
 **Why Cloudflare does not use it:** at 55M RPS with thousands of rate-limited entities, O(N) memory per key is
 untenable. Sliding window counter (O(1)) is the correct trade-off at that scale.
 
-### 7. Token Bucket in Redis (Lua Implementation Detail)
+### 4.7 Token Bucket in Redis (Lua Implementation Detail)
 
 The token bucket requires reading two fields, computing new state, and writing back — all atomically. A Lua script
 handles this:
@@ -304,6 +319,45 @@ end
 
 This uses two Redis keys per rate-limited entity and a Lua script for atomicity — the same pattern as fixed-window, but
 computing time-based refill instead of window-id rollover.
+
+### 4.8 Multi-Region Rate Limiting (Staff-Level Trade-off)
+
+This is where single-DC design breaks down. A client distributed across regions can bypass a per-region limit.
+
+**Option A: Centralized Redis (strong consistency, high latency)**
+
+```
+US-East (primary Redis)
+    ← EU writes (70ms RTT)
+    ← APAC writes (150ms RTT)
+```
+
+- Every request pays cross-region RTT for the INCR call
+- 70–150ms added latency — completely violates the < 1ms budget
+- Only viable if all traffic originates in one region
+
+**Option B: Local counting with async synchronization (eventual consistency)**
+
+```
+US-East Redis  ←──── periodic sync (every 1–10s) ────→  EU Redis
+     ↑                                                       ↑
+  US API servers                                         EU API servers
+```
+
+- Each region counts locally: O(0) added latency
+- Counts are periodically synced to a global aggregator or shared via gossip
+- During the sync window (1–10s), a client can exceed the global limit by up to N_regions × limit
+- Acceptable for DDoS protection and API monetisation — brief overcount is not catastrophic
+- **This is what Cloudflare does** across their ~300 PoPs
+
+**Option C: Approximate global limit via probabilistic counting**
+
+- HyperLogLog or count-min sketch per region
+- Not suitable for hard rate limits, but useful for analytics-driven throttling
+
+**Interview recommendation:** propose Option A for single-region, Option B for multi-region. Call out the consistency
+trade-off explicitly: "We accept eventual consistency across regions — a client might get 1.2× the limit during a sync
+gap, but that's acceptable because the alternative (cross-region round trip) breaks our latency SLA."
 
 ---
 
@@ -500,3 +554,12 @@ docker compose down -v
     window boundary (thundering herd). With `Retry-After` set to the exact seconds until window reset, all clients
     spread their retries across the new window as they each back off by the same duration. Also include
     `X-RateLimit-Reset` (Unix timestamp of window end) so SDKs that prefer absolute time can use it instead.
+
+15. **Q: How would your design change if you needed to rate limit across 3 geographic regions?**
+    A: A single central Redis is not viable — cross-region INCR adds 70–150ms per request, blowing the < 1ms latency
+    budget. The only scalable approach is local counting per region with periodic synchronization (every 1–10s). Each
+    region enforces the full limit independently; the sync aggregates counts globally to detect sustained multi-region
+    abuse. During the sync gap, a globally distributed client can briefly exceed the limit by up to N_regions×limit.
+    This is acceptable for rate limiting (brief over-counting is not catastrophic) but not for billing or quota enforcement
+    where exact counting is required. For billing-grade accuracy across regions, you need async event streaming
+    (Kafka/Kinesis) with a global aggregator — at the cost of eventual consistency and higher system complexity.

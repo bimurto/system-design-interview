@@ -803,7 +803,9 @@ def main():
     phase2_consume_and_deliver(conn)
     phase3_preference_filtering(conn)
     phase4_deduplication(conn)
-    phase5_retry_backoff(conn)
+    dlq_producer = make_producer()
+    phase5_retry_backoff(conn, dlq_producer)
+    dlq_producer.close()
 
     fanout_producer = make_producer()
     phase6_fanout_simulation(fanout_producer, conn)

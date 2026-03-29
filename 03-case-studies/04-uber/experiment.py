@@ -251,9 +251,19 @@ def phase2_find_nearest(r):
     for rank, (did, dist, eta) in enumerate(by_eta, 1):
         print(f"  {rank:>4}  {did:<24}  {dist:>8.3f}  {eta:>8.1f}")
 
+    # Count how many top-5 positions differ between the two rankings
+    dist_ids = [d[0] for d in by_distance]
+    eta_ids  = [d[0] for d in by_eta]
+    rank_changes = sum(1 for i, did in enumerate(eta_ids) if did != dist_ids[i])
     if by_distance[0][0] != by_eta[0][0]:
-        print(f"\n  NOTE: distance-nearest ({by_distance[0][0]}) != ETA-nearest ({by_eta[0][0]})")
-        print(f"        Urban road geometry means the closest driver isn't always fastest.")
+        print(f"\n  KEY INSIGHT: distance-nearest ({by_distance[0][0]}) != ETA-nearest ({by_eta[0][0]})")
+        print(f"    {rank_changes}/5 positions differ between distance-ranked and ETA-ranked lists.")
+        print(f"    Urban road geometry (rivers, one-ways, traffic) means the closest driver")
+        print(f"    is NOT always the fastest — minimising ETA produces better rider experience.")
+    else:
+        print(f"\n  Top driver matches between distance and ETA rankings ({rank_changes}/5 positions differ).")
+        print(f"    In this sample the nearest driver also has best ETA, but road factors vary;")
+        print(f"    in real networks with rivers/highways the rankings often diverge significantly.")
 
     print(f"""
   GEOSEARCH internals:
@@ -441,7 +451,7 @@ def phase5_kafka_pipeline(r):
 
     # Ensure the topic exists by sending one probe message and flushing, then
     # snapshot the current high-water mark for each partition.
-    probe_future = producer.send(TOPIC, value=json.dumps({"_probe": True}).encode())
+    probe_future = producer.send(TOPIC, value={"_probe": True})  # serializer handles encoding
     producer.flush()
 
     # Use a short-lived consumer to fetch current partition offsets (end offsets).
@@ -604,6 +614,9 @@ def phase7_latency_comparison(conn, r, driver_locations):
             )
 
     print(f"\n  Synced {len(drivers_subset)} drivers to PostGIS")
+    print(f"  NOTE: PostGIS has only {len(drivers_subset)} drivers (demo subset).")
+    print(f"  At 4M drivers, PostGIS GIST scan time grows O(log N + K), so expect")
+    print(f"  5-50ms per query vs sub-ms for Redis — a 10-100x gap at production scale.")
 
     rider_lat, rider_lng = 37.7751, -122.4180
     radii = [0.5, 1.0, 2.0, 5.0]
