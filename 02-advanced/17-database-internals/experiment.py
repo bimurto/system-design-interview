@@ -8,9 +8,11 @@ Prerequisites: docker compose up -d (wait ~10s)
 What this demonstrates:
   1. WAL (Write-Ahead Log): LSN advances with every write; WAL bytes per operation
   2. B-tree write patterns: random-key vs sequential-key inserts (page splits)
-  3. MVCC: snapshot isolation + dead tuple accumulation visible in pg_stat_user_tables
+  3. MVCC: snapshot isolation + dead tuple accumulation visible in pg_stat_user_tables;
+     idle-in-transaction connection blocking VACUUM
   4. Simulated LSM-tree: memtable flush -> SSTables -> compaction, with a real
-     probabilistic Bloom filter showing false positives
+     probabilistic Bloom filter showing false positives; Bloom false-positives do NOT
+     stop the scan — remaining SSTables are always checked
   5. Write amplification: quantifying how many bytes hit disk per logical write
 """
 
@@ -357,6 +359,71 @@ def phase3_mvcc():
   A single forgotten idle-in-transaction session can cause table bloat.
 """)
 
+    # ── Idle-in-transaction blocks VACUUM demo ────────────────────────────────
+    print("  Idle-in-transaction blocking VACUUM:\n")
+    print("  An open transaction (even doing nothing) pins the xmin horizon,")
+    print("  preventing VACUUM from reclaiming dead tuples older than that XID.\n")
+
+    conn_idle = get_pg()           # this connection will hold an open TX
+    cur_idle = conn_idle.cursor()
+    cur_idle.execute("BEGIN")      # open TX — now idle-in-transaction
+    cur_idle.execute("SELECT 1")   # take a snapshot
+
+    # Generate more dead tuples while idle TX is open
+    conn_bloat = get_pg(autocommit=True)
+    cur_bloat = conn_bloat.cursor()
+    for i in range(50):
+        cur_bloat.execute("UPDATE mvcc_demo SET balance = %s WHERE id = 1", (9000 + i,))
+
+    # Check whether VACUUM can advance the relfrozenxid / remove dead tuples
+    cur_bloat.execute("VACUUM mvcc_demo")   # runs, but xmin horizon is blocked
+
+    cur_bloat.execute("""
+        SELECT n_dead_tup,
+               age(relfrozenxid) AS frozen_xid_age
+        FROM pg_stat_user_tables st
+        JOIN pg_class c ON c.relname = st.relname
+        WHERE st.relname = 'mvcc_demo'
+    """)
+    row = cur_bloat.fetchone()
+    dead_while_blocked, frozen_age = (row[0], row[1]) if row else (0, 0)
+
+    # Now close the blocking idle TX and vacuum again
+    conn_idle.rollback()
+    conn_idle.close()
+    cur_bloat.execute("VACUUM mvcc_demo")
+    time.sleep(0.3)
+
+    cur_bloat.execute("""
+        SELECT n_dead_tup,
+               age(relfrozenxid) AS frozen_xid_age
+        FROM pg_stat_user_tables st
+        JOIN pg_class c ON c.relname = st.relname
+        WHERE st.relname = 'mvcc_demo'
+    """)
+    row = cur_bloat.fetchone()
+    dead_after_unblock, frozen_age2 = (row[0], row[1]) if row else (0, 0)
+
+    print(f"    Dead tuples while idle TX open:  {dead_while_blocked}")
+    print(f"    Dead tuples after idle TX closed: {dead_after_unblock}")
+    print(f"""
+  Key insight: one forgotten idle-in-transaction session can halt VACUUM
+  across ALL tables in the database, causing unbounded table bloat.
+
+  Detection:
+    SELECT pid, state, now() - xact_start AS idle_duration, query
+    FROM pg_stat_activity
+    WHERE state = 'idle in transaction'
+    ORDER BY idle_duration DESC;
+
+  Mitigation:
+    SET idle_in_transaction_session_timeout = '5min';  -- auto-kill stale TXs
+    Monitor pg_stat_activity regularly in production.
+""")
+
+    cur_bloat.close()
+    conn_bloat.close()
+
     for c in [conn_reader, conn_writer, conn_new, conn_update]:
         try:
             c.close()
@@ -528,8 +595,10 @@ def phase4_lsm_simulation():
                 val, found, reason = sst.get(key)
                 if found:
                     return val, str(sst), reason
-                if reason == "bloom_false_positive":
-                    return None, str(sst), reason
+                # BUG FIX: a Bloom false-positive means the binary search found
+                # no match in *this* SSTable.  We must continue scanning older
+                # SSTables — an earlier SSTable may still hold the key.
+                # (Previously the code returned here, causing a premature miss.)
             return None, "not_found", None
 
         def write_amplification_factor(self):
@@ -722,7 +791,8 @@ def main():
   Topics:
     1. WAL: sequential durability log, LSN tracking, crash recovery, replication
     2. B-tree writes: sequential keys vs random UUID keys (page splits, index bloat)
-    3. MVCC: snapshot isolation + dead tuple accumulation + autovacuum
+    3. MVCC: snapshot isolation + dead tuple accumulation + autovacuum +
+             idle-in-transaction blocking VACUUM
     4. LSM simulation: memtable -> SSTable flush -> compaction + probabilistic Bloom filter
     5. Write amplification: quantifying WAL overhead per operation type (INSERT/UPDATE/DELETE)
 """)

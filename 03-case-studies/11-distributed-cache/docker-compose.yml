@@ -14,6 +14,7 @@ services:
         --cluster-require-full-coverage no
         --cluster-announce-ip redis-1
         --cluster-announce-port 7001
+        --cluster-announce-bus-port 17001
         --appendonly yes
         --appendfsync everysec
         --save 60 1
@@ -42,6 +43,7 @@ services:
         --cluster-require-full-coverage no
         --cluster-announce-ip redis-2
         --cluster-announce-port 7002
+        --cluster-announce-bus-port 17002
         --appendonly yes
         --appendfsync everysec
         --save 60 1
@@ -70,6 +72,7 @@ services:
         --cluster-require-full-coverage no
         --cluster-announce-ip redis-3
         --cluster-announce-port 7003
+        --cluster-announce-bus-port 17003
         --appendonly yes
         --appendfsync everysec
         --save 60 1

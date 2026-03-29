@@ -131,6 +131,48 @@ must be checkpointed to durable storage for fault tolerance. Flink uses RocksDB 
 larger than memory, and checkpoints to S3/HDFS allow recovery from failures without reprocessing the entire stream from
 scratch.
 
+### Processing Guarantees
+
+Stream processors offer three delivery semantics for output records:
+
+- **At-most-once:** offsets are committed before output is written. A crash after commit but before the write loses
+  records. Simplest to implement; acceptable only for metrics/monitoring where data loss is tolerable.
+- **At-least-once:** output is written before offsets are committed. A crash after write but before commit causes the
+  operator to reprocess from the last committed offset, re-emitting duplicates. Idempotent sinks (e.g., UPSERT with a
+  dedup key) are required to make this safe.
+- **Exactly-once:** both the output write and the offset commit are made atomically. No data is lost and no record is
+  emitted more than once.
+
+**Flink's two-phase commit (2PC) for exactly-once Kafka sinks:**
+
+```
+  Checkpoint N begins:
+    1. JobManager injects a CheckpointBarrier into every source partition.
+    2. Each operator buffers output records (pre-commit phase):
+         Kafka sink opens a Kafka transaction and writes records to the broker,
+         but does NOT yet call commitTransaction().
+    3. Once all operators have acknowledged the barrier:
+         JobManager calls notifyCheckpointComplete(N).
+    4. Kafka sink calls commitTransaction() — output is now visible to consumers.
+         Kafka consumer offset is advanced to checkpoint N's recorded Kafka offset.
+
+  On failure (crash between steps 2 and 4):
+    - Pre-committed Kafka transactions are aborted (Kafka's transaction timeout).
+    - Flink restores from checkpoint N-1; re-processes events since N-1.
+    - Output is re-written inside a new transaction and committed cleanly.
+    - Net result: every record appears exactly once in the output topic.
+
+  Requirements for exactly-once end-to-end:
+    1. Idempotent Kafka producer (enable.idempotence=true) — deduplicates retries
+       within a single producer session.
+    2. Kafka transactions on the sink (isolation.level=read_committed on consumers).
+    3. Flink checkpointing enabled with a durable state backend (S3/HDFS).
+    4. Source must support replay from a recorded offset (Kafka satisfies this).
+```
+
+Without all four, you get at-least-once at best. Exactly-once adds latency proportional to the checkpoint interval
+(typically 10–60 seconds for production jobs) because output is only visible after the checkpoint completes.
+
 **Backpressure** is a critical operational concern. When a downstream operator (e.g., a sink writing to a database)
 processes slower than the upstream source (Kafka), the unbounded internal queue between them grows until the process
 runs out of memory and crashes. Flink handles backpressure by propagating credit tokens upstream — when the sink's input

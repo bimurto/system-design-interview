@@ -9,6 +9,8 @@ services:
       - "8001:8001"
     environment:
       - JWT_SECRET=supersecretkey_change_in_production
+    mem_limit: 128m
+    restart: unless-stopped
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')" ]
       interval: 5s
@@ -26,6 +28,8 @@ services:
     environment:
       - JWT_SECRET=supersecretkey_change_in_production
       - AUTH_HOST=auth-service
+    mem_limit: 128m
+    restart: unless-stopped
     depends_on:
       auth-service:
         condition: service_healthy

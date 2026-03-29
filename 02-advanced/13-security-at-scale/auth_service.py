@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Auth service: issues JWT access tokens and refresh tokens.
-POST /token   — username/password → access_token + refresh_token
-POST /refresh — refresh_token → new access_token + NEW refresh_token (rotation)
-POST /logout  — invalidate refresh_token
+POST /token        — username/password → access_token + refresh_token
+POST /refresh      — refresh_token → new access_token + NEW refresh_token (rotation)
+POST /logout       — invalidate refresh_token
 GET  /health
+GET  /jwks         — public key components (n, e) for RS256 or "none" for HS256 (illustrative)
 
 Security design notes:
   - Refresh token rotation: every /refresh call invalidates the old token and issues
@@ -13,6 +14,9 @@ Security design notes:
   - Token type claim: access tokens carry type="access", refresh tokens type="refresh".
     The API service rejects refresh tokens used directly as access tokens.
   - Passwords compared with constant-time hmac.compare_digest to resist timing attacks.
+  - /jwks publishes a JWKS-style document so API services can discover verification keys
+    without out-of-band configuration.  In this lab we use HS256 so there is no public
+    key to expose; the endpoint returns a placeholder to illustrate the RS256 workflow.
 """
 import os
 import time
@@ -79,6 +83,35 @@ def revoke_family(family_id):
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "auth"})
+
+
+@app.route("/jwks")
+def jwks():
+    """Return a JSON Web Key Set document.
+
+    In a real RS256 deployment this would return the RSA public key's modulus (n)
+    and exponent (e) so that any API service can verify tokens without sharing a
+    secret.  Because this lab uses HS256 (symmetric), we return an empty keys list
+    with a note explaining the RS256 rotation workflow:
+
+      1. Generate a new RSA key pair.
+      2. Add the new public key to /jwks under a new "kid".
+      3. Re-sign new tokens with the new private key, setting the matching "kid" in
+         the JWT header.
+      4. Allow both keys in /jwks during the rollover window (old tokens expire).
+      5. Remove the old key from /jwks after its tokens have expired.
+
+    This zero-downtime rotation is impossible with HS256 because the shared secret
+    cannot be published.
+    """
+    return jsonify({
+        "keys": [],
+        "_note": (
+            "HS256 is symmetric — the secret cannot be published. "
+            "Switch to RS256 to expose n/e here and enable zero-downtime key rotation. "
+            "See README §HS256 vs RS256 and the JWKS rotation workflow."
+        ),
+    })
 
 
 @app.route("/token", methods=["POST"])

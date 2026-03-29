@@ -10,14 +10,27 @@ Endpoints:
   GET  /ledger                         → full ledger view (all entries)
   GET  /balance/<account_id>           → balance for an account
   POST /refund                         → refund a charge
-       body: {transaction_id, idempotency_key}
+       body: {transaction_id, idempotency_key, amount? (partial refund)}
+  GET  /reconcile                      → run ledger integrity check
+
+Design notes:
+  - Idempotency keys are scoped to (customer_id, idempotency_key) so two different
+    customers can use the same key string without collision. In production this would
+    be (api_key_id, idempotency_key).
+  - The UNIQUE constraint on (customer_id, idempotency_key) is the correctness
+    guarantee for concurrent deduplication. The Redis pre-check is a latency
+    optimization only — correctness does NOT depend on Redis.
+  - Ledger entries carry a currency column so the sum-to-zero invariant is enforced
+    per-currency, not in aggregate across currencies.
+  - The outbox table captures webhook events inside the same DB transaction as the
+    charge, guaranteeing at-least-once delivery even if the service crashes before
+    publishing to Kafka/SQS.
 """
 
 import json
 import os
-import time
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import psycopg2
 import psycopg2.extras
@@ -29,10 +42,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://app:secret@localhost
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 MERCHANT_ACCOUNT = "merchant-001"
-REVENUE_ACCOUNT = "revenue-001"
 ESCROW_ACCOUNT = "escrow-001"
 
-# Connect to Redis for idempotency key cache
+IDEM_KEY_TTL_SECONDS = 86400  # 24 hours
+
+# Connect to Redis for idempotency key cache.
 # Redis is a performance optimization only — Postgres UNIQUE constraint is the
 # correctness guarantee. If Redis is unavailable, all requests fall through to
 # Postgres (slower, but correct).
@@ -55,14 +69,23 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
-                idempotency_key TEXT UNIQUE NOT NULL,
+                -- Scoped to customer to match the (api_key, idem_key) production pattern.
+                -- The UNIQUE constraint here is the atomic guard against TOCTOU races.
                 customer_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
                 amount NUMERIC(18, 2) NOT NULL CHECK (amount > 0),
+                -- Track how much has been refunded so partial refunds are safe.
+                refunded_amount NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (refunded_amount >= 0),
                 currency TEXT NOT NULL DEFAULT 'USD',
-                status TEXT NOT NULL DEFAULT 'pending',
+                -- status lifecycle: pending → completed | failed | refunded | partially_refunded
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'completed', 'failed', 'refunded', 'partially_refunded')),
                 description TEXT,
+                -- Store when this idempotency key expires so batch pruning can filter by it.
+                idem_key_expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (customer_id, idempotency_key)
             )
         """)
         cur.execute("""
@@ -70,9 +93,26 @@ def init_db():
                 id BIGSERIAL PRIMARY KEY,
                 transaction_id TEXT NOT NULL REFERENCES transactions(id),
                 account_id TEXT NOT NULL,
-                amount NUMERIC(18, 2) NOT NULL,
+                amount NUMERIC(18, 2) NOT NULL CHECK (amount > 0),
+                -- currency is stored here so sum-to-zero can be verified per-currency.
+                -- In a multi-currency system, SUM(signed_amount) must equal 0 for each
+                -- currency independently — not in aggregate across currencies.
+                currency TEXT NOT NULL DEFAULT 'USD',
                 entry_type TEXT NOT NULL CHECK (entry_type IN ('debit', 'credit')),
                 description TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        # Outbox table: webhook events written inside the same DB transaction as the
+        # charge. A separate delivery worker polls this table and publishes to
+        # Kafka/SQS, then marks delivered=true. This guarantees at-least-once
+        # delivery even if the service crashes between commit and publish.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS outbox_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                delivered BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
@@ -84,10 +124,21 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_ledger_account
             ON ledger_entries(account_id)
         """)
-        # Idempotency key is scoped to (api_key, idempotency_key) in production.
-        # In this lab we scope by (customer_id, idempotency_key) for simplicity.
-        # The UNIQUE constraint on idempotency_key is the atomicity guarantee —
-        # not the pre-check SELECT. See TOCTOU note in README.
+        # Composite index mirrors the UNIQUE constraint for fast idempotency lookups.
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transactions_idem
+            ON transactions(customer_id, idempotency_key)
+        """)
+        # Index for batch pruning of expired idempotency keys.
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transactions_idem_expires
+            ON transactions(idem_key_expires_at)
+            WHERE idem_key_expires_at < NOW()
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_outbox_undelivered
+            ON outbox_events(created_at) WHERE delivered = FALSE
+        """)
         cur.execute("""
             CREATE OR REPLACE FUNCTION update_updated_at()
             RETURNS TRIGGER AS $$
@@ -110,27 +161,63 @@ def init_db():
 
 
 def create_ledger_entries(cur, transaction_id: str, customer_id: str,
-                          amount: Decimal, description: str):
+                          amount: Decimal, currency: str, description: str,
+                          debit_account: str = None, credit_account: str = None,
+                          debit_desc: str = None, credit_desc: str = None):
     """
-    Double-entry bookkeeping: every charge creates two entries.
-    Customer account: debit (money leaves customer)
-    Merchant account: credit (money arrives at merchant)
-    The sum of all ledger entries must always be zero.
+    Double-entry bookkeeping: every money movement creates exactly two entries.
+    The sum of (credits - debits) across all entries must always equal zero,
+    enforced per-currency.
+
+    Default pattern for a charge:
+      Debit  customer account  (money leaves customer)
+      Credit merchant account  (money arrives at merchant)
+
+    For a refund the caller inverts debit_account / credit_account.
     """
+    debit_account = debit_account or customer_id
+    credit_account = credit_account or MERCHANT_ACCOUNT
+    debit_desc = debit_desc or f"Charge: {description}"
+    credit_desc = credit_desc or f"Revenue: {description}"
+
     cur.execute("""
-        INSERT INTO ledger_entries (transaction_id, account_id, amount, entry_type, description)
+        INSERT INTO ledger_entries
+            (transaction_id, account_id, amount, currency, entry_type, description)
         VALUES
-          (%s, %s, %s, 'debit',  %s),
-          (%s, %s, %s, 'credit', %s)
+          (%s, %s, %s, %s, 'debit',  %s),
+          (%s, %s, %s, %s, 'credit', %s)
     """, (
-        transaction_id, customer_id, amount, f"Charge: {description}",
-        transaction_id, MERCHANT_ACCOUNT, amount, f"Revenue: {description}",
+        transaction_id, debit_account,  amount, currency, debit_desc,
+        transaction_id, credit_account, amount, currency, credit_desc,
     ))
 
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "payment-service"})
+
+
+def _serialize_transaction(txn: dict) -> dict:
+    """
+    Normalize a transactions row into a stable API response shape.
+    Always returns 'transaction_id' (not the raw DB column 'id') so callers
+    get a consistent field name regardless of whether the response is a fresh
+    charge or an idempotency-deduplicated repeat.
+    """
+    out = dict(txn)
+    # Expose the PK as 'transaction_id' for a clean API contract.
+    out["transaction_id"] = out.pop("id", out.get("transaction_id", ""))
+    out["amount"] = str(out["amount"])
+    out["refunded_amount"] = str(out.get("refunded_amount") or "0")
+    out["created_at"] = str(out["created_at"])
+    out["updated_at"] = str(out["updated_at"])
+    out["idem_key_expires_at"] = str(out.get("idem_key_expires_at", ""))
+    return out
+
+
+def _redis_idem_key(customer_id: str, idem_key: str) -> str:
+    """Redis key is scoped to customer so two customers can use the same string."""
+    return f"idem:{customer_id}:{idem_key}"
 
 
 @app.route("/charge", methods=["POST"])
@@ -141,11 +228,11 @@ def charge():
     required = ["amount", "currency", "customer_id", "idempotency_key"]
     for field in required:
         if field not in data:
-            return jsonify({"error": f"missing_field", "field": field}), 400
+            return jsonify({"error": "missing_field", "field": field}), 400
 
     try:
         amount = Decimal(str(data["amount"]))
-    except Exception:
+    except (InvalidOperation, ValueError):
         return jsonify({"error": "invalid_amount"}), 400
 
     if amount <= 0:
@@ -155,43 +242,59 @@ def charge():
     customer_id = str(data["customer_id"])
     currency = str(data["currency"]).upper()
     description = str(data.get("description", "Payment"))
+    redis_key = _redis_idem_key(customer_id, idem_key)
 
-    # Check Redis idempotency cache first (fast path)
+    # Fast path: check Redis cache (performance optimisation, not correctness guarantee).
     if rcache:
-        cached = rcache.get(f"idem:{idem_key}")
+        cached = rcache.get(redis_key)
         if cached:
+            cached_result = json.loads(cached)
             return jsonify({"status": "duplicate", "cached": True,
-                            "transaction": json.loads(cached)}), 200
+                            "transaction": cached_result}), 200
 
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            # Check idempotency in DB (authoritative)
+            # Authoritative idempotency check in Postgres.
+            # Scoped to (customer_id, idempotency_key) — mirrors production
+            # (api_key_id, idempotency_key) pattern to prevent cross-merchant
+            # key collisions (Failure Mode 6 in README).
             cur.execute(
-                "SELECT * FROM transactions WHERE idempotency_key = %s",
-                (idem_key,)
+                "SELECT * FROM transactions WHERE customer_id = %s AND idempotency_key = %s",
+                (customer_id, idem_key)
             )
             existing = cur.fetchone()
             if existing:
-                txn = dict(existing)
-                txn["amount"] = str(txn["amount"])
-                txn["created_at"] = str(txn["created_at"])
-                txn["updated_at"] = str(txn["updated_at"])
-                # Cache it for future fast lookups
+                result = _serialize_transaction(existing)
                 if rcache:
-                    rcache.setex(f"idem:{idem_key}", 86400, json.dumps(txn))
-                return jsonify({"status": "duplicate", "transaction": txn}), 200
+                    rcache.setex(redis_key, IDEM_KEY_TTL_SECONDS, json.dumps(result))
+                return jsonify({"status": "duplicate", "transaction": result}), 200
 
-            # Create transaction record
+            # New request: insert transaction + ledger entries in one atomic transaction.
+            # The UNIQUE (customer_id, idempotency_key) constraint is the last-line guard
+            # for concurrent races (TOCTOU). If two threads race here, only one INSERT
+            # commits; the other gets UniqueViolation and falls into the except block.
             transaction_id = str(uuid.uuid4())
             cur.execute("""
-                INSERT INTO transactions (id, idempotency_key, customer_id, amount,
-                    currency, status, description)
+                INSERT INTO transactions
+                    (id, idempotency_key, customer_id, amount, currency, status, description)
                 VALUES (%s, %s, %s, %s, %s, 'completed', %s)
             """, (transaction_id, idem_key, customer_id, amount, currency, description))
 
-            # Create double-entry ledger entries
-            create_ledger_entries(cur, transaction_id, customer_id, amount, description)
+            # Double-entry: debit customer, credit merchant.
+            create_ledger_entries(cur, transaction_id, customer_id, amount, currency, description)
+
+            # Outbox event: written in the same DB transaction so webhook delivery
+            # is guaranteed even if the process crashes before publishing externally.
+            cur.execute("""
+                INSERT INTO outbox_events (event_type, payload)
+                VALUES ('payment.created', %s)
+            """, (json.dumps({
+                "transaction_id": transaction_id,
+                "customer_id": customer_id,
+                "amount": str(amount),
+                "currency": currency,
+            }),))
 
         conn.commit()
 
@@ -205,26 +308,24 @@ def charge():
             "description": description,
         }
 
-        # Cache in Redis for 24h
+        # Populate Redis after commit so cache is never ahead of DB truth.
         if rcache:
-            rcache.setex(f"idem:{idem_key}", 86400, json.dumps(result))
+            rcache.setex(redis_key, IDEM_KEY_TTL_SECONDS, json.dumps(result))
 
         return jsonify(result), 201
 
     except psycopg2.errors.UniqueViolation:
+        # Concurrent duplicate hit the UNIQUE constraint. Roll back and return
+        # the committed row — this is the correct path for the TOCTOU race.
         conn.rollback()
-        # Concurrent duplicate — fetch and return existing
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM transactions WHERE idempotency_key = %s",
-                (idem_key,)
+                "SELECT * FROM transactions WHERE customer_id = %s AND idempotency_key = %s",
+                (customer_id, idem_key)
             )
             existing = cur.fetchone()
-        txn = dict(existing)
-        txn["amount"] = str(txn["amount"])
-        txn["created_at"] = str(txn["created_at"])
-        txn["updated_at"] = str(txn["updated_at"])
-        return jsonify({"status": "duplicate", "transaction": txn}), 200
+        result = _serialize_transaction(existing)
+        return jsonify({"status": "duplicate", "transaction": result}), 200
     except Exception as e:
         conn.rollback()
         return jsonify({"error": "internal_error", "detail": str(e)}), 500

@@ -56,10 +56,20 @@ scanning all SSTables, each one has a **Bloom filter** (a probabilistic structur
 this SSTable") and a sparse index. Reads are more expensive than B-tree reads because multiple files may need to be
 consulted — this is the write-optimized vs read-optimized trade-off.
 
-**Compaction:** SSTables accumulate over time. A background compaction process merges SSTables at the same level into a
-new, larger SSTable at the next level, discarding deleted and overwritten entries. Compaction keeps read performance
-acceptable, but it consumes I/O bandwidth — during heavy compaction, read and write latency spikes. This is **write
-amplification**: each byte written by the application may be rewritten multiple times during compaction across levels.
+**Compaction:** SSTables accumulate over time. A background compaction process merges SSTables, discarding deleted and
+overwritten entries. Compaction keeps read performance acceptable, but it consumes I/O bandwidth — during heavy
+compaction, read and write latency spikes. This is **write amplification**: each byte written by the application may be
+rewritten multiple times during compaction across levels.
+
+Two dominant compaction strategies:
+
+- **Size-Tiered Compaction Strategy (STCS):** merges SSTables of similar size into one larger SSTable. Write amplification
+  is low (fewer rewrites), but space amplification is high — multiple overlapping SSTables of the same key range coexist
+  temporarily, doubling disk usage during compaction. Used by Cassandra as the default for write-heavy workloads.
+- **Leveled Compaction Strategy (LCS / RocksDB default):** SSTables at each level have non-overlapping key ranges and a
+  fixed size limit per level. Compaction merges an L_n SSTable into L_{n+1}, maintaining the sorted, non-overlapping
+  invariant. Read amplification is low (at most one SSTable per level needs checking), but write amplification is high
+  (10–30x) because data is rewritten at each level. Used by RocksDB for mixed read/write workloads.
 
 **Tombstones:** deletes are not in-place. Instead, a delete writes a **tombstone** record (a marker with the key and a
 deletion flag). The actual entry is removed during the next compaction that merges the tombstone with the original
@@ -114,6 +124,12 @@ storage can be 10–100x faster than row storage.
   all, making reads much cheaper"
 - "For time-series or append-only workloads (logs, events, metrics), LSM-tree engines like RocksDB or Cassandra
   outperform Postgres significantly because writes never do random I/O"
+- "WAL archiving enables Point-In-Time Recovery (PITR): ship WAL segments to object storage (S3, GCS), then replay them
+  on top of a base backup to restore to any second in the past. This is the standard disaster-recovery mechanism for
+  managed Postgres (RDS, Cloud SQL, Supabase). RPO approaches zero; RTO depends on how many WAL segments must be
+  replayed"
+- "STCS vs leveled compaction is a space-amplification vs write-amplification trade-off: STCS is write-friendly but
+  temporarily uses 2x disk during compaction; leveled reads faster but rewrites data 10–30x across levels"
 
 ## Hands-on Lab
 
@@ -173,3 +189,16 @@ docker compose down -v
 - **Choosing column storage for OLTP.** Column stores are terrible for point lookups and single-row updates — they must
   reconstruct the full row from multiple column files. Use column storage only for analytical (read-heavy, full-scan)
   workloads.
+- **Ignoring XID (Transaction ID) wraparound in Postgres.** Postgres assigns a 32-bit XID to every transaction. At 2^31
+  (≈ 2.1 billion) transactions ahead of the oldest unfrozen XID, Postgres will refuse all writes and go read-only to
+  prevent data corruption — one of the most dangerous Postgres-specific failure modes. VACUUM FREEZE advances
+  `relfrozenxid` to prevent wraparound. Monitor with:
+  ```sql
+  SELECT relname, age(relfrozenxid) AS xid_age
+  FROM pg_class
+  WHERE relkind = 'r'
+  ORDER BY xid_age DESC
+  LIMIT 10;
+  ```
+  Alert when `xid_age > 1.5 billion`. Autovacuum triggers a freeze pass at `autovacuum_freeze_max_age` (default 200M).
+  For write-heavy databases, tune this lower and ensure autovacuum is not blocked by long-running transactions.

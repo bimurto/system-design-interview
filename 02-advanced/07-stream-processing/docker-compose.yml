@@ -9,6 +9,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - stream-net
 
   kafka:
     image: confluentinc/cp-kafka:7.4.0
@@ -17,6 +19,7 @@ services:
         condition: service_healthy
     ports:
       - "9092:9092"
+    mem_limit: 1g
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -42,6 +45,8 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
+    networks:
+      - stream-net
 
   processor:
     image: python:3.11-slim
@@ -50,7 +55,11 @@ services:
         condition: service_healthy
     volumes:
       - ./experiment.py:/experiment.py
-    # Run via the external port so experiment.py needs no code changes for Docker mode.
+    environment:
+      # Use internal broker address for container-to-container communication.
+      # experiment.py reads this env var so the same script works in Docker and locally.
+      BOOTSTRAP_SERVERS: "kafka:29092"
+    # Run via the internal listener so processor can reach Kafka within stream-net.
     command: >
       bash -c "pip install kafka-python-ng -q && python /experiment.py"
     # Use a named network instead of network_mode:host — host networking is Linux-only

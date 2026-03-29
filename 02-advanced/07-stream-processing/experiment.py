@@ -10,11 +10,14 @@ What this demonstrates:
   3. Sliding window: count clicks per user in last 60 seconds (with window slide)
   4. Session window: group user events by inactivity gaps
   5. Out-of-order events: step through watermark advancement with explicit event stream
+     (includes "remaining open windows" printout showing in-memory state held)
   6. Late-arriving event: three handling strategies (hard cutoff, watermark, side output)
   7. Lambda vs Kappa architecture comparison
+  8. State TTL / state explosion demo — 500 unique bot IDs, unbounded vs TTL-capped state
 """
 
 import json
+import os
 import time
 import subprocess
 import uuid
@@ -33,7 +36,9 @@ except ImportError:
     from kafka.admin import KafkaAdminClient, NewTopic
     from kafka.errors import TopicAlreadyExistsError
 
-BOOTSTRAP   = "localhost:9092"
+# In Docker mode, docker-compose sets BOOTSTRAP_SERVERS=kafka:29092 (internal listener).
+# When running locally, falls back to localhost:9092 (external listener exposed on port 9092).
+BOOTSTRAP   = os.environ.get("BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC       = "clicks"
 NUM_USERS   = 20
 NUM_EVENTS  = 1000
@@ -422,6 +427,19 @@ def phase5_watermark_stepping():
         for arr, evt, usr in side_output:
             print(f"      arrival={arr}, event_time=+{evt - BASE}, user={usr}")
 
+    # Show windows that are still open (holding state in memory)
+    open_windows = [ws for ws in window_counts if ws not in closed_windows]
+    if open_windows:
+        print(f"\n  Remaining open windows ({len(open_windows)} — still holding state in memory):")
+        for ws in sorted(open_windows):
+            we = ws + WINDOW_SIZE
+            events_in_window = sum(window_counts[ws].values())
+            print(f"    Window [{ws - BASE}, {we - BASE}): {events_in_window} event(s) "
+                  f"— waiting for watermark to reach t=+{we - BASE} before closing")
+        print(f"  NOTE: In a real job these windows occupy state backend memory until the")
+        print(f"  watermark advances past their end. If the stream goes idle, they stay open")
+        print(f"  forever — this is the 'watermark stall / idle partition' failure mode.")
+
     print(f"""
   Key observations from the trace above:
     1. The watermark advances monotonically (never goes backward).
@@ -620,6 +638,119 @@ def phase7_lambda_vs_kappa():
 """)
 
 
+def phase8_state_ttl_explosion():
+    """
+    State TTL and state explosion demo.
+
+    Scenario: a bot floods the system with 500 unique user IDs, each generating
+    one event.  Session windows keep one open-session record per user.  Without a
+    max-session-duration cap the state grows without bound.  With a cap the state
+    is provably bounded: O(max_session_duration / gap * active_users).
+
+    This maps directly to the 'state explosion' failure mode asked about in FAANG
+    system-design interviews.
+    """
+    section("Phase 8: State TTL / State Explosion Demo")
+
+    SESSION_GAP      = 30   # seconds — inactivity gap that starts a new session
+    MAX_SESSION_SECS = 300  # 5-minute absolute cap (simulates StateTtlConfig / Retention)
+    NUM_BOT_USERS    = 500  # attacker generates this many unique IDs
+
+    print(f"\n  Scenario: bot generates {NUM_BOT_USERS} unique user IDs, one event each.")
+    print(f"  Session gap: {SESSION_GAP}s | Max session duration cap: {MAX_SESSION_SECS}s\n")
+
+    # ── Generate bot events ───────────────────────────────────────────────────
+    random.seed(99)
+    now_ts = 10_000  # abstract timestamp base
+
+    bot_events = []
+    for i in range(NUM_BOT_USERS):
+        uid = f"bot-{i:05d}"
+        # Each bot user sends exactly one event at a random time in a 10-minute window
+        ts = now_ts + random.randint(0, 600)
+        bot_events.append({"user_id": uid, "ts": ts})
+
+    # ── Without TTL cap: track open sessions ─────────────────────────────────
+    # State = {user_id: last_event_ts}  — one entry per "open" session
+    state_no_ttl = {}
+    for ev in bot_events:
+        uid = ev["user_id"]
+        state_no_ttl[uid] = ev["ts"]   # always update last-seen timestamp
+
+    print(f"  Without TTL cap:")
+    print(f"    Open session entries in state:  {len(state_no_ttl):,}")
+    print(f"    Each entry ~200 bytes (user_id string + timestamp + overhead)")
+    estimated_bytes_no_ttl = len(state_no_ttl) * 200
+    print(f"    Estimated state size:           ~{estimated_bytes_no_ttl / 1024:.1f} KB")
+    print(f"    If bot scales to 10M IDs:       ~{10_000_000 * 200 / (1024**3):.1f} GB → OOM / RocksDB thrash")
+
+    # ── With TTL cap: evict sessions older than MAX_SESSION_SECS ─────────────
+    # In Flink this is StateTtlConfig.newBuilder(Time.seconds(MAX_SESSION_SECS))
+    # In Kafka Streams this is SessionWindows.ofInactivityGapWithNoGrace(...).grace(Duration.ofSeconds(...))
+    high_watermark = max(ev["ts"] for ev in bot_events)
+    eviction_cutoff = high_watermark - MAX_SESSION_SECS
+
+    state_with_ttl = {
+        uid: last_ts
+        for uid, last_ts in state_no_ttl.items()
+        if last_ts >= eviction_cutoff
+    }
+
+    print(f"\n  With TTL cap ({MAX_SESSION_SECS}s max session duration):")
+    print(f"    Eviction cutoff timestamp:      {eviction_cutoff}")
+    print(f"    Open session entries remaining: {len(state_with_ttl):,}")
+    estimated_bytes_ttl = len(state_with_ttl) * 200
+    print(f"    Estimated state size:           ~{estimated_bytes_ttl / 1024:.1f} KB")
+    evicted = len(state_no_ttl) - len(state_with_ttl)
+    print(f"    Evicted (TTL expired):          {evicted:,} entries")
+
+    # Show state is now bounded relative to the TTL window
+    fraction_kept = len(state_with_ttl) / len(state_no_ttl)
+    print(f"    State reduction:                {(1 - fraction_kept) * 100:.1f}% smaller")
+
+    # ── Mixed legitimate + bot traffic to show bounded steady state ───────────
+    print(f"\n  Bounded steady-state analysis:")
+    print(f"    With TTL={MAX_SESSION_SECS}s and gap={SESSION_GAP}s:")
+    print(f"    Max open sessions per user = MAX_SESSION_SECS / SESSION_GAP = "
+          f"{MAX_SESSION_SECS // SESSION_GAP}")
+    print(f"    State size = O(active_users × MAX_SESSION_SECS / SESSION_GAP)")
+    print(f"    For 1M DAU each with avg 2 sessions → ~{1_000_000 * 2 * 200 / (1024**2):.0f} MB — manageable")
+    print(f"    For 10M bot IDs without TTL         → ~{10_000_000 * 200 / (1024**3):.1f} GB — OOM")
+
+    print(f"""
+  State explosion failure mode — interview depth:
+    Root cause: session windows (or any keyed state) accumulate one entry per
+    unique key.  An adversary flooding unique user IDs drives unbounded growth.
+
+    Flink mitigation:
+      StateTtlConfig ttl = StateTtlConfig
+          .newBuilder(Time.seconds({MAX_SESSION_SECS}))
+          .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+          .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+          .build();
+      stateDescriptor.enableTimeToLive(ttl);
+
+    Kafka Streams mitigation:
+      SessionWindows.ofInactivityGapWithNoGrace(Duration.ofSeconds({SESSION_GAP}))
+          // Retention = gap + max_session_duration
+          // Streams auto-evicts sessions older than this.
+
+    Operational signals to monitor:
+      • Flink: JVM heap used, RocksDB SST file count, checkpoint size trend
+      • Kafka Streams: state store size bytes (JMX: kafka.streams/state/size)
+      • Alert threshold: state size growing faster than event rate (linear growth
+        suggests keys are never evicted — TTL not firing or misconfigured)
+
+    Interview answer skeleton:
+      "Session windows are keyed state — one live entry per active user.
+       Without a TTL or max-session cap, a bot generating M unique user IDs
+       creates M open sessions, each never evicted, causing state backend OOM.
+       I'd configure StateTtlConfig in Flink (or Retention in Kafka Streams)
+       to bound state to O(active_users × max_session_secs / gap).
+       I'd also monitor RocksDB state size and alert on super-linear growth."
+""")
+
+
 def main():
     section("STREAM PROCESSING LAB — WINDOWING, WATERMARKS, SESSION WINDOWS")
     print("""
@@ -694,6 +825,7 @@ def main():
     phase5_watermark_stepping()
     phase6_late_event_strategies(now)
     phase7_lambda_vs_kappa()
+    phase8_state_ttl_explosion()
 
     section("Summary — Key Interview Points")
     print("""
@@ -727,6 +859,13 @@ def main():
      Flink: RocksDB state backend (disk-spillable, S3 checkpoints).
      Kafka Streams: RocksDB + Kafka changelog topic for recovery.
      Always configure state TTL to prevent unbounded growth.
+
+  7. State explosion (Phase 8):
+     Session windows accumulate one entry per unique key.
+     500 bot IDs → 500 open sessions; 10M IDs → OOM.
+     Fix: StateTtlConfig (Flink) or Retention (Kafka Streams).
+     Bound: O(active_users × max_session_secs / gap).
+     Monitor RocksDB state size; alert on super-linear growth.
 """)
 
 

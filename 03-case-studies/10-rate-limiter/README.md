@@ -244,7 +244,36 @@ R/second). Implemented in Redis with two fields: `tokens` (current bucket fill l
 of last refill). On each request, compute `elapsed = now - last_refill`, add `elapsed × R` tokens (capped at B), then
 consume 1 token if available.
 
-### 6. Token Bucket in Redis (Implementation Detail)
+### 6. Sliding Window Log: Exact but Expensive
+
+The sliding window log is the only algorithm that provides an exact sliding window — no approximation error. Each request
+is stored as a timestamped entry in a Redis sorted set (ZADD). On each new request:
+
+```lua
+-- Remove all entries older than 1 window ago
+ZREMRANGEBYSCORE key 0 (now - window_size)
+-- Count remaining entries
+count = ZCARD key
+if count < limit then
+    ZADD key now now      -- score=timestamp, member=timestamp
+    EXPIRE key window_size
+    return "allowed"
+else
+    return "denied"
+end
+```
+
+**Memory cost: O(N) per key** where N = limit. For a 15 req/15min limit (Twitter), that is 15 entries × ~16B per entry
+≈ 240B. Acceptable. For a 10,000 req/hour limit, that is 10,000 entries × 16B = 160KB per key — becomes prohibitive at
+scale with millions of keys.
+
+**Why Twitter uses it:** their API limits are small (15–300 req/15min). Exact enforcement matters for developer
+experience and their Terms of Service audit. Memory is manageable at these limits.
+
+**Why Cloudflare does not use it:** at 55M RPS with thousands of rate-limited entities, O(N) memory per key is
+untenable. Sliding window counter (O(1)) is the correct trade-off at that scale.
+
+### 7. Token Bucket in Redis (Lua Implementation Detail)
 
 The token bucket requires reading two fields, computing new state, and writing back — all atomically. A Lua script
 handles this:
@@ -454,3 +483,20 @@ docker compose down -v
     B tokens accumulated during idle periods, then enforces average rate R. For an API where clients legitimately batch
     requests occasionally, token bucket is more permissive and feels more natural. Sliding window counter is simpler to
     implement and reason about at scale (Cloudflare's choice).
+
+13. **Q: When would you choose sliding window log over sliding window counter?**
+    A: Sliding window log (Redis ZADD per request) is exact — it records every request timestamp and counts only those
+    within the last N seconds, with zero approximation error. Sliding window counter has up to ~0.003% error because it
+    weights the previous window linearly rather than tracking individual timestamps. Choose sliding window log when: (1)
+    the rate limit is small (≤ few hundred req/window) — Twitter's 15 req/15min model; (2) exact enforcement is required
+    for legal or audit reasons; (3) you need to answer "when was the oldest request in this window?" for debugging. At
+    high limits (thousands of req/window) or millions of rate-limited keys, the O(N) memory cost of the sorted set makes
+    it prohibitive — sliding window counter's O(1) cost is the only viable option.
+
+14. **Q: A client's SDK is hammering your API with retries after hitting 429. What header prevents this?**
+    A: `Retry-After` (RFC 7231). The value is the number of seconds the client must wait before retrying. A well-behaved
+    SDK sleeps exactly `Retry-After` seconds instead of applying exponential backoff. Without this header, all clients
+    that hit the 429 at the same moment will retry at independently randomised intervals — many will collide again at the
+    window boundary (thundering herd). With `Retry-After` set to the exact seconds until window reset, all clients
+    spread their retries across the new window as they each back off by the same duration. Also include
+    `X-RateLimit-Reset` (Unix timestamp of window end) so SDKs that prefer absolute time can use it instead.

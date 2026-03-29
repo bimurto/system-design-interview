@@ -10,6 +10,7 @@ What this demonstrates:
   Phase 5: Spell correction via suggest API
   Phase 6: Faceted search with aggregations
   Phase 7: BM25 explain + refresh_interval trade-off (indexing throughput vs. latency)
+  Phase 8: Vector (dense_vector) search + Reciprocal Rank Fusion hybrid retrieval
 
 Run:
   docker compose up -d elasticsearch
@@ -143,7 +144,8 @@ class InvertedIndex:
         for term in terms:
             term = term.strip(".,!?;:'\"()")
             if term in self.index:
-                idf = math.log(self.doc_count / self.doc_freq[term])
+                # +1 smoothing prevents IDF=0 when a term appears in every doc
+                idf = math.log((self.doc_count + 1) / (self.doc_freq[term] + 1)) + 1.0
                 for doc_id, tf in self.index[term]:
                     scores[doc_id] += tf * idf  # TF-IDF score
         ranked = sorted(scores.items(), key=lambda x: -x[1])[:10]
@@ -216,28 +218,27 @@ def phase1_manual_inverted_index():
 def phase2_index_products(es: Elasticsearch):
     section("Phase 2: Index 5,000 Products in Elasticsearch")
 
-    # Define index with custom mapping
-    mapping = {
-        "mappings": {
-            "properties": {
-                "title": {"type": "text", "boost": 3.0, "analyzer": "english"},
-                "description": {"type": "text", "analyzer": "english"},
-                "category": {"type": "keyword"},
-                "brand": {"type": "keyword"},
-                "price": {"type": "float"},
-                "rating": {"type": "float"},
-                "in_stock": {"type": "boolean"},
-            }
-        },
-        "settings": {
-            "number_of_shards": 1,
-            "number_of_replicas": 0,
+    # Define index with custom mapping.
+    # Note: index-time `boost` was removed in ES 8; boosting is applied at query time.
+    mappings = {
+        "properties": {
+            "title": {"type": "text", "analyzer": "english"},
+            "description": {"type": "text", "analyzer": "english"},
+            "category": {"type": "keyword"},
+            "brand": {"type": "keyword"},
+            "price": {"type": "float"},
+            "rating": {"type": "float"},
+            "in_stock": {"type": "boolean"},
         }
+    }
+    settings = {
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
     }
 
     if es.indices.exists(index=INDEX_NAME):
         es.indices.delete(index=INDEX_NAME)
-    es.indices.create(index=INDEX_NAME, body=mapping)
+    es.indices.create(index=INDEX_NAME, mappings=mappings, settings=settings)
     print(f"  Created index '{INDEX_NAME}' with custom mapping")
 
     # Bulk index
@@ -282,11 +283,8 @@ def phase3_full_text_search(es: Elasticsearch):
     for query, note in queries:
         result = es.search(
             index=INDEX_NAME,
-            body={
-                "query": {"match": {"title": query}},
-                "size": 5,
-                "explain": False,
-            }
+            query={"match": {"title": query}},
+            size=5,
         )
         hits = result["hits"]["hits"]
         total = result["hits"]["total"]["value"]
@@ -313,29 +311,25 @@ def phase4_multi_field_boosting(es: Elasticsearch):
     # Without boosting (equal weight)
     result_equal = es.search(
         index=INDEX_NAME,
-        body={
-            "query": {
-                "multi_match": {
-                    "query": query_text,
-                    "fields": ["title", "description"],
-                }
-            },
-            "size": 5,
-        }
+        query={
+            "multi_match": {
+                "query": query_text,
+                "fields": ["title", "description"],
+            }
+        },
+        size=5,
     )
 
-    # With title boosting
+    # With title boosting (query-time boost — the correct ES 8 approach)
     result_boosted = es.search(
         index=INDEX_NAME,
-        body={
-            "query": {
-                "multi_match": {
-                    "query": query_text,
-                    "fields": ["title^3", "description^1"],
-                }
-            },
-            "size": 5,
-        }
+        query={
+            "multi_match": {
+                "query": query_text,
+                "fields": ["title^3", "description^1"],
+            }
+        },
+        size=5,
     )
 
     print(f"  Query: \"{query_text}\"\n")
@@ -378,20 +372,18 @@ def phase5_spell_correction(es: Elasticsearch):
     for misspelled, expected in misspelled_queries:
         result = es.search(
             index=INDEX_NAME,
-            body={
-                "suggest": {
-                    "title-suggest": {
-                        "text": misspelled,
-                        "term": {
-                            "field": "title",
-                            "suggest_mode": "always",
-                            "sort": "score",
-                            "max_edits": 2,
-                        }
+            suggest={
+                "title-suggest": {
+                    "text": misspelled,
+                    "term": {
+                        "field": "title",
+                        "suggest_mode": "always",
+                        "sort": "score",
+                        "max_edits": 2,
                     }
-                },
-                "size": 0,
-            }
+                }
+            },
+            size=0,
         )
         suggestions = result.get("suggest", {}).get("title-suggest", [])
         corrected_terms = []
@@ -423,32 +415,30 @@ def phase6_faceted_search(es: Elasticsearch):
 
     result = es.search(
         index=INDEX_NAME,
-        body={
-            "query": {"match": {"title": "widget"}},
-            "size": 0,  # we only want aggregations, not documents
-            "aggs": {
-                "categories": {
-                    "terms": {"field": "category", "size": 10}
-                },
-                "brands": {
-                    "terms": {"field": "brand", "size": 5}
-                },
-                "price_ranges": {
-                    "range": {
-                        "field": "price",
-                        "ranges": [
-                            {"to": 50, "key": "Under $50"},
-                            {"from": 50, "to": 150, "key": "$50-$150"},
-                            {"from": 150, "to": 300, "key": "$150-$300"},
-                            {"from": 300, "key": "Over $300"},
-                        ]
-                    }
-                },
-                "avg_rating": {"avg": {"field": "rating"}},
-                "in_stock_count": {
-                    "filter": {"term": {"in_stock": True}}
-                },
-            }
+        query={"match": {"title": "widget"}},
+        size=0,  # we only want aggregations, not documents
+        aggs={
+            "categories": {
+                "terms": {"field": "category", "size": 10}
+            },
+            "brands": {
+                "terms": {"field": "brand", "size": 5}
+            },
+            "price_ranges": {
+                "range": {
+                    "field": "price",
+                    "ranges": [
+                        {"to": 50, "key": "Under $50"},
+                        {"from": 50, "to": 150, "key": "$50-$150"},
+                        {"from": 150, "to": 300, "key": "$150-$300"},
+                        {"from": 300, "key": "Over $300"},
+                    ]
+                }
+            },
+            "avg_rating": {"avg": {"field": "rating"}},
+            "in_stock_count": {
+                "filter": {"term": {"in_stock": True}}
+            },
         }
     )
 
@@ -500,10 +490,8 @@ def phase7_bm25_explain_and_refresh(es: Elasticsearch):
     # Find a product that matches "premium widget" to explain
     result = es.search(
         index=INDEX_NAME,
-        body={
-            "query": {"match": {"title": "premium widget"}},
-            "size": 1,
-        }
+        query={"match": {"title": "premium widget"}},
+        size=1,
     )
     hits = result["hits"]["hits"]
     if hits:
@@ -514,7 +502,7 @@ def phase7_bm25_explain_and_refresh(es: Elasticsearch):
         explain_result = es.explain(
             index=INDEX_NAME,
             id=doc_id,
-            body={"query": {"match": {"title": "premium widget"}}},
+            query={"match": {"title": "premium widget"}},
         )
 
         print(f"  Top result: \"{doc_title}\"  (score={doc_score:.3f})")
@@ -568,12 +556,10 @@ def phase7_bm25_explain_and_refresh(es: Elasticsearch):
             es.indices.delete(index=BENCH_INDEX)
         es.indices.create(
             index=BENCH_INDEX,
-            body={
-                "settings": {
-                    "number_of_shards": 1,
-                    "number_of_replicas": 0,
-                    "refresh_interval": refresh_interval,
-                }
+            settings={
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "refresh_interval": refresh_interval,
             },
         )
         actions = (
@@ -608,6 +594,240 @@ def phase7_bm25_explain_and_refresh(es: Elasticsearch):
 
   Why it matters: during a full re-index of a 1T-document corpus, this difference
   can mean days vs weeks of indexing time.
+""")
+
+
+# ── Phase 8: Vector Search + Hybrid Retrieval (RRF) ──────────────────────────
+
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Pure-Python cosine similarity between two equal-length vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _fake_embed(text: str, dim: int = 16) -> list[float]:
+    """
+    Deterministic pseudo-embedding: hash each character into a float bucket.
+    This produces consistent vectors without a neural model, good enough to
+    demonstrate ANN retrieval concepts locally.
+
+    Real systems use sentence-transformers, OpenAI text-embedding-*, etc.
+    """
+    # seed a small deterministic vector from the text
+    rng = random.Random(hash(text.lower()) & 0xFFFF_FFFF)
+    return [rng.gauss(0, 1) for _ in range(dim)]
+
+
+def _rrf_score(rank: int, k: int = 60) -> float:
+    """Reciprocal Rank Fusion score: 1 / (k + rank)."""
+    return 1.0 / (k + rank)
+
+
+def phase8_vector_and_hybrid_search(es: Elasticsearch):
+    section("Phase 8: Vector Search + Hybrid Retrieval (RRF)")
+
+    print("""
+  Vector search encodes documents and queries as dense embeddings.
+  ANN (Approximate Nearest Neighbor) retrieval finds semantically
+  similar documents even when exact keywords don't match.
+
+  HNSW (Hierarchical Navigable Small World) is the dominant ANN algorithm:
+    - Each node connects to M neighbors at each layer.
+    - Query traverses the graph greedily from an entry point.
+    - O(log N) expected time; ~95% recall at ef_search=100 for 10M vectors.
+
+  Hybrid retrieval combines BM25 + ANN via Reciprocal Rank Fusion (RRF):
+    score(d) = Σ 1/(k + rank_i(d))   for each retriever i
+  Simple, parameter-free, empirically strong in production.
+""")
+
+    VECTOR_DIM = 16  # small for local demo; production uses 768–1536
+    VECTOR_INDEX = "products_vector"
+
+    # ── Part A: pure-Python HNSW simulation ──────────────────────────────────
+    print("  Part A — Python HNSW analogue (brute-force ANN over 200 docs)")
+    print("  ----------------------------------------------------------------")
+
+    # Build a tiny in-memory vector store over the first 200 products
+    sample = PRODUCTS[:200]
+    corpus: list[tuple[int, str, list[float]]] = []
+    for doc in sample:
+        text = doc["title"] + " " + doc["category"]
+        vec = _fake_embed(text, VECTOR_DIM)
+        corpus.append((doc["id"], doc["title"], vec))
+
+    def ann_search(query_text: str, top_k: int = 5) -> list[tuple[int, float, str]]:
+        """Exact NN (stands in for HNSW) over the toy corpus."""
+        q_vec = _fake_embed(query_text, VECTOR_DIM)
+        scored = [(doc_id, _cosine_sim(q_vec, vec), title)
+                  for doc_id, title, vec in corpus]
+        scored.sort(key=lambda x: -x[1])
+        return scored[:top_k]
+
+    vector_queries = [
+        ("high performance electronics", "semantic — no exact keyword match"),
+        ("premium widget", "lexical — exact keyword match present"),
+    ]
+    for q_text, note in vector_queries:
+        hits = ann_search(q_text)
+        print(f"\n  Vector query: \"{q_text}\"  [{note}]")
+        print(f"  {'Rank':<5} {'Cosine':>7}  {'Title'}")
+        print(f"  {'-'*5}  {'-'*7}  {'-'*40}")
+        for rank, (doc_id, score, title) in enumerate(hits, 1):
+            print(f"  {rank:<5}  {score:>7.4f}  {title}")
+
+    # ── Part B: Elasticsearch dense_vector + knn search ──────────────────────
+    print("""
+  Part B — Elasticsearch dense_vector field + kNN search
+  -------------------------------------------------------
+  Elasticsearch 8 stores dense_vector fields as HNSW graphs on disk.
+  kNN search uses the HNSW index; results are scored by cosine similarity.
+""")
+
+    vec_mappings = {
+        "properties": {
+            "title":     {"type": "text", "analyzer": "english"},
+            "category":  {"type": "keyword"},
+            "brand":     {"type": "keyword"},
+            "price":     {"type": "float"},
+            "embedding": {
+                "type":       "dense_vector",
+                "dims":       VECTOR_DIM,
+                "index":      True,
+                "similarity": "cosine",
+            },
+        }
+    }
+    vec_settings = {"number_of_shards": 1, "number_of_replicas": 0}
+
+    if es.indices.exists(index=VECTOR_INDEX):
+        es.indices.delete(index=VECTOR_INDEX)
+    es.indices.create(index=VECTOR_INDEX, mappings=vec_mappings, settings=vec_settings)
+
+    # Bulk index with embeddings
+    def vec_actions():
+        for doc in sample:
+            text = doc["title"] + " " + doc["category"]
+            yield {
+                "_index": VECTOR_INDEX,
+                "_id": doc["id"],
+                "_source": {
+                    "title":     doc["title"],
+                    "category":  doc["category"],
+                    "brand":     doc["brand"],
+                    "price":     doc["price"],
+                    "embedding": _fake_embed(text, VECTOR_DIM),
+                },
+            }
+
+    helpers.bulk(es, vec_actions(), chunk_size=200)
+    es.indices.refresh(index=VECTOR_INDEX)
+    print(f"  Indexed {len(sample)} docs with {VECTOR_DIM}-dim embeddings")
+
+    # kNN query
+    knn_query_text = "professional sports equipment"
+    q_vec = _fake_embed(knn_query_text, VECTOR_DIM)
+
+    knn_result = es.search(
+        index=VECTOR_INDEX,
+        knn={
+            "field":         "embedding",
+            "query_vector":  q_vec,
+            "k":             5,
+            "num_candidates": 50,
+        },
+        size=5,
+    )
+    knn_hits = knn_result["hits"]["hits"]
+    print(f"\n  kNN query: \"{knn_query_text}\"")
+    print(f"  {'Rank':<5} {'Score':>8}  {'Title'}")
+    print(f"  {'-'*5}  {'-'*8}  {'-'*40}")
+    for rank, hit in enumerate(knn_hits, 1):
+        print(f"  {rank:<5}  {hit['_score']:>8.4f}  {hit['_source']['title']}")
+
+    # ── Part C: Hybrid search — BM25 + kNN via RRF ───────────────────────────
+    print("""
+  Part C — Hybrid retrieval via Reciprocal Rank Fusion (RRF)
+  -----------------------------------------------------------
+  Run BM25 and kNN independently, then merge ranked lists:
+    rrf_score(d) = Σ_i  1 / (k + rank_i(d))
+  Documents appearing near the top of both lists get the highest score.
+  k=60 is the standard default; it dampens the impact of rank differences
+  at the top of each list.
+
+  BM25 excels at: exact keyword matches, navigational queries.
+  kNN  excels at: semantic/paraphrase queries, intent matching.
+  RRF  combines both with no extra parameters to tune.
+""")
+
+    hybrid_query = "premium widget"
+
+    # BM25 retrieval
+    bm25_result = es.search(
+        index=VECTOR_INDEX,
+        query={"match": {"title": hybrid_query}},
+        size=10,
+    )
+    bm25_hits = bm25_result["hits"]["hits"]
+    bm25_ranks: dict[str, int] = {h["_id"]: rank for rank, h in enumerate(bm25_hits, 1)}
+
+    # kNN retrieval
+    q_vec_hybrid = _fake_embed(hybrid_query, VECTOR_DIM)
+    knn_result2 = es.search(
+        index=VECTOR_INDEX,
+        knn={
+            "field":          "embedding",
+            "query_vector":   q_vec_hybrid,
+            "k":              10,
+            "num_candidates": 50,
+        },
+        size=10,
+    )
+    knn_hits2 = knn_result2["hits"]["hits"]
+    knn_ranks: dict[str, int] = {h["_id"]: rank for rank, h in enumerate(knn_hits2, 1)}
+
+    # RRF fusion
+    all_ids = set(bm25_ranks) | set(knn_ranks)
+    rrf_scores: dict[str, float] = {}
+    id_to_title: dict[str, str] = {}
+
+    for h in bm25_hits + knn_hits2:
+        id_to_title[h["_id"]] = h["_source"]["title"]
+
+    for doc_id in all_ids:
+        score = 0.0
+        if doc_id in bm25_ranks:
+            score += _rrf_score(bm25_ranks[doc_id])
+        if doc_id in knn_ranks:
+            score += _rrf_score(knn_ranks[doc_id])
+        rrf_scores[doc_id] = score
+
+    rrf_ranked = sorted(rrf_scores.items(), key=lambda x: -x[1])[:5]
+
+    print(f"  Hybrid query: \"{hybrid_query}\"\n")
+    print(f"  {'Rank':<5} {'RRF':>8}  {'BM25 rank':>10}  {'kNN rank':>9}  Title")
+    print(f"  {'-'*5}  {'-'*8}  {'-'*10}  {'-'*9}  {'-'*35}")
+    for rank, (doc_id, score) in enumerate(rrf_ranked, 1):
+        bm_r = bm25_ranks.get(doc_id, "-")
+        kn_r = knn_ranks.get(doc_id, "-")
+        title = id_to_title.get(doc_id, "?")[:35]
+        print(f"  {rank:<5}  {score:>8.5f}  {str(bm_r):>10}  {str(kn_r):>9}  {title}")
+
+    # Cleanup
+    es.indices.delete(index=VECTOR_INDEX)
+
+    print("""
+  Key takeaways:
+  - BM25 misses semantic matches (paraphrase, synonyms) — kNN fills the gap.
+  - kNN misses exact keyword matches — BM25 fills the gap.
+  - RRF requires no score normalisation — ranks are already comparable.
+  - Production systems (Google, Bing, Amazon) use hybrid retrieval as default.
+  - For a 1T-document corpus: 768-dim float32 = ~3 PB raw; Product Quantization
+    (IVF-PQ in FAISS) compresses 8–32× to ~100–375 TB, fitting in large clusters.
 """)
 
 

@@ -148,21 +148,37 @@ def phase1_seed_drivers(r):
   This enables O(log N) proximity queries via sorted set range scans.
 """)
 
+    VEHICLE_TYPES = ["UberX", "UberX", "UberX", "UberXL", "UberBlack"]  # weighted toward UberX
+
     random.seed(42)
     driver_locations = {}
     drivers = []
+    driver_metadata = []  # (driver_id, vehicle_type) for status seed
     for i in range(1000):
         driver_id = f"driver_{i:04d}"
         lat, lng  = random_sf_point()
+        vtype     = VEHICLE_TYPES[i % len(VEHICLE_TYPES)]
         driver_locations[driver_id] = (lat, lng)
         drivers.append((lng, lat, driver_id))  # Redis GEOADD expects: lng, lat, name
+        driver_metadata.append((driver_id, vtype))
 
-    # Batch insert with pipeline
+    # Batch insert geo positions + status hashes in a single pipeline
     start = time.perf_counter()
     BATCH_SIZE = 100
     for i in range(0, len(drivers), BATCH_SIZE):
         batch = drivers[i:i + BATCH_SIZE]
         r.geoadd("drivers:geo", batch)
+
+    # Seed driver:status hashes so vehicle_type filtering works in /match and Phase 3
+    now = time.time()
+    pipe = r.pipeline()
+    for driver_id, vtype in driver_metadata:
+        pipe.hset(f"driver:status:{driver_id}", mapping={
+            "status": "AVAILABLE",
+            "vehicle_type": vtype,
+        })
+        pipe.zadd("driver:heartbeats", {driver_id: now})
+    pipe.execute()
     elapsed_ms = (time.perf_counter() - start) * 1000
 
     count = r.zcard("drivers:geo")
@@ -419,6 +435,26 @@ def phase5_kafka_pipeline(r):
         print(f"  Kafka not reachable at {KAFKA_BOOTSTRAP}. Skipping Kafka phase.\n")
         return
 
+    # Record the end-offset of every partition BEFORE we produce so the consumer
+    # only reads the messages we are about to send, not ones from prior lab runs.
+    from kafka import TopicPartition
+
+    # Ensure the topic exists by sending one probe message and flushing, then
+    # snapshot the current high-water mark for each partition.
+    probe_future = producer.send(TOPIC, value=json.dumps({"_probe": True}).encode())
+    producer.flush()
+
+    # Use a short-lived consumer to fetch current partition offsets (end offsets).
+    offset_consumer = KafkaConsumer(
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        api_version=(2, 8, 0),
+    )
+    partitions = offset_consumer.partitions_for_topic(TOPIC) or {0}
+    topic_partitions = [TopicPartition(TOPIC, p) for p in partitions]
+    # end_offsets returns the next-to-be-written offset per partition (high-water mark)
+    start_offsets = offset_consumer.end_offsets(topic_partitions)
+    offset_consumer.close()
+
     random.seed(77)
     messages = []
     for i in range(N):
@@ -432,22 +468,30 @@ def phase5_kafka_pipeline(r):
     print(f"  Produced {N} location updates to Kafka topic '{TOPIC}'")
 
     # ── Consume + index ───────────────────────────────────────────────────────
+    # Use a unique group_id each run so Kafka never restores stale committed
+    # offsets; we seek to the pre-produce high-water mark ourselves.
+    run_group_id = f"location-redis-consumer-lab-{int(time.time())}"
     consumer = KafkaConsumer(
-        TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP,
         auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="location-redis-consumer-lab",
-        consumer_timeout_ms=4000,
+        enable_auto_commit=False,
+        group_id=run_group_id,
+        consumer_timeout_ms=5000,
         value_deserializer=lambda v: json.loads(v.decode()),
         api_version=(2, 8, 0),
     )
+    consumer.assign(topic_partitions)
+    # Seek each partition to the offset that existed before we produced
+    for tp, offset in start_offsets.items():
+        consumer.seek(tp, offset)
 
     consumed = 0
     start = time.perf_counter()
     pipe = r.pipeline()
     for msg in consumer:
         payload = msg.value
+        if payload.get("_probe"):
+            continue  # skip the probe message
         pipe.geoadd("drivers:geo", [(payload["lng"], payload["lat"], payload["driver_id"])])
         pipe.zadd("driver:heartbeats", {payload["driver_id"]: payload["ts"]})
         consumed += 1
@@ -455,7 +499,10 @@ def phase5_kafka_pipeline(r):
     consumer.close()
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    print(f"  Consumed {consumed} messages and indexed into Redis in {elapsed_ms:.0f}ms")
+    if consumed == 0:
+        print(f"  WARNING: consumed 0 messages — Kafka may still be starting up.")
+    else:
+        print(f"  Consumed {consumed} messages and indexed into Redis in {elapsed_ms:.0f}ms")
     print(f"""
   Key design choices:
     • Partition key = driver_id  → all updates for one driver are ordered

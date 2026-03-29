@@ -10,12 +10,14 @@ What this demonstrates:
   3. Consumer group lag — what it means and how to measure it correctly
   4. Idempotent consumers — processing duplicate events safely
   5. Replay from offset 0 — full state rebuild (the event sourcing superpower)
+  6. Transactional Outbox pattern — naive dual-write failure vs outbox atomicity
 """
 
 import json
 import time
 import uuid
 import subprocess
+import threading
 from datetime import datetime, timezone
 
 try:
@@ -55,11 +57,13 @@ def get_producer():
         value_serializer=lambda v: json.dumps(v).encode(),
         key_serializer=lambda k: k.encode() if k else None,
         # acks="all" waits for all in-sync replicas to acknowledge.
-        # Combined with enable.idempotence=true on the broker this gives
-        # exactly-once producer semantics (no duplicates from retries).
+        # This is a prerequisite for enable_idempotence=True below.
         acks="all",
-        # Idempotent producer: Kafka assigns each producer a PID and tracks
-        # sequence numbers so retried sends don't produce duplicates.
+        # Idempotent producer (producer-side config, NOT a broker setting):
+        # Kafka assigns each producer session a PID and tracks per-partition
+        # sequence numbers. Retried sends with the same sequence number are
+        # deduplicated by the broker, preventing duplicate records from
+        # transient network errors.
         enable_idempotence=True,
     )
 
@@ -141,7 +145,14 @@ def consume_all_events(group_id, from_beginning=False, timeout_ms=5000):
 
 def get_consumer_lag(group_id):
     """
-    Return (end_offset, committed_offset, lag) for group_id on partition 0.
+    Return (end_offset, committed_offset, lag, group_exists) for group_id
+    on partition 0.
+
+    group_exists=False means Kafka has no committed offset for this group at
+    all (never connected, or offsets expired). committed_offset=0 is ambiguous
+    on its own: it could mean "consumed nothing yet" OR "group unknown" — the
+    boolean disambiguates. Callers that silently treat both as lag=end_offset
+    produce correct numbers but hide the distinction in dashboards/alerting.
 
     Uses a separate admin client to read the committed offset; avoids
     polluting Kafka's group metadata with a spurious consumer group.
@@ -157,17 +168,25 @@ def get_consumer_lag(group_id):
 
     # Get the committed offset for the actual consumer group
     admin = KafkaAdminClient(bootstrap_servers=BOOTSTRAP)
+    group_exists = False
+    committed_offset = 0
     try:
         offsets = admin.list_consumer_group_offsets(group_id)
         committed = offsets.get(tp)
-        committed_offset = committed.offset if committed else 0
+        if committed is not None:
+            group_exists = True
+            committed_offset = committed.offset
+        # offsets dict present but tp key absent → group registered but
+        # has not yet committed any offset on this partition
     except Exception:
+        # Group does not exist at all in Kafka's group coordinator
+        group_exists = False
         committed_offset = 0
     finally:
         admin.close()
 
     lag = end_offset - committed_offset
-    return end_offset, committed_offset, lag
+    return end_offset, committed_offset, lag, group_exists
 
 
 def main():
@@ -326,16 +345,21 @@ def main():
     producer.close()
     time.sleep(1)
 
-    end_offset, committed, lag = get_consumer_lag("group-state-builder")
+    end_offset, committed, lag, group_exists = get_consumer_lag("group-state-builder")
+    group_status = "known (has committed offsets)" if group_exists else "unknown / no committed offsets"
     print(f"""
   Consumer group 'group-state-builder':
-    Log end offset (total messages in partition): {end_offset}
-    Committed offset (last processed by group):   {committed}
-    Lag (messages not yet consumed):              {lag}
+    Group status:                                  {group_status}
+    Log end offset (total messages in partition):  {end_offset}
+    Committed offset (last processed by group):    {committed}
+    Lag (messages not yet consumed):               {lag}
 
   Consumer lag = (log end offset) - (committed offset)
     • Lag = 0  → consumer is caught up
     • Lag > 0  → consumer is behind; {new_event_count} new events published while it was offline
+    • group_exists=False + committed=0 means Kafka has NO record of this
+      group — different from a group that has genuinely consumed 0 messages.
+      Dashboards that show lag=end_offset in both cases hide this distinction.
     • Kafka retains ALL events regardless of consumption, up to the
       configured retention period (default: 7 days / KAFKA_LOG_RETENTION_MS)
     • This is unlike traditional MQ (RabbitMQ/SQS): consuming an event
@@ -345,6 +369,16 @@ def main():
   A steady non-zero lag (processing at produce rate) is fine; a growing
   lag means the consumer can't keep up and will eventually miss events if
   retention expires before it catches up.
+
+  Back-pressure failure mode (bounded-storage topics):
+    If a topic has KAFKA_LOG_RETENTION_BYTES set (bounded storage), a
+    slow consumer that accumulates lag may find that the earliest offsets
+    it still needs have been deleted by the log cleaner to free space —
+    even before the time-based retention window expires. The consumer gets
+    an OffsetOutOfRange error and must reset, potentially missing events.
+    Mitigation: monitor lag in bytes (not just message count), set
+    retention.bytes generously, and alert before the consumer's committed
+    offset falls within the cleanup window.
 """)
 
     # ── Phase 4: Idempotent consumers ──────────────────────────────
@@ -453,6 +487,154 @@ def main():
       and automated compatibility enforcement
 """)
 
+    # ── Phase 6: Transactional Outbox pattern ────────────────────
+    section("Phase 6: Transactional Outbox — Dual-Write Failure vs Outbox Atomicity")
+
+    print("""  The dual-write problem:
+    A service that writes to its database AND publishes an event in two
+    separate operations has no atomicity. A crash between them causes:
+      • DB written, event never emitted  → downstream services miss the change
+      • Event emitted, DB rolled back    → phantom event for state that doesn't exist
+
+  This simulation uses in-memory state to model a DB and a Kafka topic,
+  with an injected crash between the two writes to show each failure mode.
+""")
+
+    # ── Shared in-memory "infrastructure" ──────────────────────────────────
+    sim_db: dict   = {}   # order_id → order record (simulated DB table)
+    sim_kafka: list = []  # (key, event) tuples (simulated Kafka topic)
+    outbox: list   = []   # (order_id, event) tuples (simulated outbox table)
+
+    def sim_produce(order_id: str, event: dict):
+        sim_kafka.append((order_id, event))
+
+    # ── Scenario A: Naive dual-write — crash after DB, before Kafka ────────
+    print("  Scenario A: Naive dual-write (crash injected between DB write and Kafka publish)")
+    print()
+
+    def naive_place_order(order_id: str, crash_after_db: bool = False):
+        """
+        Write to DB, then publish to Kafka — no atomicity between the two.
+        crash_after_db=True simulates a process crash / network error after
+        the DB commit but before the Kafka send completes.
+        """
+        # Step 1: write to DB
+        sim_db[order_id] = {"order_id": order_id, "status": "created"}
+        print(f"    [DB]    INSERT orders ({order_id}, 'created')  ✓")
+
+        if crash_after_db:
+            raise RuntimeError("SIMULATED CRASH — process died after DB commit")
+
+        # Step 2: publish event
+        ev = make_event("order.created", order_id, {"source": "naive_dual_write"})
+        sim_produce(order_id, ev)
+        print(f"    [Kafka] PRODUCE order.created for {order_id}   ✓")
+
+    try:
+        naive_place_order("DUAL-WRITE-OK")
+        print(f"    Result (no crash): DB={sim_db.get('DUAL-WRITE-OK', 'MISSING')}, "
+              f"Kafka events={len([e for k, e in sim_kafka if k == 'DUAL-WRITE-OK'])}")
+    except RuntimeError as exc:
+        print(f"    ERROR: {exc}")
+
+    print()
+
+    sim_kafka_before = len(sim_kafka)
+    try:
+        naive_place_order("DUAL-WRITE-CRASH", crash_after_db=True)
+    except RuntimeError as exc:
+        print(f"    {exc}")
+        db_record   = sim_db.get("DUAL-WRITE-CRASH")
+        kafka_count = len([e for k, e in sim_kafka if k == "DUAL-WRITE-CRASH"])
+        print(f"    Result after crash: DB record={db_record}, Kafka events for this order={kafka_count}")
+        print(f"    ^^^ BUG: DB has the order but Kafka never received the event.")
+        print(f"             Downstream services (inventory, payments) never learn of it.")
+
+    print()
+
+    # ── Scenario B: Transactional Outbox ──────────────────────────────────
+    print("  Scenario B: Transactional Outbox — write DB + outbox in one atomic TX,")
+    print("              then relay publishes from outbox to Kafka idempotently.")
+    print()
+
+    def outbox_place_order(order_id: str, crash_relay: bool = False):
+        """
+        Atomically write the order row AND an outbox row in the same local
+        transaction. A separate relay process reads the outbox and publishes
+        to Kafka, then marks the outbox row as published.
+
+        crash_relay=True simulates the relay crashing after Kafka publish but
+        before it marks the outbox row — relay will retry and re-publish, so
+        consumers must be idempotent (which they already are via event_id).
+        """
+        # ── TX BEGIN (atomic: both writes succeed or neither does) ──────
+        pending_db    = {"order_id": order_id, "status": "created"}
+        pending_event = make_event("order.created", order_id, {"source": "outbox"})
+        pending_outbox = {"order_id": order_id, "event": pending_event, "published": False}
+
+        sim_db[order_id]  = pending_db
+        outbox.append(pending_outbox)
+        # ── TX COMMIT ────────────────────────────────────────────────────
+        print(f"    [TX]    INSERT orders ({order_id}) + INSERT outbox  ✓  (atomic)")
+
+        # ── Relay process (runs separately; reads outbox, publishes) ────
+        for row in [r for r in outbox if not r["published"] and r["order_id"] == order_id]:
+            sim_produce(order_id, row["event"])
+            print(f"    [Relay] PRODUCE order.created for {order_id}        ✓")
+
+            if crash_relay:
+                raise RuntimeError(
+                    "SIMULATED RELAY CRASH — published to Kafka but did not mark outbox row"
+                )
+
+            row["published"] = True
+            print(f"    [Relay] UPDATE outbox SET published=true            ✓")
+
+    print("  Place ORD-OUTBOX-1 (happy path):")
+    outbox_place_order("ORD-OUTBOX-1")
+    print()
+
+    print("  Place ORD-OUTBOX-2 (relay crashes after publish, before marking row):")
+    try:
+        outbox_place_order("ORD-OUTBOX-2", crash_relay=True)
+    except RuntimeError as exc:
+        print(f"    {exc}")
+        unpublished = [r for r in outbox if not r["published"]]
+        print(f"    Outbox has {len(unpublished)} unacknowledged row(s). Relay will retry.")
+        print()
+        print("    Relay retries — re-publishes event to Kafka (at-least-once):")
+        for row in unpublished:
+            sim_produce(row["order_id"], row["event"])
+            row["published"] = True
+            print(f"    [Relay] RE-PRODUCE order.created for {row['order_id']}  ✓ (same event_id)")
+            print(f"    [Relay] UPDATE outbox SET published=true                ✓")
+
+    print()
+    kafka_for_outbox2 = [e for k, e in sim_kafka if k == "ORD-OUTBOX-2"]
+    print(f"    Kafka received {len(kafka_for_outbox2)} event(s) for ORD-OUTBOX-2.")
+    print(f"    event_id values: {[e['event_id'] for e in kafka_for_outbox2]}")
+    duplicate_ids = len(kafka_for_outbox2) == 2 and kafka_for_outbox2[0]["event_id"] == kafka_for_outbox2[1]["event_id"]
+    print(f"    Both events have the same event_id: {duplicate_ids}")
+    print(f"    ^^^ Safe: consumer idempotency check (Phase 4) discards the duplicate.")
+
+    print(f"""
+  Key properties of the Transactional Outbox pattern:
+    • Atomicity: DB change and outbox row are in the SAME local transaction.
+      If the TX rolls back, neither is written — no phantom events.
+    • Durability: outbox row survives process crashes; relay retries until
+      the event reaches Kafka.
+    • At-least-once: relay may publish twice after a crash; consumers
+      must handle duplicates via event_id idempotency.
+    • CDC relay (e.g. Debezium): reads the database WAL (Write-Ahead Log),
+      not a polling query. It does NOT delete outbox rows — it reads the
+      WAL stream and publishes every INSERT it sees. Rows can be pruned
+      separately (e.g., a scheduled job deletes published=true rows older
+      than N days) or the outbox table can be a Postgres partitioned table
+      with time-based partition drops.
+    • No distributed transaction needed: atomicity is achieved via the
+      local DB transaction; Kafka is written by the relay, not the service.
+""")
+
     # ── Summary ───────────────────────────────────────────────────
     section("Summary — Event-Driven Architecture")
 
@@ -490,9 +672,27 @@ def main():
 
   Critical failure modes:
     Poison pill:    malformed event crashes consumer → dead-letter topic
-    Consumer lag:   slow consumer misses events when retention expires
+    Consumer lag:   slow consumer misses events when retention expires;
+                    bounded-storage topics can evict offsets the consumer
+                    still needs (back-pressure / OffsetOutOfRange)
     Dual-write:     writing to DB and publishing event non-atomically →
-                    use the Transactional Outbox pattern instead
+                    use the Transactional Outbox pattern instead (Phase 6)
+    Schema drift:   producer deploys breaking schema change; consumers
+                    crash on deserialization → enforce via Schema Registry
+
+  Event versioning / upcasters:
+    Events are immutable once written. When the schema of an event type
+    must change in a backward-incompatible way:
+      Option 1 — New event type: publish order.created.v2 alongside v1;
+        consumers subscribe to both during a migration window, then drop v1.
+      Option 2 — Upcaster: a function in the consumer pipeline that detects
+        old-format events (by version field or absence of a new field) and
+        transforms them to the current shape before the projection handler
+        sees them. The projection code stays clean; version logic is
+        isolated in the upcaster chain. Useful when you can't afford two
+        parallel event types in the log.
+      Schema Registry: Avro/Protobuf + Registry enforces BACKWARD/FORWARD/
+        FULL compatibility at produce time, preventing accidental breaks.
 
   Next: ../05-message-queues-kafka/
 """)

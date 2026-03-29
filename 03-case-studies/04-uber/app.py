@@ -3,13 +3,15 @@
 Uber Driver Location API
 
 Endpoints:
-  POST /driver/location           body: {driver_id, lat, lng} → update location + heartbeat
+  POST /driver/location           body: {driver_id, lat, lng, vehicle_type?} → update location + heartbeat
   POST /driver/status             body: {driver_id, status}   → AVAILABLE | ON_TRIP | OFFLINE
   GET  /drivers/nearby?lat=&lng=&radius_km=  → list nearest AVAILABLE drivers
   GET  /match?lat=&lng=&vehicle_type=        → dispatch: nearest AVAILABLE driver ranked by simulated ETA
+  GET  /evict_stale               → run stale-driver eviction (background job simulation)
   GET  /health                    → {"status": "ok"}
 """
 
+import hashlib
 import os
 import time
 import psycopg2
@@ -63,6 +65,7 @@ def update_location():
     driver_id = data.get("driver_id")
     lat = float(data.get("lat", 0))
     lng = float(data.get("lng", 0))
+    vehicle_type = data.get("vehicle_type", "UberX")
 
     if not driver_id:
         return jsonify({"error": "driver_id required"}), 400
@@ -73,8 +76,9 @@ def update_location():
     pipe.geoadd("drivers:geo", [(lng, lat, driver_id)])
     # Update heartbeat (scored sorted set for stale eviction)
     pipe.zadd("driver:heartbeats", {driver_id: time.time()})
-    # Set default status if not yet present
+    # Initialise status hash if not yet present; also record vehicle_type
     pipe.hsetnx(f"driver:status:{driver_id}", "status", "AVAILABLE")
+    pipe.hsetnx(f"driver:status:{driver_id}", "vehicle_type", vehicle_type)
     pipe.execute()
 
     return jsonify({"status": "ok", "driver_id": driver_id})
@@ -102,6 +106,9 @@ def update_status():
         # Remove from geo index and heartbeat tracker
         pipe.zrem("drivers:geo", driver_id)
         pipe.zrem("driver:heartbeats", driver_id)
+    elif new_status == "AVAILABLE":
+        # Refresh heartbeat on status transition back to available (e.g. trip ends)
+        pipe.zadd("driver:heartbeats", {driver_id: time.time()})
     pipe.execute()
 
     return jsonify({"status": "ok", "driver_id": driver_id, "new_status": new_status})
@@ -187,18 +194,23 @@ def match_driver():
         for i, (driver_id, dist_km) in enumerate(candidates):
             status = raw[i * 2] or "UNKNOWN"
             vtype = raw[i * 2 + 1] or "UberX"
-            if status == "AVAILABLE":
-                # Simulate ETA: straight-line distance * road factor (1.3-1.8)
-                import random
-                random.seed(hash(driver_id) % 1000)
-                road_factor = 1.3 + random.random() * 0.5
-                eta_minutes = (float(dist_km) / 30.0) * 60 * road_factor
-                available.append({
-                    "driver_id": driver_id,
-                    "distance_km": round(float(dist_km), 3),
-                    "eta_minutes": round(eta_minutes, 1),
-                    "road_factor": round(road_factor, 2),
-                })
+            if status != "AVAILABLE":
+                continue
+            if vehicle_type and vtype != vehicle_type:
+                continue
+            # Simulate ETA: straight-line distance * road factor (1.3–1.8).
+            # Use a hash of the driver_id for determinism across Python processes
+            # (built-in hash() is PYTHONHASHSEED-randomised and must not be used here).
+            digest = int(hashlib.md5(driver_id.encode()).hexdigest(), 16)
+            road_factor = 1.3 + (digest % 1000) / 2000.0
+            eta_minutes = (float(dist_km) / 30.0) * 60 * road_factor
+            available.append({
+                "driver_id": driver_id,
+                "distance_km": round(float(dist_km), 3),
+                "eta_minutes": round(eta_minutes, 1),
+                "road_factor": round(road_factor, 2),
+                "vehicle_type": vtype,
+            })
 
         if len(available) >= 1:
             # Rank by ETA (not distance)
@@ -211,6 +223,36 @@ def match_driver():
             })
 
     return jsonify({"error": "no drivers available", "searched_radius_km": 5.0}), 503
+
+
+@app.route("/evict_stale")
+def evict_stale():
+    """
+    Simulate the background heartbeat-eviction job that runs every 10 seconds.
+    Drivers whose last heartbeat is older than 60 seconds are marked OFFLINE and
+    removed from the geo index.
+
+    Production note: this runs as a dedicated background process (cron / Celery beat),
+    NOT as an API endpoint.  It is exposed here so the lab can trigger it on demand
+    to demonstrate the sorted-set eviction pattern described in Deep Dive §2.
+    """
+    r = get_redis()
+    ttl_seconds = int(request.args.get("ttl", 60))
+    cutoff = time.time() - ttl_seconds
+
+    # Single range scan — O(log N + K) for K stale drivers
+    stale = r.zrangebyscore("driver:heartbeats", 0, cutoff)
+    if not stale:
+        return jsonify({"evicted": 0, "message": "no stale drivers"})
+
+    pipe = r.pipeline()
+    for driver_id in stale:
+        pipe.zrem("driver:heartbeats", driver_id)
+        pipe.zrem("drivers:geo", driver_id)
+        pipe.hset(f"driver:status:{driver_id}", "status", "OFFLINE")
+    pipe.execute()
+
+    return jsonify({"evicted": len(stale), "driver_ids": stale})
 
 
 if __name__ == "__main__":

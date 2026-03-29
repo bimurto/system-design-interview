@@ -5,17 +5,20 @@ Observability Lab — Prometheus metrics, SLO analysis, RED method.
 What this demonstrates:
   1. Send 500 requests with varied latencies (10% slow, 5% errors)
   2. Query Prometheus API: request rate, error rate, p50/p95/p99 latency
-  3. SLO analysis: is the p99 latency SLO of 200ms being met?
-  4. Error budget burn rate — map to Google SRE alert severity tiers
-  5. RED method summary (Rate, Errors, Duration)
-  6. Cardinality simulation — why user_id labels cause OOM
-  7. Histogram bucket internals — show actual bucket counts from Prometheus
+  3. Histogram bucket internals — show actual bucket counts from Prometheus
+  4. SLO analysis: is the p99 latency SLO of 200ms being met?
+  5. Error budget burn rate — map to Google SRE alert severity tiers
+  6. RED method summary + recording rule demo (pre-computed series)
+  7. Cardinality explosion simulation — why user_id labels cause OOM
+
+Prerequisites: docker compose up -d flask-app prometheus grafana
 """
 
 import os
 import time
 import random
 import threading
+import sys
 import requests
 
 APP_HOST  = os.environ.get("APP_HOST", "localhost")
@@ -28,6 +31,36 @@ def section(title):
     print(f"\n{'=' * 65}")
     print(f"  {title}")
     print("=" * 65)
+
+
+def wait_for_service(url, label, timeout=60):
+    """Poll a URL until it returns HTTP 200 or timeout is reached."""
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            r = requests.get(url, timeout=3)
+            if r.status_code == 200:
+                print(f"  {label} ready after {attempt} attempt(s).")
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    print(f"  ERROR: {label} did not become ready within {timeout}s.")
+    return False
+
+
+def wait_for_prom_data(expr, label, timeout=30):
+    """Wait until a PromQL expression returns a non-None result."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        val = prom_query(expr)
+        if val is not None:
+            return val
+        time.sleep(2)
+    print(f"  WARNING: {label} — no data after {timeout}s (showing N/A values)")
+    return None
 
 
 def prom_query(expr):
@@ -109,6 +142,15 @@ def percentile(values, p):
 
 
 def main():
+    section("OBSERVABILITY LAB — Service Health Checks")
+    print("  Verifying Flask app and Prometheus are reachable before starting...\n")
+    if not wait_for_service(f"{APP_URL}/health", "Flask app"):
+        print("  Hint: docker compose up -d flask-app prometheus grafana")
+        sys.exit(1)
+    if not wait_for_service(f"{PROM_URL}/-/healthy", "Prometheus"):
+        print("  Hint: docker compose up -d flask-app prometheus grafana")
+        sys.exit(1)
+
     section("OBSERVABILITY LAB")
     print("""
   Three Pillars of Observability:
@@ -123,6 +165,15 @@ def main():
     Rate     → requests per second
     Errors   → error rate (%)
     Duration → latency percentiles (p50, p95, p99)
+
+  Pull vs Push model debate (common interview topic):
+    Prometheus PULLS metrics — scrapes /metrics on each service every N seconds.
+    Advantages: Prometheus controls scrape timing; easy to detect dead services
+    (scrape fails); no need to configure each service with the Prometheus address.
+    Disadvantages: requires service discovery; short-lived jobs (batch) may
+    complete before the scrape fires → use Pushgateway for those.
+    Push model (StatsD, Datadog agent, OTel Collector): service pushes on each
+    event. Better for short-lived processes; harder to detect silent failures.
 """)
 
     # ── Phase 1: Send 500 requests ─────────────────────────────────
@@ -160,9 +211,11 @@ def main():
   hides the slow tail that real users experience.
 """)
 
-    # Wait for Prometheus to scrape (up to 15s)
-    print("  Waiting 15s for Prometheus to scrape metrics...")
-    time.sleep(15)
+    # Wait for Prometheus to scrape the traffic we just generated.
+    # Poll every 2s instead of a fixed sleep — avoids wasting time when
+    # Prometheus has already scraped, and gives a clear message if it hasn't.
+    print("  Waiting for Prometheus to scrape metrics (up to 30s)...")
+    wait_for_prom_data("sum(http_requests_total)", "http_requests_total", timeout=30)
 
     # ── Phase 2: Query Prometheus ──────────────────────────────────
     section("Phase 2: Querying Prometheus API (PromQL)")
@@ -271,17 +324,15 @@ def main():
         if total_count > 0:
             threshold_99 = total_count * 0.99
             prev_le = None
-            prev_count = 0
             for labels, count in sorted_buckets:
                 le_val = labels.get("le", "+Inf")
                 if count >= threshold_99:
                     le_ms = f"{float(le_val)*1000:.0f}ms" if le_val != "+Inf" else "+Inf"
                     prev_ms = f"{float(prev_le)*1000:.0f}ms" if prev_le else "0ms"
-                    print(f"  → p99 lands in bucket ({prev_ms}, {le_ms}]")
-                    print(f"    Prometheus interpolates within this range for the estimate.")
+                    print(f"  -> p99 lands in bucket ({prev_ms}, {le_ms}]")
+                    print(f"     Prometheus interpolates within this range for the estimate.")
                     break
                 prev_le = le_val
-                prev_count = count
     else:
         print("  Histogram bucket data not yet available from Prometheus.")
         print("  (Prometheus needs at least one scrape after traffic was sent.)")
@@ -404,8 +455,58 @@ def main():
   budget exhaustion time and acceptable detection latency.
 """)
 
-    # ── Phase 5: RED Method Summary ────────────────────────────────
-    section("Phase 5: RED Method Summary")
+    # ── Phase 5: Recording Rules Demo ─────────────────────────────
+    section("Phase 5: Recording Rules — Pre-computed SLO Series")
+    print("""  Recording rules evaluate expensive PromQL once per interval and store
+  the result as a new time series. All dashboards and alert rules then
+  query the cheap derived series instead of re-running the fan-out.
+
+  Rules configured in rules.yml (mounted into Prometheus):
+    job:http_request_duration_p99:rate1m
+    job:http_request_duration_p95:rate1m
+    job:http_request_duration_p50:rate1m
+    job:http_error_rate:rate1m
+    job:http_request_rate:rate1m
+    job:http_error_budget_burn_rate:rate1m
+
+  Querying recording rule series (same data, no histogram fan-out):
+""")
+    rec_p99   = prom_query("job:http_request_duration_p99:rate1m")
+    rec_p50   = prom_query("job:http_request_duration_p50:rate1m")
+    rec_err   = prom_query("job:http_error_rate:rate1m")
+    rec_rate  = prom_query("job:http_request_rate:rate1m")
+    rec_burn  = prom_query("job:http_error_budget_burn_rate:rate1m")
+
+    def fmt_rec(val, scale=1, unit=""):
+        if val is None:
+            return "N/A (recording rule not yet evaluated — wait 15s after traffic)"
+        return f"{val * scale:.2f}{unit}"
+
+    print(f"  p99 latency (from recording rule): {fmt_rec(rec_p99, 1000, 'ms')}")
+    print(f"  p50 latency (from recording rule): {fmt_rec(rec_p50, 1000, 'ms')}")
+    print(f"  error rate  (from recording rule): {fmt_rec(rec_err, 100, '%')}")
+    print(f"  request rate (from recording rule): {fmt_rec(rec_rate, 1, ' req/s')}")
+    print(f"  burn rate   (from recording rule): {fmt_rec(rec_burn, 1, 'x')}")
+
+    if rec_p99 is None:
+        print("""
+  Note: Recording rules need at least one evaluation cycle after traffic.
+  If you see N/A above, wait 15s and re-run the experiment — or check
+  Prometheus UI at http://localhost:9090/rules to verify rules loaded.
+""")
+    else:
+        print(f"""
+  These values match Phase 2's raw PromQL results — same data, cheaper query.
+  At scale (100+ services, 1000+ series per metric), recording rules are the
+  difference between a Prometheus that handles 100 concurrent dashboards and
+  one that collapses under CPU load from repeated histogram_quantile() fan-outs.
+
+  Verify rules in Prometheus UI: http://localhost:9090/rules
+  The "State: OK" column means each rule evaluated successfully this cycle.
+""")
+
+    # ── Phase 6: RED Method Summary ────────────────────────────────
+    section("Phase 6: RED Method Summary")
     rate_str = fmt(rate, ' req/s')
     err_str  = fmt(err_rate, '%')
     dur_str  = f"p50={fmt(p50_prom, 'ms', 1000)}, p95={fmt(p95_prom, 'ms', 1000)}, p99={fmt(p99_prom, 'ms', 1000)}"

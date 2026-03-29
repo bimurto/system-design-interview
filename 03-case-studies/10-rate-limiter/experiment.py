@@ -439,9 +439,13 @@ def phase6_boundary_attack():
     window = DEFAULT_WINDOW
     now = int(time.time())
     window_end = (now // window + 1) * window
-    wait_secs = window_end - now - 1  # arrive 1s before boundary
-    if wait_secs < 0:
-        wait_secs = window - abs(wait_secs) % window
+    # Position 1s before the boundary so Batch A lands in the current window.
+    # If we're already within 1s of the end (wait_secs <= 0), skip to the
+    # NEXT boundary to guarantee we have a full second in the current window.
+    wait_secs = window_end - now - 1
+    if wait_secs <= 0:
+        window_end += window
+        wait_secs = window_end - now - 1
 
     print(f"  Current time:      {now} (window ends at {window_end})")
     print(f"  Waiting {wait_secs:.0f}s to position at window boundary ...")
@@ -559,19 +563,31 @@ def phase7_sliding_window():
     print(f"    ratelimit:{{key}}:{{window_id}}      -> current_window_count (TTL = window)")
     print()
     print("  Algorithm comparison:")
-    print(f"  {'Algorithm':<26}  {'Memory/key':>12}  {'Accuracy':>10}  {'Burst?':>7}")
-    print(f"  {'-'*26}  {'-'*12}  {'-'*10}  {'-'*7}")
+    print(f"  {'Algorithm':<26}  {'Memory/key':>16}  {'Accuracy':>20}  {'Burst?':>7}")
+    print(f"  {'-'*26}  {'-'*16}  {'-'*20}  {'-'*7}")
     rows = [
-        ("Fixed Window Counter",      "O(1) — 1 key",    "+-100% at boundary", "Yes"),
-        ("Sliding Window Log (ZADD)", "O(N) — N=limit",  "Exact",              "No"),
-        ("Sliding Window Counter",    "O(1) — 2 keys",   "<0.003% error",      "No"),
-        ("Token Bucket",              "O(1) — 2 fields", "Exact avg rate",     "Yes"),
-        ("Leaky Bucket",              "O(1) — 1 queue",  "Exact smoothing",    "No"),
+        ("Fixed Window Counter",      "O(1) — 1 key",    "+-100% at boundary",  "Yes"),
+        ("Sliding Window Log (ZADD)", "O(N) — N=limit",  "Exact",               "No"),
+        ("Sliding Window Counter",    "O(1) — 2 keys",   "<0.003% error",       "No"),
+        ("Token Bucket",              "O(1) — 2 fields", "Exact avg rate",      "Yes"),
+        ("Leaky Bucket",              "O(1) — 1 queue",  "Exact smoothing",     "No"),
     ]
     for name, mem, acc, burst in rows:
-        print(f"  {name:<26}  {mem:>12}  {acc:>10}  {burst:>7}")
+        print(f"  {name:<26}  {mem:>16}  {acc:>20}  {burst:>7}")
 
     print(f"""
+  WHY THE MEMORY COST MATTERS:
+
+    Sliding Window Log uses a Redis sorted set (ZADD) per rate-limited key.
+    Each entry = 1 request timestamp = ~16B in Redis.
+
+    At limit=15 (Twitter):     15 entries x 16B = ~240B per key   — fine
+    At limit=10,000 (Stripe):  10K entries x 16B = ~160KB per key — 160GB for 1M keys
+    At limit=100K (premium):   100K x 16B = 1.6MB per key         — unusable
+
+    Sliding Window Counter uses 2 integer keys regardless of limit: ~200B per key.
+    At 1M keys: 200MB total — fits in a single Redis node.
+
   PRODUCTION CHOICES:
     Stripe:     Token Bucket — allows burst, enforces average rate
     Cloudflare: Sliding Window Counter — O(1) memory at 55M RPS

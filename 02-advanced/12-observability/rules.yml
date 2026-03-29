@@ -1,0 +1,118 @@
+groups:
+  # ── SLO Recording Rules ──────────────────────────────────────────────────
+  # Pre-compute expensive histogram_quantile() and error-rate aggregations.
+  # Without recording rules every dashboard panel + alert re-evaluates the
+  # full fan-out query independently — at scale this causes CPU spikes and
+  # query timeouts. These rules evaluate once per scrape interval and store
+  # the result as a cheap derived time series.
+  - name: slo_precompute
+    interval: 15s
+    rules:
+      # p99 latency per job (all endpoints aggregated)
+      - record: job:http_request_duration_p99:rate1m
+        expr: >
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[1m])) by (le, job)
+          )
+
+      # p95 latency per job
+      - record: job:http_request_duration_p95:rate1m
+        expr: >
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[1m])) by (le, job)
+          )
+
+      # p50 latency per job
+      - record: job:http_request_duration_p50:rate1m
+        expr: >
+          histogram_quantile(0.50,
+            sum(rate(http_request_duration_seconds_bucket[1m])) by (le, job)
+          )
+
+      # Per-endpoint p99 — needed for endpoint-level SLO tracking
+      - record: job_endpoint:http_request_duration_p99:rate1m
+        expr: >
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket[1m])) by (le, job, endpoint)
+          )
+
+      # Error rate per job (fraction, not percentage — multiply by 100 for %)
+      - record: job:http_error_rate:rate1m
+        expr: >
+          sum(rate(http_requests_total{status_code=~"5.."}[1m])) by (job)
+          / sum(rate(http_requests_total[1m])) by (job)
+
+      # Request rate per job
+      - record: job:http_request_rate:rate1m
+        expr: >
+          sum(rate(http_requests_total[1m])) by (job)
+
+      # Error budget burn rate (relative to 99.9% SLO → budget = 0.001)
+      # burn_rate > 1 means consuming budget faster than steady state
+      # burn_rate > 14.4 means budget exhausted in ~2h → page immediately
+      - record: job:http_error_budget_burn_rate:rate1m
+        expr: >
+          job:http_error_rate:rate1m / 0.001
+
+  # ── Alerting Rules ───────────────────────────────────────────────────────
+  # These fire against the pre-computed recording rules above (cheap lookups).
+  # In a real deployment these would route to Alertmanager → PagerDuty/Slack.
+  #
+  # Multi-window burn rate pattern (Google SRE chapter 5):
+  # Alert fires ONLY when BOTH the long window AND short window exceed threshold.
+  # Long window confirms the incident is sustained; short window confirms it is
+  # still ongoing. This prevents false positives from transient spikes AND
+  # false negatives from a spike that ended before the alert window closed.
+  - name: slo_alerts
+    rules:
+      # Critical: burn rate 14.4× — budget exhausted in ~2h. Page immediately.
+      - alert: HighErrorBurnRateCritical
+        expr: >
+          (
+            rate(http_requests_total{status_code=~"5.."}[1h])
+            / rate(http_requests_total[1h]) > 14.4 * 0.001
+          ) and (
+            rate(http_requests_total{status_code=~"5.."}[5m])
+            / rate(http_requests_total[5m]) > 14.4 * 0.001
+          )
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error budget burn rate critical (>14.4x) on {{ $labels.job }}"
+          description: >
+            Error rate is burning the error budget at {{ $value | humanize }}x the
+            allowed rate. At this rate the monthly budget will be exhausted in ~2h.
+            Multi-window: both 1h and 5m windows exceeded threshold.
+
+      # High: burn rate 6× — budget exhausted in ~5 days. Page within 6h.
+      - alert: HighErrorBurnRateHigh
+        expr: >
+          (
+            rate(http_requests_total{status_code=~"5.."}[6h])
+            / rate(http_requests_total[6h]) > 6 * 0.001
+          ) and (
+            rate(http_requests_total{status_code=~"5.."}[30m])
+            / rate(http_requests_total[30m]) > 6 * 0.001
+          )
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "Error budget burn rate high (>6x) on {{ $labels.job }}"
+          description: >
+            Error rate is burning the error budget at >6x the allowed rate.
+            Budget will be exhausted in ~5 days.
+
+      # P99 latency SLO violation: p99 > 200ms sustained for 5 minutes.
+      # References the recording rule — no histogram fan-out on every evaluation.
+      - alert: P99LatencySLOViolation
+        expr: job:http_request_duration_p99:rate1m > 0.200
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "P99 latency SLO violated on {{ $labels.job }}"
+          description: >
+            P99 latency is {{ $value | humanizeDuration }} (SLO: <200ms).
+            Check per-endpoint breakdown: job_endpoint:http_request_duration_p99:rate1m

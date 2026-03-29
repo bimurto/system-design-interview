@@ -74,12 +74,15 @@ class BloomFilter:
 
     def add(self, item):
         for seed in range(self.k):
-            idx = mmh3.hash(item, seed) % self.m
+            # signed=False: use full unsigned 32-bit range [0, 2^32) for
+            # index computation — avoids implicit sign bit in the modulo
+            # and ensures uniform distribution across all m buckets.
+            idx = mmh3.hash(item, seed, signed=False) % self.m
             self._set_bit(idx)
 
     def __contains__(self, item):
         return all(
-            self._get_bit(mmh3.hash(item, seed) % self.m)
+            self._get_bit(mmh3.hash(item, seed, signed=False) % self.m)
             for seed in range(self.k)
         )
 
@@ -319,12 +322,13 @@ class CountMinSketch:
 
     def add(self, item, count=1):
         for i in range(self.depth):
-            col = mmh3.hash(item, i) % self.width
+            # signed=False: consistent unsigned hashing — same fix as BloomFilter
+            col = mmh3.hash(item, i, signed=False) % self.width
             self.table[i][col] += count
 
     def query(self, item):
         return min(
-            self.table[i][mmh3.hash(item, i) % self.width]
+            self.table[i][mmh3.hash(item, i, signed=False) % self.width]
             for i in range(self.depth)
         )
 
@@ -447,12 +451,18 @@ def phase4_topk():
 
     print(f"  Processing {len(pages):,} page view events...")
 
-    # Add in batches
+    # Add in batches; TOPK.ADD returns the item displaced from the top-K list
+    # when a new item pushes out a previous occupant — useful to observe.
     batch = 200
     true_counts = defaultdict(int)
+    displaced_items: set[str] = set()
     for i in range(0, len(pages), batch):
         chunk = pages[i:i+batch]
-        r.execute_command("TOPK.ADD", "topk:pages", *chunk)
+        evicted = r.execute_command("TOPK.ADD", "topk:pages", *chunk)
+        # evicted is a list with one entry per input item; None means no eviction
+        for item in evicted:
+            if item is not None:
+                displaced_items.add(item)
         for p in chunk:
             true_counts[p] += 1
 
@@ -467,6 +477,12 @@ def phase4_topk():
         if page:
             in_exact = "YES" if page in true_top_10 else "no (near boundary)"
             print(f"  {rank:<6} {page:<14} {true_counts.get(page, 0):>12,}  {in_exact}")
+
+    if displaced_items:
+        print(f"\n  Items displaced from top-{K} during stream processing: "
+              f"{len(displaced_items)} item(s)")
+        print(f"  (TOPK.ADD returns the evicted item whenever a new item enters the top-K)")
+        print(f"  Example displaced: {sorted(displaced_items)[:5]}")
 
     overlap = len(topk_set & set(true_top_10))
     print(f"\n  Overlap with exact top-{K}: {overlap}/{K} items match")
@@ -726,13 +742,31 @@ def main():
     7 — Summary:               comparison table + error direction cheat-sheet
 """)
 
-    phase1_bloom_filter()
-    phase2_hyperloglog()
-    phase3_count_min_sketch()
-    phase4_topk()
-    phase5_bloom_saturation()
-    phase6_minhash()
-    phase7_summary()
+    phases = [
+        ("Phase 1: Bloom Filter",       phase1_bloom_filter),
+        ("Phase 2: HyperLogLog",         phase2_hyperloglog),
+        ("Phase 3: Count-Min Sketch",    phase3_count_min_sketch),
+        ("Phase 4: Top-K",               phase4_topk),
+        ("Phase 5: Bloom Saturation",    phase5_bloom_saturation),
+        ("Phase 6: MinHash",             phase6_minhash),
+        ("Phase 7: Summary",             phase7_summary),
+    ]
+
+    timings: list[tuple[str, float]] = []
+    for label, fn in phases:
+        t0 = time.perf_counter()
+        fn()
+        elapsed = time.perf_counter() - t0
+        timings.append((label, elapsed))
+
+    section("Phase Timings")
+    print(f"\n  {'Phase':<35} {'Time (s)':>10}")
+    print(f"  {'─'*35} {'─'*10}")
+    for label, elapsed in timings:
+        print(f"  {label:<35} {elapsed:>10.2f}")
+    total = sum(t for _, t in timings)
+    print(f"  {'─'*35} {'─'*10}")
+    print(f"  {'TOTAL':<35} {total:>10.2f}\n")
 
 
 if __name__ == "__main__":

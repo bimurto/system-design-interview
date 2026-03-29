@@ -6,9 +6,10 @@ What this demonstrates:
   1. Upload video to MinIO (simulates object storage)
   2. Store metadata in Postgres (title, status=processing)
   3. Simulate transcoding pipeline: processing → ready, multiple quality entries
-  4. Serve video with byte-range requests via Nginx (video seeking)
-  5. Increment view count in Redis (INCR), periodic flush to Postgres
-  6. Show view count never writes to Postgres per-view, only batched
+  4. Generate HLS master manifest + per-quality segment manifests
+  5. Serve video with byte-range requests via Nginx (video seeking / HTTP 206)
+  6. Increment view count in Redis (INCR), observe Postgres stays at 0
+  7. Batch flush Redis counters to Postgres in a single pass
 
 Run:
   docker compose up -d
@@ -18,15 +19,10 @@ Run:
 
 import hashlib
 import io
-import json
 import os
-import random
 import time
 import urllib.error
 import urllib.request
-
-import psycopg2
-import redis
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -37,9 +33,6 @@ MINIO_BUCKET    = "videos"
 DB_URL          = os.getenv("DATABASE_URL", "postgresql://app:secret@localhost:5432/youtube")
 REDIS_URL       = os.getenv("REDIS_URL",    "redis://localhost:6379")
 NGINX_URL       = os.getenv("NGINX_URL",    "http://localhost:8080")
-
-VIEW_FLUSH_INTERVAL = 30   # seconds between Redis → Postgres view count flush
-VIEW_FLUSH_THRESHOLD = 10  # flush if counter exceeds this even before interval
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -68,11 +61,43 @@ def wait_for_service(url, max_wait=60, label="service"):
     raise RuntimeError(f"{label} did not start within {max_wait}s")
 
 
+def wait_for_postgres(dsn, max_wait=60):
+    """Poll until Postgres accepts connections."""
+    import psycopg2
+    print(f"  Waiting for Postgres ...")
+    for i in range(max_wait):
+        try:
+            conn = psycopg2.connect(dsn)
+            conn.close()
+            print(f"  Postgres ready after {i+1}s")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("Postgres did not start within 60s")
+
+
+def wait_for_redis(url, max_wait=60):
+    """Poll until Redis accepts connections."""
+    import redis as redis_lib
+    print(f"  Waiting for Redis ...")
+    r = redis_lib.from_url(url)
+    for i in range(max_wait):
+        try:
+            r.ping()
+            print(f"  Redis ready after {i+1}s")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("Redis did not start within 60s")
+
+
 def get_db():
+    import psycopg2
     return psycopg2.connect(DB_URL)
 
 
 def get_redis():
+    import redis
     return redis.from_url(REDIS_URL, decode_responses=True)
 
 
@@ -103,11 +128,11 @@ def init_db(conn):
                     view_count  BIGINT DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS video_qualities (
-                    id         BIGSERIAL PRIMARY KEY,
-                    video_id   BIGINT REFERENCES videos(id),
-                    quality    TEXT NOT NULL,
-                    path       TEXT NOT NULL,
-                    size_bytes BIGINT,
+                    id           BIGSERIAL PRIMARY KEY,
+                    video_id     BIGINT REFERENCES videos(id),
+                    quality      TEXT NOT NULL,
+                    path         TEXT NOT NULL,
+                    size_bytes   BIGINT,
                     bitrate_kbps INT
                 );
                 CREATE INDEX IF NOT EXISTS idx_videos_user ON videos(user_id);
@@ -126,13 +151,14 @@ def ensure_bucket(client):
 def phase1_upload(conn, minio_client):
     section("Phase 1: Upload Video to MinIO (Object Storage)")
 
-    # Generate a fake video file (binary blob representing raw video bytes)
-    random.seed(42)
+    # Use os.urandom — fast C-level random bytes, not a Python-level loop.
+    # A Python loop over getrandbits(8) for 5MB takes ~3s; os.urandom takes <1ms.
     video_size_mb = 5
-    video_data = bytes(random.getrandbits(8) for _ in range(video_size_mb * 1024 * 1024))
+    video_data = os.urandom(video_size_mb * 1024 * 1024)
     checksum = hashlib.sha256(video_data).hexdigest()
 
     print(f"\n  Simulated video: {video_size_mb}MB, SHA-256: {checksum[:16]}...")
+    print(f"  (SHA-256 enables exact deduplication: same bytes → skip re-transcoding)")
 
     object_name = f"raw/{checksum[:16]}.mp4"
 
@@ -149,7 +175,7 @@ def phase1_upload(conn, minio_client):
     print(f"  Uploaded to MinIO in {upload_ms:.0f}ms")
     print(f"  Path: {MINIO_BUCKET}/{object_name}")
 
-    # Store metadata in Postgres with status=uploading→processing
+    # Store metadata in Postgres with status=processing
     with conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -160,6 +186,7 @@ def phase1_upload(conn, minio_client):
             video_id = cur.fetchone()[0]
 
     print(f"\n  Postgres metadata: video_id={video_id}, status=processing")
+    print(f"  Note: video bytes live in MinIO, NOT Postgres — Postgres stores only paths.")
     print(f"  (Transcoding pipeline will update status → ready)")
     return video_id, object_name, video_data
 
@@ -188,6 +215,9 @@ def phase2_metadata(conn, video_id):
     Postgres is optimised for structured queries (search by user, filter by status).
     Object storage is optimised for large binary blobs (cheap, durable, CDN-friendly).
     Never store video bytes in Postgres (BLOBs kill performance at scale).
+
+  At production scale YouTube uses Bigtable (video_id as row key) not Postgres —
+  same logical model, but horizontal scale without sharding complexity.
 """)
 
 
@@ -199,25 +229,30 @@ def phase3_transcoding(conn, minio_client, video_id, video_data):
     print("""
   Real transcoding pipeline:
     Upload → SQS/Kafka → Transcoding workers → Multiple resolutions → Object storage
-    Workers use FFmpeg to produce HLS segments at 360p/720p/1080p/4K
+    Workers use FFmpeg/AV1 to produce HLS .ts segments at 360p/720p/1080p/4K
 
-  Simulated here: create fake quality variants in MinIO + update Postgres
+  Key design decisions:
+    • All quality levels transcoded in parallel across separate workers
+    • 360p available in ~2 min (fast encode) → video marked 'ready' immediately
+    • 4K may take 30+ min — progressive availability, not all-or-nothing
+    • GPU acceleration (NVENC/VAAPI): 10–20× faster than CPU encoding
+    • Spot/preemptible VMs: jobs are idempotent, safe to retry on preemption
+
+  Simulated here: create proportionally-sized quality variants in MinIO
 """)
 
     qualities = [
-        ("360p",  500_000,  "low"),
-        ("720p",  2_500_000, "medium"),
-        ("1080p", 8_000_000, "high"),
+        ("360p",   500_000,  0.10),
+        ("720p",  2_500_000, 0.40),
+        ("1080p", 8_000_000, 0.90),
     ]
 
     checksum = hashlib.sha256(video_data).hexdigest()[:16]
     quality_records = []
 
-    for quality_label, bitrate_bps, size_suffix in qualities:
-        # Create a smaller "transcoded" version (simulated)
-        scale = {"360p": 0.1, "720p": 0.4, "1080p": 0.9}[quality_label]
+    for quality_label, bitrate_bps, scale in qualities:
         transcoded_size = int(len(video_data) * scale)
-        # Use a slice of the original + quality marker to simulate different outputs
+        # Simulate distinct transcoded bytes (different slice per quality)
         transcoded_data = video_data[:transcoded_size]
 
         object_name = f"transcoded/{checksum}/{quality_label}/video.mp4"
@@ -263,23 +298,110 @@ def phase3_transcoding(conn, minio_client, video_id, video_data):
         )
         rows = cur.fetchall()
 
-    print(f"\n  Quality variants stored:")
+    print(f"\n  Quality variants stored in Postgres:")
     print(f"  {'Quality':<10}  {'Bitrate kbps':>14}  {'Size':>10}")
     print(f"  {'-'*10}  {'-'*14}  {'-'*10}")
     for quality, bitrate, size in rows:
-        print(f"  {quality:<10}  {bitrate:>14}  {size//1024:>8}KB")
+        print(f"  {quality:<10}  {bitrate:>14,}  {size//1024:>8}KB")
 
-    return quality_records
+    return quality_records, checksum
 
 
-# ── Phase 4: Byte-range requests (video seeking) ─────────────────────────────
+# ── Phase 4: HLS Manifest ─────────────────────────────────────────────────────
 
-def phase4_byte_range(minio_client, quality_records):
-    section("Phase 4: Byte-Range Requests — Video Seeking via Nginx")
+def phase4_hls_manifest(minio_client, video_id, quality_records, checksum):
+    section("Phase 4: HLS Master Manifest — Adaptive Bitrate Streaming")
+
+    print("""
+  HLS (HTTP Live Streaming) splits each quality level into small .ts segments
+  (2–6 seconds each). A master manifest (.m3u8) lists all quality variants.
+  The player picks the highest quality that fits in available bandwidth and
+  switches quality dynamically at segment boundaries — invisible to the viewer.
+
+  Master manifest format:
+""")
+
+    # Build a realistic HLS master manifest
+    master_lines = ["#EXTM3U", "#EXT-X-VERSION:3", ""]
+    for q in sorted(quality_records, key=lambda x: x["bitrate_kbps"]):
+        resolution_map = {"360p": "640x360", "720p": "1280x720", "1080p": "1920x1080"}
+        resolution = resolution_map.get(q["quality"], "unknown")
+        bandwidth = q["bitrate_kbps"] * 1000
+        master_lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={resolution},CODECS="avc1.4d401f,mp4a.40.2"')
+        master_lines.append(f'{q["quality"]}/index.m3u8')
+        master_lines.append("")
+    master_manifest = "\n".join(master_lines)
+
+    print("  --- master.m3u8 ---")
+    print(master_manifest)
+
+    # Upload master manifest to MinIO
+    manifest_path = f"transcoded/{checksum}/master.m3u8"
+    manifest_bytes = master_manifest.encode()
+    minio_client.put_object(
+        MINIO_BUCKET,
+        manifest_path,
+        io.BytesIO(manifest_bytes),
+        length=len(manifest_bytes),
+        content_type="application/vnd.apple.mpegurl",
+    )
+    print(f"  Uploaded to MinIO: {MINIO_BUCKET}/{manifest_path}")
+
+    # Build a per-quality segment manifest (360p example, 3-minute video at 4s segments)
+    duration_s = 180
+    segment_duration = 4
+    num_segments = duration_s // segment_duration
+
+    segment_lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f"#EXT-X-TARGETDURATION:{segment_duration}",
+        "#EXT-X-MEDIA-SEQUENCE:0",
+        "",
+    ]
+    for i in range(num_segments):
+        segment_lines.append(f"#EXTINF:{segment_duration}.0,")
+        segment_lines.append(f"segment_{i:04d}.ts")
+    segment_lines.append("#EXT-X-ENDLIST")
+    segment_manifest = "\n".join(segment_lines)
+
+    # Show first few segments
+    preview_lines = segment_lines[:14]
+    preview_lines.append(f"  ... ({num_segments} segments total for {duration_s}s video)")
+    print(f"\n  --- 360p/index.m3u8 (first {len(preview_lines)} lines) ---")
+    for line in preview_lines:
+        print(f"  {line}")
+
+    segment_manifest_path = f"transcoded/{checksum}/360p/index.m3u8"
+    manifest_bytes = segment_manifest.encode()
+    minio_client.put_object(
+        MINIO_BUCKET,
+        segment_manifest_path,
+        io.BytesIO(manifest_bytes),
+        length=len(manifest_bytes),
+        content_type="application/vnd.apple.mpegurl",
+    )
+
+    print(f"""
+  Seeking with HLS:
+    Player reads manifest → knows each segment covers exactly {segment_duration}s.
+    Seek to t=90s → request segment_{90//segment_duration:04d}.ts  (segment index 22).
+    Only that one segment is fetched — not the preceding 90 seconds of video.
+    At 1080p (~8 Mbps), one 4s segment ≈ 4MB. Sub-second seek from any CDN edge.
+""")
+
+    return manifest_path
+
+
+# ── Phase 5: Byte-range requests (video seeking) ─────────────────────────────
+
+def phase5_byte_range(minio_client, quality_records):
+    section("Phase 5: Byte-Range Requests — HTTP 206 Partial Content")
 
     print("""
   HTTP byte-range requests let clients seek to any position in a video
-  without downloading the entire file.
+  without downloading the entire file. This is the mechanism HLS uses
+  under the hood when fetching individual .ts segments from object storage.
 
   Request:  GET /video/videos/path HTTP/1.1
             Range: bytes=1048576-2097151
@@ -296,7 +418,7 @@ def phase4_byte_range(minio_client, quality_records):
 
     nginx_url = f"{NGINX_URL}/video/{MINIO_BUCKET}/{object_path}"
 
-    # First: full download (simulates initial buffering)
+    # First: full download to establish baseline latency
     start = time.perf_counter()
     req = urllib.request.Request(nginx_url)
     try:
@@ -310,7 +432,7 @@ def phase4_byte_range(minio_client, quality_records):
         full_ms = 0
         full_size = total_size
 
-    # Byte-range: seek to 50% into the video
+    # Byte-range: seek to 50% into the video (simulates user clicking to midpoint)
     seek_start = total_size // 2
     seek_end   = seek_start + min(524288, total_size // 4)  # 512KB chunk
 
@@ -326,48 +448,45 @@ def phase4_byte_range(minio_client, quality_records):
             content_range = resp.headers.get("Content-Range", "n/a")
         seek_ms = (time.perf_counter() - start) * 1000
         print(f"\n  Byte-range seek to 50% (bytes={seek_start}-{seek_end}):")
-        print(f"    HTTP status:   {status} (206 = Partial Content)")
+        print(f"    HTTP status:   {status} (206 = Partial Content ✓)")
         print(f"    Content-Range: {content_range}")
         print(f"    Chunk size:    {len(chunk)//1024}KB fetched in {seek_ms:.0f}ms")
-        print(f"    Speedup:       {full_ms/seek_ms:.1f}x vs full download" if full_ms > 0 else "")
+        if full_ms > 0 and seek_ms > 0:
+            print(f"    Speedup vs full download: {full_ms/seek_ms:.1f}x faster")
     except urllib.error.HTTPError as e:
         print(f"  Byte-range request: HTTP {e.code} — {e.reason}")
         print(f"  (Nginx byte-range proxy may need configuration; see nginx.conf)")
 
     print(f"""
-  Adaptive Bitrate Streaming (HLS/DASH):
-    Instead of one large MP4, YouTube serves thousands of small .ts segments
-    (2-6 seconds each) at multiple quality levels.
-
-    Client player logic:
-      1. Download manifest (.m3u8 / .mpd): list of all segments + quality levels
-      2. Measure current download bandwidth
-      3. Select highest quality that fits in available bandwidth
-      4. Download next segment (prefetch 3-5 segments ahead)
-      5. If bandwidth drops: switch to lower quality mid-stream
-
-    Benefit: seamless quality switching without buffering, works on flaky networks.
-    Segment size (2-6s): small enough to switch quality quickly, large enough to
-    amortise HTTP request overhead.
+  Why this matters at scale:
+    A 1-hour 1080p video = ~3.6GB. Seeking to minute 45 via byte-range
+    fetches one 4s segment (~4MB) instead of 2.7GB. CDN serves the
+    segment from edge cache — sub-100ms latency globally.
 """)
 
 
-# ── Phase 5: View count via Redis ─────────────────────────────────────────────
+# ── Phase 6: View count via Redis ─────────────────────────────────────────────
 
-def phase5_view_count(conn, r, video_id):
-    section("Phase 5: View Count at Scale — Redis INCR + Batch Flush")
+def phase6_view_count(conn, r, video_id):
+    section("Phase 6: View Count at Scale — Redis INCR + Batch Flush")
 
     print("""
   Naive approach: UPDATE videos SET view_count = view_count + 1 WHERE id = ?
   At 1M views/minute this saturates Postgres with row-locking UPDATEs.
+  (Postgres handles ~10K writes/s; YouTube peaks at ~11,600 views/s.)
 
   Production approach:
-    1. On each view: Redis INCR view_count:{video_id}  (atomic, in-memory, fast)
+    1. On each view: Redis INCR view_count:{video_id}  (atomic, in-memory, ~0.1ms)
     2. Background worker: every 60s, flush Redis counters to Postgres in bulk
-    3. Result: 0 Postgres writes per view, 1 batch write per minute
+    3. Result: 0 Postgres writes per view, 1 batch write per minute per video
+
+  Durability trade-off:
+    • Redis AOF (appendonly yes): at most 1 second of counts lost on crash
+    • For billing/monetisation: separate Kafka-backed pipeline (zero loss)
+    • View counts lag by up to 60s — acceptable for display purposes
 """)
 
-    # Simulate 1000 views arriving quickly
+    # Simulate 1000 views arriving quickly via pipelined INCR
     n_views = 1000
     redis_key = f"view_count:{video_id}"
 
@@ -379,18 +498,21 @@ def phase5_view_count(conn, r, video_id):
     redis_ms = (time.perf_counter() - start) * 1000
 
     redis_count = int(r.get(redis_key) or 0)
-    print(f"  Simulated {n_views} views:")
-    print(f"    Redis INCR ×{n_views}: {redis_ms:.1f}ms total ({redis_ms/n_views:.3f}ms/view)")
-    print(f"    Redis counter: {redis_count}")
+    ops_per_sec = n_views / (redis_ms / 1000) if redis_ms > 0 else 0
+    print(f"  Simulated {n_views:,} views via Redis pipeline:")
+    print(f"    Time:          {redis_ms:.1f}ms total")
+    print(f"    Per-view cost: {redis_ms/n_views:.3f}ms")
+    print(f"    Throughput:    {ops_per_sec:,.0f} ops/s  (single-node Redis)")
+    print(f"    Redis counter: {redis_count:,}")
 
-    # Check current Postgres count
+    # Check current Postgres count (should still be 0)
     with conn.cursor() as cur:
         cur.execute("SELECT view_count FROM videos WHERE id=%s", (video_id,))
         db_count = cur.fetchone()[0]
-    print(f"    Postgres view_count: {db_count}  ← NOT updated yet")
+    print(f"    Postgres view_count: {db_count}  ← NOT updated yet (flush pending)")
 
     # Flush to Postgres
-    print(f"\n  Flushing Redis counter to Postgres...")
+    print(f"\n  Flushing Redis counter to Postgres (simulates 60s background tick)...")
     delta = int(r.getdel(redis_key) or 0)
     if delta > 0:
         with conn:
@@ -404,17 +526,14 @@ def phase5_view_count(conn, r, video_id):
         cur.execute("SELECT view_count FROM videos WHERE id=%s", (video_id,))
         db_count_after = cur.fetchone()[0]
 
-    print(f"    Flushed delta: +{delta} views")
-    print(f"    Postgres view_count: {db_count_after}  ← now updated")
+    print(f"    Flushed delta:       +{delta:,} views")
+    print(f"    Postgres view_count: {db_count_after:,}  ← now updated")
 
-    # Estimate savings
-    db_writes_naive = n_views
-    db_writes_batched = 1
     print(f"""
-  Cost comparison for {n_views} views:
-    Naive (per-view UPDATE):  {db_writes_naive} Postgres writes
-    Batched (Redis + flush):  {db_writes_batched} Postgres write
-    Reduction:                {db_writes_naive}x fewer DB writes
+  Cost comparison for {n_views:,} views:
+    Naive (per-view UPDATE):  {n_views:,} Postgres writes
+    Batched (Redis + flush):  1 Postgres write
+    Reduction:                {n_views:,}x fewer DB writes
 
   At YouTube scale (1B views/day = 11,574 views/s):
     Naive:   11,574 UPDATE transactions/second → Postgres overwhelmed
@@ -422,12 +541,20 @@ def phase5_view_count(conn, r, video_id):
 """)
 
 
-# ── Phase 6: Batch flush demonstration ───────────────────────────────────────
+# ── Phase 7: Batch flush demonstration ───────────────────────────────────────
 
-def phase6_batch_flush(conn, r):
-    section("Phase 6: Batch Flush — Multiple Videos at Once")
+def phase7_batch_flush(conn, r):
+    section("Phase 7: Batch Flush — Multiple Videos at Once")
 
-    # Create several video records and simulate concurrent views
+    print("""
+  Real flush worker pattern:
+    • Runs every 60 seconds (cron or event loop)
+    • Scans all view_count:* keys with SCAN (non-blocking, cursor-based)
+    • GETDEL each key atomically (avoids double-counting on concurrent flushes)
+    • Batches all UPDATEs in one transaction for efficiency
+""")
+
+    # Create several video records simulating a mix of viral + long-tail videos
     video_ids = []
     with conn:
         with conn.cursor() as cur:
@@ -438,36 +565,38 @@ def phase6_batch_flush(conn, r):
                 )
                 video_ids.append(cur.fetchone()[0])
 
-    # Simulate views on each video (different popularity)
-    view_counts = [50000, 1200, 300, 15000, 750]
-    print(f"\n  Simulating views on 5 videos (representing 60 seconds of traffic):\n")
-    print(f"  {'Video ID':>10}  {'Views (in Redis)':>18}")
-    print(f"  {'-'*10}  {'-'*18}")
-
-    for vid, views in zip(video_ids, view_counts):
+    # Simulate 60 seconds of accumulated views (different popularity levels)
+    view_counts = [50_000, 1_200, 300, 15_000, 750]
+    print(f"  Views accumulated in Redis over 60 seconds:\n")
+    print(f"  {'Video ID':>10}  {'Title':<12}  {'Views':>10}  Category")
+    print(f"  {'-'*10}  {'-'*12}  {'-'*10}  --------")
+    for vid, views, label in zip(video_ids, view_counts, ["viral", "popular", "niche", "trending", "niche"]):
         r.incrby(f"view_count:{vid}", views)
-        print(f"  {vid:>10}  {views:>18,}")
+        print(f"  {vid:>10}  {'Video #'+str(video_ids.index(vid)+1):<12}  {views:>10,}  {label}")
 
-    # Batch flush: scan all view_count:* keys and flush
-    print(f"\n  Batch flush (background worker tick)...")
+    # Batch flush: scan all view_count:* keys and flush in one pass
+    print(f"\n  Running batch flush worker...")
     start = time.perf_counter()
     flushed = 0
-    for key in r.scan_iter("view_count:*"):
-        vid_id = int(key.split(":")[1])
-        delta = int(r.getdel(key) or 0)
-        if delta > 0:
-            with conn:
-                with conn.cursor() as cur:
+    total_views = 0
+    with conn:
+        with conn.cursor() as cur:
+            for key in r.scan_iter("view_count:*"):
+                vid_id = int(key.split(":")[1])
+                delta = int(r.getdel(key) or 0)
+                if delta > 0:
                     cur.execute(
                         "UPDATE videos SET view_count = view_count + %s WHERE id = %s",
                         (delta, vid_id),
                     )
-            flushed += 1
+                    flushed += 1
+                    total_views += delta
     flush_ms = (time.perf_counter() - start) * 1000
 
-    print(f"  Flushed {flushed} counters to Postgres in {flush_ms:.1f}ms")
+    print(f"  Flushed {flushed} video counters ({total_views:,} total views) in {flush_ms:.1f}ms")
+    print(f"  Average: {flush_ms/flushed:.2f}ms per video" if flushed > 0 else "")
 
-    # Verify
+    # Verify results
     with conn.cursor() as cur:
         placeholders = ",".join(["%s"] * len(video_ids))
         cur.execute(
@@ -476,11 +605,11 @@ def phase6_batch_flush(conn, r):
         )
         rows = cur.fetchall()
 
-    print(f"\n  Postgres after flush:")
-    print(f"  {'Video ID':>10}  {'Title':<15}  {'View Count':>12}")
-    print(f"  {'-'*10}  {'-'*15}  {'-'*12}")
+    print(f"\n  Postgres after flush (sorted by popularity):")
+    print(f"  {'Video ID':>10}  {'Title':<12}  {'View Count':>12}")
+    print(f"  {'-'*10}  {'-'*12}  {'-'*12}")
     for vid_id, title, vc in rows:
-        print(f"  {vid_id:>10}  {title:<15}  {vc:>12,}")
+        print(f"  {vid_id:>10}  {title:<12}  {vc:>12,}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -491,14 +620,17 @@ def main():
   Architecture:
     Upload → MinIO (raw video) → Postgres (metadata: status=processing)
     Transcoding workers → MinIO (360p/720p/1080p) → Postgres (status=ready)
+    HLS manifest (.m3u8) → MinIO → CDN edge (served to players)
     View → Redis INCR → Background flush → Postgres (view_count)
-    Playback → Nginx → MinIO (byte-range requests, CDN simulation)
+    Playback → Nginx → MinIO (byte-range requests, simulates CDN)
 """)
 
     install_packages()
 
     wait_for_service(f"{MINIO_ENDPOINT}/minio/health/live", label="MinIO")
     wait_for_service(f"{NGINX_URL}/health", label="Nginx")
+    wait_for_postgres(DB_URL)
+    wait_for_redis(REDIS_URL)
 
     conn = get_db()
     r    = get_redis()
@@ -509,10 +641,11 @@ def main():
 
     video_id, object_name, video_data = phase1_upload(conn, mc)
     phase2_metadata(conn, video_id)
-    quality_records = phase3_transcoding(conn, mc, video_id, video_data)
-    phase4_byte_range(mc, quality_records)
-    phase5_view_count(conn, r, video_id)
-    phase6_batch_flush(conn, r)
+    quality_records, checksum = phase3_transcoding(conn, mc, video_id, video_data)
+    phase4_hls_manifest(mc, video_id, quality_records, checksum)
+    phase5_byte_range(mc, quality_records)
+    phase6_view_count(conn, r, video_id)
+    phase7_batch_flush(conn, r)
 
     conn.close()
 
@@ -522,9 +655,10 @@ def main():
   • Videos stored in object storage (MinIO/S3): cheap, scalable, CDN-friendly
   • Metadata in Postgres: structured queries, status tracking, view counts
   • Transcoding pipeline: upload triggers async workers → multi-resolution outputs
-  • Byte-range requests: HTTP 206 Partial Content enables video seeking without full download
+  • HLS manifests (.m3u8): adaptive bitrate — player picks quality to match bandwidth
+  • Byte-range requests: HTTP 206 Partial Content enables seeking without full download
   • View counts: Redis INCR avoids per-view DB write; batch flush every 60s
-  • Adaptive bitrate: HLS/DASH serves 2-6s segments at multiple qualities
+  • AOF persistence: Redis durability — lose at most 1s of counts on crash
 
   Next: 04-uber/ — real-time geospatial indexing with Redis GEORADIUS + PostGIS
 """)

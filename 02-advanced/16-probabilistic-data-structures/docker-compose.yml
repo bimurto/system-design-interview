@@ -3,6 +3,10 @@ services:
     image: redis/redis-stack-server:7.2.0-v9
     ports:
       - "6379:6379"
+    # noeviction: the experiment explicitly manages keys and never expects
+    # silent eviction to corrupt results — fail loudly if memory is exhausted.
+    environment:
+      - REDIS_ARGS=--maxmemory 200mb --maxmemory-policy noeviction
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
@@ -11,7 +15,13 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "1"
           memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   experiment:
     image: python:3.11-slim
@@ -29,5 +39,11 @@ services:
     deploy:
       resources:
         limits:
+          cpus: "2"
           memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: "no"

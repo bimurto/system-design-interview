@@ -211,6 +211,44 @@ for approximate API calls) or using a Bloom filter as the only security check (a
 can craft false positives) are category errors. Probabilistic structures are for analytics and optimization, not for
 correctness-critical operations.
 
+**Thread safety is not provided by default:** In-process implementations of Bloom filters, Count-Min Sketches, and
+MinHash structures share mutable state (bit arrays, counter matrices). Concurrent writes from multiple threads without
+locking will silently corrupt the structure — not crash, but silently produce wrong answers. Redis-backed structures
+(BF, HLL, TOPK) are server-side and atomic per command, but multi-step operations (BF.RESERVE followed by BF.ADD)
+are not atomic — use Lua scripts or Redis transactions if you need multi-command atomicity. For in-process structures,
+either use a single-writer model or wrap with a lock; the overhead is usually small compared to the sketch operations.
+
+**Counting Bloom filters permit deletion at the cost of higher memory:** A standard Bloom filter uses 1 bit per cell.
+A counting Bloom filter uses a small counter (typically 4 bits) per cell — incrementing on add, decrementing on delete.
+This restores the ability to delete without corrupting other members. The cost is 4–8x more memory than a standard
+Bloom filter. Overflow of a counter (adding more than 2^4=16 items hashing to the same cell) causes permanent
+corruption — mitigated by choosing counters large enough relative to expected load. In practice, Cuckoo filters are
+preferred over counting Bloom filters for new systems because Cuckoo filters use less memory and have a cleaner
+deletion model.
+
+## Composing Probabilistic Structures
+
+In production, these structures are rarely used alone — they layer on top of authoritative stores to reduce load:
+
+**Bloom filter as a read-path guard (LSM-tree pattern):** Keep a Bloom filter for each SSTable on disk. On a key
+lookup, check the Bloom filter first. "Definitely not here" → skip the disk read entirely. "Probably here" → do the
+disk read. At 1% FPR, 99% of "key not found" lookups avoid disk I/O. This is the exact pattern Cassandra, RocksDB,
+and LevelDB use. The filter lives in memory; the ground truth lives on disk.
+
+**HLL + exact fallback for billing boundary:** Run `PFCOUNT` for real-time dashboards (cheap, approximate). At
+billing period close, run `COUNT(DISTINCT user_id)` in your data warehouse once (expensive, exact). Use the HLL
+for the 99.9% of queries that don't need exactness; pay the cost only when you do.
+
+**Count-Min Sketch + Top-K heap for heavy hitter detection:** Use a CMS to track per-item frequencies, and maintain
+a small min-heap of the current top-K items. When a CMS query for an item exceeds the heap's minimum, insert it.
+This is cheaper than a full sort and more accurate than Top-K alone — the CMS prevents low-frequency items from
+polluting the heap due to noise.
+
+**Cascading filters for multi-tier storage:** In a multi-level cache (L1 in-process → L2 Redis → L3 DB), use a
+Bloom filter at each tier. A miss at L1 checks the L1 Bloom filter; if "definitely not in L2" skip L2 entirely and
+go to L3. This requires maintaining filter membership across cache inserts and evictions, which is complex — only
+worthwhile when the cost of a cache miss is very high (e.g., hundreds of milliseconds of DB latency).
+
 ## Interview Talking Points
 
 - "Bloom filters are used in Cassandra, RocksDB, and LevelDB for SSTable/SST file lookup — before reading from disk,

@@ -24,12 +24,17 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./rules.yml:/etc/prometheus/rules.yml:ro
     # Retain 7 days of data — sufficient for the lab, avoids unbounded disk growth.
+    # --web.enable-lifecycle allows POST /-/reload to hot-reload config without restart.
+    # --web.enable-remote-write-receiver enables the remote_write push API used by
+    #   agents (Grafana Agent, OTel Collector) and Thanos/Cortex federation.
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.retention.time=7d'
       - '--storage.tsdb.path=/prometheus'
       - '--web.enable-lifecycle'
+      - '--web.enable-remote-write-receiver'
     depends_on:
       flask-app:
         condition: service_healthy

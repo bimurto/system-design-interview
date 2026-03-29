@@ -225,18 +225,17 @@ def phase2_eviction():
     for i in range(2000):
         pipe.set(f"filler:{i}", "x" * 800, ex=600)
         if (i + 1) % 500 == 0:
-            pipe.execute()
+            try:
+                pipe.execute()
+            except redis.exceptions.ResponseError as e:
+                # OOM error means eviction is not keeping up — still informative
+                print(f"  Pipeline execute error at {i+1}: {e}")
             info = r.info("memory")
             stats = r.info("stats")
             evictions = stats.get("evicted_keys", 0) - evictions_before
             used_mb = info["used_memory"] / (1024 * 1024)
             print(f"  {i + 1:<22}  {used_mb:>12.2f}MB  {evictions:>10}")
             pipe = r.pipeline(transaction=False)
-    # Execute any remaining queued commands
-    try:
-        pipe.execute()
-    except Exception:
-        pass
 
     # Final check: which keys survived?
     hot_survived = sum(1 for k in hot_keys if r.exists(k))
@@ -537,7 +536,13 @@ def phase5_rdb_snapshot():
     key_count = r.dbsize()
 
     t0 = time.perf_counter()
-    r.bgsave()
+    try:
+        r.bgsave()
+    except redis.exceptions.ResponseError as e:
+        # "ERR Background save already in progress" — safe to ignore,
+        # a save triggered by appendonly or a previous phase is already running.
+        if "already in progress" not in str(e):
+            raise
 
     # Poll until BGSAVE completes
     for _ in range(300):
@@ -772,6 +777,180 @@ def phase7_hot_key_problem():
 """)
 
 
+# ── Phase 8: Cache stampede prevention ───────────────────────────────────────
+
+def phase8_cache_stampede():
+    section("Phase 8: Cache Stampede Prevention — Probabilistic Early Recomputation")
+
+    r = connect_single(7001)
+
+    print("""
+  Cache stampede (thundering herd): when a hot key expires, many concurrent
+  requests all miss the cache simultaneously and all query the backing store.
+  At scale this can overwhelm the database in milliseconds.
+
+  Three approaches demonstrated here:
+    A. No protection    — all N threads miss and recompute simultaneously
+    B. Mutex lock       — first thread recomputes, others wait (serialized)
+    C. PER (Probabilistic Early Recomputation) — one thread recomputes before
+       expiry based on time-to-expiry probability; zero stale-window risk
+
+  PER formula (Fetch, Haynes et al. 2015):
+    recompute = current_time - (compute_time * beta * log(random()))
+              > (expiry_time - ttl_remaining)
+    A high beta (default 1.0) means more aggressive early recomputation.
+    random() is in (0,1), so log() is negative -> subtracted from current_time.
+    When TTL remaining is large, log(random()) × beta is small relative to gap;
+    as TTL shrinks, the probability of triggering early recomputation rises.
+""")
+
+    KEY = "stampede:hot-key"
+    DB_FETCH_LATENCY_MS = 50  # simulated slow DB call
+    CONCURRENCY = 20
+    TTL_S = 3  # short TTL to make the stampede observable
+
+    def simulate_db_fetch(label: str) -> str:
+        """Simulate a slow database call."""
+        time.sleep(DB_FETCH_LATENCY_MS / 1000)
+        return f"db-result-{label}"
+
+    # ── Scenario A: No protection ─────────────────────────────────────────────
+    print(f"  Scenario A: No stampede protection ({CONCURRENCY} threads, {TTL_S}s TTL)")
+    r.set(KEY, "initial-value", ex=TTL_S)
+    time.sleep(TTL_S + 0.1)  # let the key expire
+
+    db_hits_a = []
+    barrier_a = threading.Barrier(CONCURRENCY)
+
+    def worker_no_protection(thread_id: int):
+        barrier_a.wait()  # all threads fire at once
+        val = r.get(KEY)
+        if val is None:
+            db_hits_a.append(thread_id)
+            val = simulate_db_fetch("A")
+            r.set(KEY, val, ex=TTL_S)
+
+    threads_a = [threading.Thread(target=worker_no_protection, args=(i,)) for i in range(CONCURRENCY)]
+    for t in threads_a:
+        t.start()
+    for t in threads_a:
+        t.join(timeout=5)
+
+    print(f"    Cache misses (DB hits): {len(db_hits_a)}/{CONCURRENCY}  "
+          f"({'STAMPEDE — all hit DB' if len(db_hits_a) > 1 else 'OK'})")
+
+    # ── Scenario B: Mutex lock ────────────────────────────────────────────────
+    print(f"\n  Scenario B: Mutex lock protection ({CONCURRENCY} threads)")
+    r.delete(KEY)  # ensure expired
+
+    db_hits_b = []
+    barrier_b = threading.Barrier(CONCURRENCY)
+    lock_b = threading.Lock()
+
+    def worker_with_lock(thread_id: int):
+        barrier_b.wait()
+        val = r.get(KEY)
+        if val is None:
+            with lock_b:
+                # Double-check after acquiring lock (classic DCL pattern)
+                val = r.get(KEY)
+                if val is None:
+                    db_hits_b.append(thread_id)
+                    val = simulate_db_fetch("B")
+                    r.set(KEY, val, ex=TTL_S)
+
+    threads_b = [threading.Thread(target=worker_with_lock, args=(i,)) for i in range(CONCURRENCY)]
+    for t in threads_b:
+        t.start()
+    for t in threads_b:
+        t.join(timeout=5)
+
+    print(f"    Cache misses (DB hits): {len(db_hits_b)}/{CONCURRENCY}  "
+          f"({'OK — exactly 1 DB hit' if len(db_hits_b) == 1 else f'UNEXPECTED: {len(db_hits_b)} hits'})")
+
+    # ── Scenario C: Probabilistic Early Recomputation (PER) ──────────────────
+    print(f"\n  Scenario C: PER — recompute before expiry, zero stampede window")
+
+    import math
+
+    def per_get(r_conn: redis.Redis, key: str, ttl: int, beta: float = 1.0):
+        """
+        PER-aware cache get.
+        Returns (value, recomputed: bool).
+        The caller should call per_get again after a recompute to update the cache.
+        """
+        val = r_conn.get(key)
+        remaining = r_conn.ttl(key)  # seconds remaining; -2 = expired/missing
+
+        if val is None or remaining < 0:
+            return None, True  # definitely expired — must recompute
+
+        # PER decision: recompute early with probability proportional to staleness risk
+        # compute_time approximation: DB_FETCH_LATENCY_MS / 1000
+        compute_time = DB_FETCH_LATENCY_MS / 1000
+        # If current_time - compute_time * beta * log(rand) > (now + remaining - ttl)
+        # Simplifies to: -compute_time * beta * log(rand) > (remaining - ttl)
+        # i.e. when remaining is small relative to compute_time * beta
+        should_recompute = (-compute_time * beta * math.log(random.random())) > remaining
+        return val, should_recompute
+
+    # Seed the cache with a very short TTL to observe PER behavior
+    PER_TTL = 2
+    r.set(KEY, "per-value", ex=PER_TTL)
+
+    # Simulate 50 reads over 2 seconds; PER should trigger exactly once
+    db_hits_c = []
+    recompute_lock = threading.Lock()
+
+    def worker_per(thread_id: int):
+        time.sleep(random.random() * PER_TTL)  # stagger reads across TTL window
+        val, should_recompute = per_get(r, KEY, ttl=PER_TTL, beta=1.0)
+        if should_recompute:
+            with recompute_lock:
+                # Re-check — another thread may have already recomputed
+                val2, still_stale = per_get(r, KEY, ttl=PER_TTL, beta=0.0)  # beta=0 = no early recompute
+                if still_stale or val2 is None:
+                    db_hits_c.append(thread_id)
+                    new_val = simulate_db_fetch("C")
+                    r.set(KEY, new_val, ex=PER_TTL)
+
+    threads_c = [threading.Thread(target=worker_per, args=(i,)) for i in range(CONCURRENCY)]
+    for t in threads_c:
+        t.start()
+    for t in threads_c:
+        t.join(timeout=PER_TTL + 2)
+
+    print(f"    Proactive recomputes (DB hits): {len(db_hits_c)}/{CONCURRENCY}  "
+          f"(PER triggered {'efficiently' if len(db_hits_c) <= 2 else 'too aggressively'})")
+
+    r.delete(KEY)
+    r.close()
+
+    print(f"""
+  Results summary:
+    Scenario A (no protection):  {len(db_hits_a)} simultaneous DB hits — {len(db_hits_a)}x DB load spike
+    Scenario B (mutex lock):     {len(db_hits_b)} DB hit — others wait (adds latency tail)
+    Scenario C (PER):            {len(db_hits_c)} proactive refresh — no expiry window, no wait
+
+  PER trade-offs:
+  - Pro: near-zero stampede risk; no lock contention; no stale-value exposure
+  - Pro: works in distributed systems without a shared mutex
+  - Con: slightly more DB calls overall (beta tuning required)
+  - Con: implementation complexity vs simple "check cache, miss, populate"
+
+  Production usage:
+  - Netflix: PER variant for content metadata caches
+  - Redis Labs: recommended pattern for caches with expensive recomputation
+  - Good beta values: 0.5–2.0 depending on compute_time vs TTL ratio
+
+  When to use each:
+  - No protection: only for non-critical, cheap-to-recompute data
+  - Mutex lock:    when exactly-one recompute is required (expensive DB queries)
+  - PER:           high-read, hot keys with long compute time relative to TTL
+  - Stale-while-revalidate: when brief staleness is acceptable (most caches)
+""")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -788,7 +967,8 @@ def main():
     4. Distributed lock     — atomic Lua check-and-set (single-node Redlock)
     5. RDB snapshot         — BGSAVE timing, COW mechanics, AOF trade-offs
     6. Cluster hash slots   — key routing, hash tags, cross-slot MGET limits
-    7. Hot key problem      — uneven load symptoms and mitigation patterns
+    7. Hot key problem       — uneven load symptoms and mitigation patterns
+    8. Cache stampede       — thundering herd prevention (PER vs mutex vs none)
 """)
 
     wait_for_cluster()

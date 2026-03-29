@@ -115,10 +115,14 @@ between the DB write and the event publish without distributed transactions.
   With Transactional Outbox:
     Service ──► BEGIN TX ──► UPDATE orders SET ... ──► INSERT INTO outbox ──► COMMIT
                                                               │
-    Debezium (CDC) ──────────────────────────────────────────►│ tails outbox table
+    Debezium (CDC) ──────────────────────────────────────────►│ reads WAL (not the table directly)
                                                               ▼
                                                          Kafka publish
-                                                         (at-least-once; outbox row deleted)
+                                                         (at-least-once; outbox rows are NOT
+                                                          deleted by Debezium — it reads the
+                                                          WAL stream; rows are pruned separately
+                                                          e.g. a scheduled DELETE WHERE published
+                                                          AND created_at < now() - interval '7d')
 ```
 
 **Saga pattern:** long-running business transactions that span multiple services cannot use a single database
@@ -178,6 +182,15 @@ than the time needed to catch up, the consumer will miss events permanently. Mit
 continuously (lag AND lag growth rate); scale out consumer instances (up to the partition count limit); increase
 retention period; use Kafka's log compaction for state-based topics to keep the log bounded.
 
+**Back-pressure on bounded-storage topics:** when `retention.bytes` is set (per-partition byte cap), the log cleaner
+can evict old segments to reclaim space even before the time-based retention window (`retention.ms`) expires. A consumer
+that has fallen far behind may find its committed offset pointing to a segment that has already been deleted, triggering
+an `OffsetOutOfRange` error. Unlike time-based retention this can happen silently and suddenly under write bursts.
+Mitigation: size `retention.bytes` to accommodate the worst-case lag, monitor the gap between the consumer's committed
+offset and the log's start offset (not just the end offset), and alert before the consumer enters the deletion window.
+If the consumer is reset, decide deliberately whether to resume from earliest (risk replay storms) or latest (accept
+data loss), and emit an alert for every forced offset reset so it is never invisible.
+
 **Event schema mismatch:** a producer publishes events in a new format that old consumers can't deserialize, causing
 crashes. Mitigation: use a Schema Registry with compatibility checks (e.g., `BACKWARD` mode ensures new schemas can read
 old messages). Never deploy a schema-breaking change without coordinating with all consumers.
@@ -220,6 +233,12 @@ from scratch. This is the event sourcing superpower — the event log is the gro
 - "The hardest part of EDA is schema evolution. Events are immutable once published — you can never change historical
   events. Design events to be backward-compatible: add optional fields, never remove required ones. For breaking
   changes, introduce a new event type (order.created.v2) or use an upcaster in the consumer."
+- "Event versioning in practice: I include a `schema_version` field in every event envelope. When a breaking change is
+  needed, I add an upcaster — a small function that sits at the consumer's deserialization boundary and maps old payloads
+  to the current shape. The projection handler only ever sees the latest shape, and the upcaster chain accumulates
+  version-specific transforms. This is more maintainable than scattering `if version == 1` checks through domain logic.
+  For cross-team contracts, I enforce compatibility at the Schema Registry layer (BACKWARD mode) so producers cannot
+  deploy a breaking schema without all consumers being ready first."
 
 ## Hands-on Lab
 
@@ -241,15 +260,17 @@ pip install kafka-python-ng
 python experiment.py
 ```
 
-The script runs five phases:
+The script runs six phases:
 
 1. Publishes the full lifecycle of 5 orders (created → paid → shipped → delivered, with one cancellation)
 2. Consumes all events and rebuilds current state via a CQRS projection
 3. Produces 5 more events while a consumer is "offline" and measures real consumer lag (committed offset vs. log end
-   offset)
+   offset), including a note on back-pressure from bounded-storage topics
 4. Simulates at-least-once delivery by re-feeding events twice, then shows how an idempotency check using event_id
    eliminates duplicates
 5. Replays all events from offset 0 with a fresh consumer group to show full state reconstruction
+6. Simulates the Transactional Outbox pattern: naive dual-write with injected crash (shows phantom DB state), then
+   outbox with relay crash (shows at-least-once re-publish and idempotent dedup)
 
 ### Break It
 
@@ -291,10 +312,13 @@ consumer.close()
 
 The state rebuild in Phase 2 shows that ORD-0003 ends up in `cancelled` status even though it was previously
 `delivered` — the last event wins in the projection. Phase 3 consumer lag shows the difference between committed offset
-and log end offset; the lag is exactly the number of events produced while the consumer was offline. Phase 4 shows that
+and log end offset; the lag is exactly the number of events produced while the consumer was offline. The output also
+distinguishes `group_exists=True/False` — a committed offset of 0 is ambiguous without this flag. Phase 4 shows that
 without an idempotency check, duplicate events inflate the event chain; with the check, duplicates are silently
 discarded and the state is identical. Phase 5 replay produces the exact same final state as Phase 2 — this is the core
-guarantee of event sourcing.
+guarantee of event sourcing. Phase 6 shows the dual-write problem concretely: the in-memory DB is updated but Kafka
+never receives the event after the simulated crash; the outbox scenario then shows that atomicity comes from the local
+DB transaction and that a relay crash causes at-most a duplicate publish, which the idempotency check handles cleanly.
 
 ### Teardown
 

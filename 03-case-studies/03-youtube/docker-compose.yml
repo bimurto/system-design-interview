@@ -9,10 +9,14 @@ services:
       - "9000:9000"
       - "9001:9001"
     healthcheck:
-      test: [ "CMD-SHELL", "mc ready local || curl -f http://localhost:9000/minio/health/live" ]
+      test: [ "CMD-SHELL", "curl -f http://localhost:9000/minio/health/live" ]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   db:
     image: postgres:15
@@ -20,19 +24,33 @@ services:
       POSTGRES_DB: youtube
       POSTGRES_USER: app
       POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U app -d youtube" ]
       interval: 5s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   cache:
     image: redis:7
+    # AOF persistence: flush to disk every second — lose at most 1s of view counts on crash
+    command: redis-server --appendonly yes --appendfsync everysec
+    ports:
+      - "6379:6379"
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 128m
 
   nginx:
     image: nginx:alpine
@@ -48,3 +66,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 64m

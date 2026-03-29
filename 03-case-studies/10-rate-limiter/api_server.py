@@ -120,7 +120,7 @@ def check_rate_limit(api_key: str) -> tuple[bool, int | None, int | None, int]:
     If Redis is unavailable: fail-open (allowed=True, count=None, limit=None).
     Automatically retries Redis connection on each call while unavailable.
     """
-    global REDIS_AVAILABLE
+    global REDIS_AVAILABLE, _redis_client, _lua_script
 
     limit, window = KEY_LIMITS.get(api_key, (DEFAULT_LIMIT, DEFAULT_WINDOW))
     now = int(time.time())
@@ -139,8 +139,13 @@ def check_rate_limit(api_key: str) -> tuple[bool, int | None, int | None, int]:
         reset_ts = (int(window_id) + 1) * int(win_size)
         return bool(int(allowed)), int(count), int(lim), reset_ts
     except Exception:
-        # Redis became unavailable mid-request: fail-open and mark for reconnect
+        # Redis became unavailable mid-request: fail-open and mark for reconnect.
+        # The 'global' declaration above is required here — without it, this
+        # assignment would silently create a local variable and leave the module
+        # global unchanged, causing the server to keep using a dead connection.
         REDIS_AVAILABLE = False
+        _redis_client = None
+        _lua_script = None
         return True, None, None, window_reset_ts
 
 

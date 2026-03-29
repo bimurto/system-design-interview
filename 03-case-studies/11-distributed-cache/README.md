@@ -286,6 +286,7 @@ python experiment.py
 
 # Or inside a container:
 docker run --rm --network 11-distributed-cache_default \
+  -v "$(pwd)/experiment.py:/experiment.py" \
   python:3.11-slim sh -c "pip install redis --quiet && python /experiment.py"
 ```
 

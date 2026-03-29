@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Security at Scale Lab — JWT auth, tampering, expiry, refresh token rotation,
-scope-based authz, token type confusion, and theft detection.
+scope-based authz, token type confusion, theft detection, and JTI denylist.
 
 What this demonstrates:
   1. Request without token → 401
@@ -11,10 +11,13 @@ What this demonstrates:
   5. Wait for token to expire (5s TTL) → 401
   6. Refresh token rotation: each use issues a NEW refresh token;
      replaying the old one triggers theft detection → all sessions revoked
-  7. Scope-based authorisation: user with read:data can access /scoped;
-     bob (user role) cannot access /admin-only
-  8. Logout: invalidate a token family; subsequent refresh → 401
-  9. Summary of all JWT security properties demonstrated
+  7. Scope-based authorisation: alice (write:data) can POST /data;
+     bob (missing write:data) is denied on POST /data → 403 [new];
+     bob (user role) cannot access /admin-only → 403
+  8. JTI denylist: revoke a still-valid access token by its jti;
+     subsequent requests with that token are rejected immediately → 401 [new]
+  9. Logout: invalidate a token family; subsequent refresh → 401
+  10. Summary of all JWT security properties demonstrated
 """
 
 import os
@@ -258,7 +261,7 @@ def main():
 
     # ── Phase 7: Scope-based authorisation ───────────────────────────────────
     section("Phase 7: Scope-Based Authorisation (Fine-Grained, Beyond Roles)")
-    print("  Accessing /scoped — requires scope 'read:data' in the token:\n")
+    print("  Accessing /scoped and POST /data — scope checks in action:\n")
 
     # Re-login alice to get a fresh token (previous one expired)
     r_alice2   = call("post", f"{AUTH}/token", "POST /token (alice, fresh)",
@@ -280,6 +283,16 @@ def main():
     call("get", f"{API}/admin-only", "GET /admin-only (bob, role=user) → 403  [role check]",
          headers={"Authorization": f"Bearer {bob2_tok}"})
 
+    # ── 7b: write:data scope — alice can write, bob cannot ───────────────────
+    print("\n  POST /data requires scope 'write:data':\n")
+    call("post", f"{API}/data", "POST /data (alice, has write:data)    → 201",
+         headers={"Authorization": f"Bearer {alice2_tok}"},
+         json={"record": "hello-world"})
+    call("post", f"{API}/data",
+         "POST /data (bob, MISSING write:data)  → 403  [scope-denied]",
+         headers={"Authorization": f"Bearer {bob2_tok}"},
+         json={"record": "hello-world"})
+
     print("""
   Roles vs. Scopes:
     Roles  ("admin", "user")         → coarse-grained, who you ARE
@@ -287,10 +300,51 @@ def main():
     In OAuth2, scopes are explicitly requested per-token and can be narrower
     than the user's full permissions. A CI/CD token might have only "read:data"
     even if the human has "admin:all". Principle of least privilege.
+
+  Bob's token is cryptographically valid and not expired, but the scope
+  check on POST /data rejects it — fine-grained ABAC beyond coarse RBAC.
 """)
 
-    # ── Phase 8: Logout ───────────────────────────────────────────────────────
-    section("Phase 8: Logout — Revoke Token Family")
+    # ── Phase 8: JTI Denylist — immediate access-token revocation ────────────
+    section("Phase 8: JTI Denylist — Revoke a Still-Valid Access Token")
+    print("  Getting a fresh alice token and revoking it by JTI before it expires:\n")
+
+    r_alice_jti   = call("post", f"{AUTH}/token", "POST /token (alice, fresh for JTI demo)",
+                          json={"username": "alice", "password": "password123"})
+    alice_jti_tok = r_alice_jti.json().get("access_token", "")
+    alice_jti_val = decode_jwt_payload(alice_jti_tok).get("jti", "")
+    print(f"\n  Token JTI: {alice_jti_val}\n")
+
+    call("get", f"{API}/protected", "GET /protected (token valid, not yet revoked) → 200",
+         headers={"Authorization": f"Bearer {alice_jti_tok}"})
+
+    # Revoke the JTI — simulates the auth service or admin learning the token was
+    # leaked (e.g., found in a log file, intercepted by a proxy)
+    call("post", f"{API}/revoke-jti", f"POST /revoke-jti (add jti='{alice_jti_val}' to denylist)",
+         json={"jti": alice_jti_val}, show_body=True)
+
+    call("get", f"{API}/protected",
+         "GET /protected (same token, jti now denylisted) → 401",
+         headers={"Authorization": f"Bearer {alice_jti_tok}"})
+
+    call("get", f"{API}/denylist-check", "GET /denylist-check (introspect denylist)",
+         show_body=True)
+
+    print("""
+  JTI denylist trade-off:
+    Benefit:  Immediate revocation of a specific compromised token without
+              waiting for its exp.  Finer-grained than logout (which revokes
+              the refresh family but leaves the access token alive until TTL).
+    Cost:     Every request now requires a denylist lookup (O(1) in Redis, but
+              still a network round-trip per request).  This sacrifices the
+              stateless advantage of JWTs.
+    Best practice: Use Redis SADD with EX = remaining token TTL so the entry
+              auto-expires and the denylist doesn't grow unboundedly.
+              In this lab: in-memory set (single replica, no expiry).
+""")
+
+    # ── Phase 9: Logout ───────────────────────────────────────────────────────
+    section("Phase 9: Logout — Revoke Token Family")
     print("  Logging alice out using her refresh token:\n")
 
     r_alice3    = call("post", f"{AUTH}/token", "POST /token (alice, fresh login)",

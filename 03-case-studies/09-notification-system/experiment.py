@@ -12,14 +12,15 @@ What this demonstrates:
   6. Fan-out simulation: celebrity post triggers 500 push notifications,
      with early preference suppression at produce time
   7. Scale math: capacity numbers for 1B notifications/day
-  8. DB summary: delivered count by channel in Postgres
+  8. Redis hands-on: user preferences and dedup keys in Redis
+  9. DB summary: delivered count by channel in Postgres
 
 Run:
-  docker compose up -d zookeeper kafka db
+  docker compose up -d zookeeper kafka db redis
   # Wait ~40s for Kafka to be healthy
-  docker compose run --rm --no-deps -e KAFKA_BOOTSTRAP=kafka:9092 workers
+  docker compose --profile experiment run --rm workers
   # Or locally:
-  pip install kafka-python-ng psycopg2-binary
+  pip install kafka-python-ng psycopg2-binary redis
   KAFKA_BOOTSTRAP=localhost:9092 python experiment.py
 """
 
@@ -32,12 +33,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 
 import psycopg2
+import redis as redis_lib
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
 
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://app:secret@localhost:5432/notifications")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 # Three priority tiers matching the README architecture
 TOPIC_TRANSACTIONAL = "notifications-transactional"
@@ -61,6 +64,10 @@ class Notification:
     idempotency_key: str
     priority: str = "normal"  # high | normal | low
     created_at: float = field(default_factory=time.time)
+    # expires_at is set by the producing service (e.g. Auth Service sets it to
+    # OTP TTL expiry). DLQ consumers must check this before re-delivering:
+    # a 30-minute-old OTP must be dropped, not resent.
+    expires_at: float = 0.0   # 0 = no expiry
 
     def to_json(self) -> bytes:
         return json.dumps(asdict(self)).encode()
@@ -68,6 +75,10 @@ class Notification:
     @classmethod
     def from_json(cls, data: bytes) -> "Notification":
         return cls(**json.loads(data))
+
+    def is_expired(self) -> bool:
+        """True if this notification has a TTL and that TTL has passed."""
+        return self.expires_at > 0 and time.time() > self.expires_at
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,6 +115,25 @@ def wait_for_postgres(dsn: str, max_wait: int = 60):
         except Exception:
             time.sleep(1)
     raise RuntimeError("Postgres not ready")
+
+
+def wait_for_redis(url: str, max_wait: int = 30):
+    """Wait until Redis is accepting connections before running the lab."""
+    print(f"  Waiting for Redis ...")
+    for i in range(max_wait):
+        try:
+            r = redis_lib.from_url(url)
+            r.ping()
+            r.close()
+            print(f"  Redis ready after {i + 1}s")
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("Redis not ready")
+
+
+def make_redis() -> redis_lib.Redis:
+    return redis_lib.from_url(REDIS_URL, decode_responses=True)
 
 
 def create_topics(bootstrap: str):
@@ -257,6 +287,11 @@ class DeliveryWorker:
     def process(self, notif: Notification):
         user_id = notif.user_id
         channel = notif.channel
+
+        # Drop expired notifications (e.g. OTP TTL passed while sitting in DLQ)
+        if notif.is_expired():
+            self.stats["expired"] += 1
+            return
 
         # Check user preferences
         if not is_channel_enabled(self.conn, user_id, channel):
@@ -488,7 +523,7 @@ def phase4_deduplication(conn):
     print(f"  DB entries for this key: {db_count} (should be 1)")
 
 
-def phase5_retry_backoff(conn):
+def phase5_retry_backoff(conn, dlq_producer: KafkaProducer):
     section("Phase 5: Retry with Exponential Backoff + DLQ")
 
     print("""
@@ -499,9 +534,11 @@ def phase5_retry_backoff(conn):
     attempt 1: fail → wait 50ms
     attempt 2: fail → wait 100ms
     attempt 3: success → mark delivered
-    If ID ends in '7' AND max_attempts is reduced to 2 → exhausted → DLQ
+    If delivery always fails → exhausted all retries → DLQ
 
   The DeliveryWorker handles all of this — same code path as Phase 2.
+  One case also exercises the expires_at field: a notification with a TTL
+  already in the past must be dropped immediately, not retried.
 """)
 
     # always_fail delivery function — injected via deliver_fn, no monkey-patching
@@ -509,21 +546,23 @@ def phase5_retry_backoff(conn):
         return DeliveryResult(False, "permanent_error")
 
     test_cases = [
-        # (notif_id, note, deliver_fn override or None)
-        ("retry-ok-7",   "ends in 7: 2 transient failures, succeeds on attempt 3", None),
-        ("retry-ok-1",   "normal:    succeeds immediately on attempt 1",            None),
-        ("retry-ok-17",  "ends in 7: 2 transient failures, succeeds on attempt 3", None),
-        ("retry-dlq-7x", "always fails: exhausts 3 retries → DLQ",                 always_fail),
+        # (notif_id, note, deliver_fn override or None, expires_at or 0)
+        ("retry-ok-7",   "ends in 7: 2 transient failures, succeeds on attempt 3", None,         0.0),
+        ("retry-ok-1",   "normal:    succeeds immediately on attempt 1",            None,         0.0),
+        ("retry-ok-17",  "ends in 7: 2 transient failures, succeeds on attempt 3", None,         0.0),
+        ("retry-dlq-7x", "always fails: exhausts 3 retries → DLQ (written to Kafka)", always_fail, 0.0),
+        ("retry-exp-1",  "expires_at in past: dropped immediately, never attempted", None,        time.time() - 5),
     ]
 
-    print(f"  {'Notification ID':<20} {'Delivered':>10}  {'Retried':>8}  {'DLQ':>5}  Note")
-    print(f"  {'-'*20}  {'-'*10}  {'-'*8}  {'-'*5}  {'-'*45}")
+    print(f"  {'Notification ID':<22} {'Delivered':>10}  {'Retried':>8}  {'DLQ':>5}  {'Expired':>7}  Note")
+    print(f"  {'-'*22}  {'-'*10}  {'-'*8}  {'-'*5}  {'-'*7}  {'-'*55}")
 
-    for notif_id, note, deliver_fn in test_cases:
+    for notif_id, note, deliver_fn, expires_at in test_cases:
         local_stats = defaultdict(int)
         worker = DeliveryWorker(
             f"retry-worker-{notif_id}", conn, local_stats,
             deliver_fn=deliver_fn,
+            dlq_producer=dlq_producer,
         )
         notif = Notification(
             notification_id=notif_id,
@@ -532,20 +571,31 @@ def phase5_retry_backoff(conn):
             type="transactional",
             message=f"Test retry for {notif_id}",
             idempotency_key=f"retry-phase5-{notif_id}-{uuid.uuid4()}",
+            expires_at=expires_at,
         )
         worker.process(notif)
-        print(f"  {notif_id:<20}  {local_stats['delivered']:>10}  "
-              f"{local_stats['retried']:>8}  {local_stats['dlq']:>5}  {note}")
+        print(f"  {notif_id:<22}  {local_stats['delivered']:>10}  "
+              f"{local_stats['retried']:>8}  {local_stats['dlq']:>5}  "
+              f"{local_stats['expired']:>7}  {note}")
+
+    # Verify the DLQ message actually made it to Kafka
+    dlq_producer.flush()
+    dlq_consumer = make_consumer([TOPIC_DLQ], f"lab-dlq-verify-{uuid.uuid4()}")
+    dlq_count = sum(1 for _ in dlq_consumer)
+    dlq_consumer.close()
+    print(f"\n  DLQ topic '{TOPIC_DLQ}' now holds {dlq_count} message(s)")
 
     print("""
   Dead Letter Queue (DLQ):
-  - Messages that exhaust all retries are produced to a 'notifications-dlq' Kafka topic
+  - Messages that exhaust all retries are produced to the 'notifications-dlq' Kafka topic
   - On-call engineers monitor DLQ consumer lag as an alerting signal
   - A spike in DLQ lag = systemic issue (APNs outage, expired credentials)
   - DLQ messages can be replayed from the beginning of the topic after a fix
-  - For transactional notifications (OTP), the system should also check whether
-    the OTP TTL has expired before re-delivering from the DLQ — a 30-min-delayed
-    password reset code should be dropped, not sent.
+  - Transactional notifications carry an expires_at timestamp. The DLQ consumer
+    must check: if time.time() > expires_at → drop the message instead of
+    re-delivering. A 30-minute-old OTP code is useless and misleading to the user.
+  - This is why expires_at must be set at event creation time by the producing
+    service (Auth Service, Payment Service), not by the delivery worker.
 """)
 
 
