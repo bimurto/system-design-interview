@@ -1,7 +1,7 @@
 # Databases — SQL vs NoSQL
 
-**Prerequisites:** `../07-load-balancing/`
-**Next:** `../09-indexes/`
+**Prerequisites:** [Load Balancing](../07-load-balancing/README.md)
+**Next:** [Indexes](../09-indexes/README.md)
 
 ---
 
@@ -320,3 +320,9 @@ docker compose down -v
 - **High Cassandra delete rates without TTL.** Deletes in Cassandra write tombstone markers that accumulate until
   compaction. A table with high delete rates will see read latency spike as scans must process millions of tombstones.
   Use TTL (`INSERT INTO ... USING TTL 86400`) for time-bounded data instead of explicit deletes.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Load Balancing](../07-load-balancing/README.md)
+**Next:** [Indexes](../09-indexes/README.md)

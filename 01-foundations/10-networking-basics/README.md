@@ -349,3 +349,9 @@ docker compose down -v
 - **Setting DNS TTL too high in production** — a TTL of 3600s means clients cache your IP for an hour. During an
   incident requiring an IP change (DDoS mitigation, region failover), traffic will continue hitting the old address for
   up to that TTL duration. Keep TTL at 60–300s for production-critical records.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [09 — Indexes](../09-indexes/)
+**Next:** [11 — API Design](../11-api-design/)

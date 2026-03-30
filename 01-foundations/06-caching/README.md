@@ -1,7 +1,7 @@
 # Caching
 
-**Prerequisites:** `../05-partitioning-sharding/`
-**Next:** `../07-load-balancing/`
+**Prerequisites:** [Partitioning & Sharding](../05-partitioning-sharding/README.md)
+**Next:** [Load Balancing](../07-load-balancing/README.md)
 
 ---
 
@@ -268,3 +268,9 @@ docker compose down -v
 - **Using the database as a cache.** Selecting data into a Redis set/hash and then running queries against it
   re-implements what a database already does, without the query planner, indexes, or ACID guarantees. Use Redis for
   simple key-value lookups; use the DB for complex queries.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Partitioning & Sharding](../05-partitioning-sharding/README.md)
+**Next:** [Load Balancing](../07-load-balancing/README.md)

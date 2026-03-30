@@ -471,3 +471,9 @@ docker compose down -v
 - **Accumulating millions of small files in streaming pipelines** — Kinesis Firehose and similar services write many
   small objects. Querying millions of 1MB files in Athena is orders of magnitude slower than querying thousands of 1GB
   files. Schedule periodic compaction jobs (Glue, Spark) to merge small files into large Parquet files.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [11 — API Design](../11-api-design/)
+**Next:** [02-advanced — Consistent Hashing](../../02-advanced/01-consistent-hashing/)

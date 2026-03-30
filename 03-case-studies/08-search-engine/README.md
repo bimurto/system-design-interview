@@ -1,6 +1,6 @@
 # Case Study: Search Engine
 
-**Prerequisites:** `../../02-advanced/08-search-systems/`, `../../01-foundations/09-indexes/`
+**Prerequisites:** `../../02-advanced/08-search-systems/`, [Indexes](../../01-foundations/09-indexes/README.md)
 
 ---
 
@@ -607,3 +607,8 @@ docker compose down -v
     benefit from clustering-aware sharding — documents with similar embeddings on the same shard improve intra-shard
     recall so fewer shards need to be queried per request. The operational complexity is the main reason most FAANG
     systems start with BM25 and layer vector retrieval on top as a re-ranking signal rather than a primary retriever.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../../02-advanced/08-search-systems/`, [Indexes](../../01-foundations/09-indexes/README.md)

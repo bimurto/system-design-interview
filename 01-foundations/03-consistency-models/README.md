@@ -1,7 +1,7 @@
 # Consistency Models
 
-**Prerequisites:** `../02-cap-theorem/`
-**Next:** `../04-replication/`
+**Prerequisites:** [CAP Theorem](../02-cap-theorem/README.md)
+**Next:** [Replication](../04-replication/README.md)
 
 ---
 
@@ -302,3 +302,9 @@ docker compose down -v
 - **Confusing causal consistency with read-your-writes.** Read-your-writes is a single-client guarantee about that
   client's own writes. Causal consistency is a multi-client guarantee about the ordering of causally related operations
   from different clients. They address different problems.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [CAP Theorem](../02-cap-theorem/README.md)
+**Next:** [Replication](../04-replication/README.md)

@@ -1,7 +1,7 @@
 # Security at Scale
 
 **Prerequisites:** `../11-observability/`
-**Next:** `../14-service-discovery-coordination/`
+**Next:** [Service Discovery & Coordination](../14-service-discovery-coordination/README.md)
 
 ---
 
@@ -368,3 +368,9 @@ docker compose down
   metadata endpoint can steal cloud credentials and escalate to full account access. Fix: block outbound traffic to
   `169.254.169.254` at the host firewall or security-group level; prefer IMDSv2 (token-gated, PUT-then-GET) on AWS,
   which is harder to exploit via SSRF.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../11-observability/`
+**Next:** [Service Discovery & Coordination](../14-service-discovery-coordination/README.md)

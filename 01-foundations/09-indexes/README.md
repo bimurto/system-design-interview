@@ -1,7 +1,7 @@
 # Indexes
 
-**Prerequisites:** `../08-databases-sql-vs-nosql/`
-**Next:** `../10-networking-basics/`
+**Prerequisites:** [Databases — SQL vs NoSQL](../08-databases-sql-vs-nosql/README.md)
+**Next:** [10 — Networking Basics](../10-networking-basics/README.md)
 
 ---
 
@@ -345,3 +345,9 @@ docker compose down -v
 - **Ignoring index bloat on high-churn tables.** Tables with frequent UPDATEs or DELETEs accumulate dead index entries.
   A bloated index is larger and slower than a compact one. Schedule regular VACUUM or use autovacuum tuning for
   high-churn tables.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Databases — SQL vs NoSQL](../08-databases-sql-vs-nosql/README.md)
+**Next:** [10 — Networking Basics](../10-networking-basics/README.md)

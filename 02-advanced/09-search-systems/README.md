@@ -1,7 +1,7 @@
 # Search Systems
 
 **Prerequisites:** `../07-distributed-caching/`
-**Next:** `../10-rate-limiting-algorithms/`
+**Next:** [Rate Limiting Algorithms](../10-rate-limiting-algorithms/README.md)
 
 ---
 
@@ -457,3 +457,9 @@ docker compose down -v
   without full reindexing. Start with a shard count based on expected data volume (target 10–50GB per shard). If you
   under-shard a fast-growing index, you will be forced into an expensive reindex operation under load. Use index
   aliases + reindex to migrate without downtime.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../07-distributed-caching/`
+**Next:** [Rate Limiting Algorithms](../10-rate-limiting-algorithms/README.md)

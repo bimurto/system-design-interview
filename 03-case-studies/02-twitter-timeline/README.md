@@ -1,6 +1,7 @@
 # Case Study: Twitter Timeline
 
-**Prerequisites:** `../../01-foundations/04-replication/`, `../../01-foundations/06-caching/`,
+**Prerequisites:
+** [Replication](../../01-foundations/04-replication/README.md), [Caching](../../01-foundations/06-caching/README.md),
 `../../02-advanced/05-message-queues-kafka/`, `../../02-advanced/07-distributed-caching/`
 
 ---
@@ -453,3 +454,10 @@ docker compose down -v
     `ZREM timeline:{follower_id} {tweet_id}` for all followers — same fan-out cost as posting. Twitter chose the
     soft-delete approach: deleted tweets are hidden at hydration time rather than eagerly removed from 100M Redis sorted
     sets. The Redis entries naturally expire when the sorted set is trimmed or the key TTLs.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Replication](../../01-foundations/04-replication/README.md), [Caching](../../01-foundations/06-caching/README.md),
+`../../02-advanced/05-message-queues-kafka/`, `../../02-advanced/07-distributed-caching/`

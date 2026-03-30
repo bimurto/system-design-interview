@@ -570,3 +570,15 @@ docker compose down -v
     enforcement
     where exact counting is required. For billing-grade accuracy across regions, you need async event streaming
     (Kafka/Kinesis) with a global aggregator — at the cost of eventual consistency and higher system complexity.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../../02-advanced/09-rate-limiting-algorithms/`, `../../02-advanced/07-distributed-caching/`
+
+**Interview time budget:** ~45 minutes total
+
+- Clarify Requirements: 3–5 min
+- Capacity Estimation: 3–5 min
+- High-Level Design: 10 min
+- Deep Dive: 15–20 min

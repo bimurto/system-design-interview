@@ -63,53 +63,53 @@ docker compose down -v
 
 Work through all 39 topics in sequence. Earlier topics build vocabulary and intuition that later topics depend on.
 
-| #  | Topic                         | Section      | Est. Time | Key Concept                                           |
-|----|-------------------------------|--------------|-----------|-------------------------------------------------------|
-| 1  | Scalability                   | Foundations  | 45 min    | Horizontal vs vertical scaling                        |
-| 2  | CAP Theorem                   | Foundations  | 45 min    | Consistency vs availability trade-off                 |
-| 3  | Consistency Models            | Foundations  | 45 min    | Strong, eventual, causal consistency                  |
-| 4  | Replication                   | Foundations  | 45 min    | Leader-follower, sync vs async                        |
-| 5  | Partitioning & Sharding       | Foundations  | 45 min    | Hash vs range partitioning                            |
-| 6  | Caching                       | Foundations  | 45 min    | Cache-aside, write-through, eviction                  |
-| 7  | Load Balancing                | Foundations  | 45 min    | Round-robin, least-connections, health checks         |
-| 8  | Databases: SQL vs NoSQL       | Foundations  | 45 min    | ACID vs BASE, when to use which                       |
-| 9  | Indexes                       | Foundations  | 45 min    | B-tree, composite, covering indexes                   |
-| 10 | Networking Basics             | Foundations  | 45 min    | TCP, HTTP versions, latency numbers                   |
-| 11 | API Design                    | Foundations  | 45 min    | REST, GraphQL, gRPC trade-offs                        |
-| 12 | Blob/Object Storage           | Foundations  | 45 min    | S3 model, multipart upload, CDN                       |
-| 13 | Proxies & Reverse Proxies     | Foundations  | 45 min    | Reverse proxy, SSL termination, API gateway           |
-| 14 | Failure Modes & Reliability   | Foundations  | 45 min    | Timeouts, retries, circuit breaker, cascading failure |
-| 15 | Consistent Hashing            | Advanced     | 60 min    | Hash ring, virtual nodes                              |
-| 16 | Distributed Transactions      | Advanced     | 60 min    | 2PC, Saga pattern                                     |
-| 17 | Consensus: Paxos & Raft       | Advanced     | 60 min    | Leader election, log replication                      |
-| 18 | Event-Driven Architecture     | Advanced     | 60 min    | Event sourcing, CQRS                                  |
-| 19 | Message Queues — Fundamentals | Advanced     | 60 min    | At-least-once, DLQ, competing consumers, pub/sub      |
-| 20 | Message Queues & Kafka        | Advanced     | 60 min    | Partitions, consumer groups, log retention            |
-| 21 | Stream Processing             | Advanced     | 60 min    | Windowing, watermarks                                 |
-| 22 | Distributed Caching           | Advanced     | 60 min    | Redis Cluster, hash slots                             |
-| 23 | Search Systems                | Advanced     | 60 min    | Inverted index, BM25, Elasticsearch                   |
-| 24 | Rate Limiting Algorithms      | Advanced     | 45 min    | Token bucket, sliding window                          |
-| 25 | CDN & Edge                    | Advanced     | 45 min    | Cache-control, origin pull                            |
-| 26 | Observability                 | Advanced     | 60 min    | Metrics, traces, logs, SLO                            |
-| 27 | Security at Scale             | Advanced     | 45 min    | JWT, OAuth2, HTTPS                                    |
-| 28 | Service Discovery             | Advanced     | 60 min    | etcd, Consul, leader election                         |
-| 29 | Idempotency & Exactly-Once    | Advanced     | 60 min    | Idempotency keys, Kafka transactions                  |
-| 30 | Probabilistic Data Structures | Advanced     | 60 min    | Bloom filter, HyperLogLog                             |
-| 31 | Database Internals            | Advanced     | 60 min    | B-tree, LSM-tree, WAL, MVCC                           |
-| 32 | Backpressure & Flow Control   | Advanced     | 60 min    | Queue depth, drop, reject, load shedding              |
-| 33 | Multi-Region Architecture     | Advanced     | 60 min    | Active-active, conflict resolution, failover          |
-| 34 | URL Shortener                 | Case Studies | 90 min    | ID generation, redirect caching                       |
-| 35 | Twitter Timeline              | Case Studies | 90 min    | Fan-out on write vs read                              |
-| 36 | YouTube                       | Case Studies | 90 min    | Video pipeline, adaptive bitrate                      |
-| 37 | Uber                          | Case Studies | 90 min    | Geo-indexing, real-time matching                      |
-| 38 | WhatsApp                      | Case Studies | 90 min    | Message delivery guarantees                           |
-| 39 | Google Drive                  | Case Studies | 90 min    | Delta sync, deduplication                             |
-| 40 | Web Crawler                   | Case Studies | 90 min    | URL frontier, politeness                              |
-| 41 | Search Engine                 | Case Studies | 90 min    | Inverted index, ranking pipeline                      |
-| 42 | Notification System           | Case Studies | 90 min    | Multi-channel fan-out                                 |
-| 43 | Distributed Rate Limiter      | Case Studies | 90 min    | Redis-backed enforcement                              |
-| 44 | Distributed Cache             | Case Studies | 90 min    | Redis internals, eviction                             |
-| 45 | Payment System                | Case Studies | 90 min    | Idempotency, double-entry ledger                      |
+| #  | Topic                                                                                   | Section      | Est. Time | Key Concept                                           |
+|----|-----------------------------------------------------------------------------------------|--------------|-----------|-------------------------------------------------------|
+| 1  | [Scalability](01-foundations/01-scalability/README.md)                                  | Foundations  | 45 min    | Horizontal vs vertical scaling                        |
+| 2  | [CAP Theorem](01-foundations/02-cap-theorem/README.md)                                  | Foundations  | 45 min    | Consistency vs availability trade-off                 |
+| 3  | [Consistency Models](01-foundations/03-consistency-models/README.md)                    | Foundations  | 45 min    | Strong, eventual, causal consistency                  |
+| 4  | [Replication](01-foundations/04-replication/README.md)                                  | Foundations  | 45 min    | Leader-follower, sync vs async                        |
+| 5  | [Partitioning & Sharding](01-foundations/05-partitioning-sharding/README.md)            | Foundations  | 45 min    | Hash vs range partitioning                            |
+| 6  | [Caching](01-foundations/06-caching/README.md)                                          | Foundations  | 45 min    | Cache-aside, write-through, eviction                  |
+| 7  | [Load Balancing](01-foundations/07-load-balancing/README.md)                            | Foundations  | 45 min    | Round-robin, least-connections, health checks         |
+| 8  | [Databases: SQL vs NoSQL](01-foundations/08-databases-sql-vs-nosql/README.md)           | Foundations  | 45 min    | ACID vs BASE, when to use which                       |
+| 9  | [Indexes](01-foundations/09-indexes/README.md)                                          | Foundations  | 45 min    | B-tree, composite, covering indexes                   |
+| 10 | [Networking Basics](01-foundations/10-networking-basics/README.md)                      | Foundations  | 45 min    | TCP, HTTP versions, latency numbers                   |
+| 11 | [API Design](01-foundations/11-api-design/README.md)                                    | Foundations  | 45 min    | REST, GraphQL, gRPC trade-offs                        |
+| 12 | [Blob/Object Storage](01-foundations/12-blob-object-storage/README.md)                  | Foundations  | 45 min    | S3 model, multipart upload, CDN                       |
+| 13 | [Proxies & Reverse Proxies](01-foundations/13-proxies-reverse-proxies/README.md)        | Foundations  | 45 min    | Reverse proxy, SSL termination, API gateway           |
+| 14 | [Failure Modes & Reliability](01-foundations/14-failure-modes-reliability/README.md)    | Foundations  | 45 min    | Timeouts, retries, circuit breaker, cascading failure |
+| 15 | [Consistent Hashing](02-advanced/01-consistent-hashing/README.md)                       | Advanced     | 60 min    | Hash ring, virtual nodes                              |
+| 16 | [Distributed Transactions](02-advanced/02-distributed-transactions/README.md)           | Advanced     | 60 min    | 2PC, Saga pattern                                     |
+| 17 | [Consensus: Paxos & Raft](02-advanced/03-consensus-paxos-raft/README.md)                | Advanced     | 60 min    | Leader election, log replication                      |
+| 18 | [Event-Driven Architecture](02-advanced/04-event-driven-architecture/README.md)         | Advanced     | 60 min    | Event sourcing, CQRS                                  |
+| 19 | [Message Queues — Fundamentals](02-advanced/05-message-queues-fundamentals/README.md)   | Advanced     | 60 min    | At-least-once, DLQ, competing consumers, pub/sub      |
+| 20 | [Message Queues & Kafka](02-advanced/06-message-queues-kafka/README.md)                 | Advanced     | 60 min    | Partitions, consumer groups, log retention            |
+| 21 | [Stream Processing](02-advanced/07-stream-processing/README.md)                         | Advanced     | 60 min    | Windowing, watermarks                                 |
+| 22 | [Distributed Caching](02-advanced/08-distributed-caching/README.md)                     | Advanced     | 60 min    | Redis Cluster, hash slots                             |
+| 23 | [Search Systems](02-advanced/09-search-systems/README.md)                               | Advanced     | 60 min    | Inverted index, BM25, Elasticsearch                   |
+| 24 | [Rate Limiting Algorithms](02-advanced/10-rate-limiting-algorithms/README.md)           | Advanced     | 45 min    | Token bucket, sliding window                          |
+| 25 | [CDN & Edge](02-advanced/11-cdn-and-edge/README.md)                                     | Advanced     | 45 min    | Cache-control, origin pull                            |
+| 26 | [Observability](02-advanced/12-observability/README.md)                                 | Advanced     | 60 min    | Metrics, traces, logs, SLO                            |
+| 27 | [Security at Scale](02-advanced/13-security-at-scale/README.md)                         | Advanced     | 45 min    | JWT, OAuth2, HTTPS                                    |
+| 28 | [Service Discovery](02-advanced/14-service-discovery-coordination/README.md)            | Advanced     | 60 min    | etcd, Consul, leader election                         |
+| 29 | [Idempotency & Exactly-Once](02-advanced/15-idempotency-exactly-once/README.md)         | Advanced     | 60 min    | Idempotency keys, Kafka transactions                  |
+| 30 | [Probabilistic Data Structures](02-advanced/16-probabilistic-data-structures/README.md) | Advanced     | 60 min    | Bloom filter, HyperLogLog                             |
+| 31 | [Database Internals](02-advanced/17-database-internals/README.md)                       | Advanced     | 60 min    | B-tree, LSM-tree, WAL, MVCC                           |
+| 32 | [Backpressure & Flow Control](02-advanced/18-backpressure-flow-control/README.md)       | Advanced     | 60 min    | Queue depth, drop, reject, load shedding              |
+| 33 | [Multi-Region Architecture](02-advanced/19-multi-region-architecture/README.md)         | Advanced     | 60 min    | Active-active, conflict resolution, failover          |
+| 34 | [URL Shortener](03-case-studies/01-url-shortener/README.md)                             | Case Studies | 90 min    | ID generation, redirect caching                       |
+| 35 | [Twitter Timeline](03-case-studies/02-twitter-timeline/README.md)                       | Case Studies | 90 min    | Fan-out on write vs read                              |
+| 36 | [YouTube](03-case-studies/03-youtube/README.md)                                         | Case Studies | 90 min    | Video pipeline, adaptive bitrate                      |
+| 37 | [Uber](03-case-studies/04-uber/README.md)                                               | Case Studies | 90 min    | Geo-indexing, real-time matching                      |
+| 38 | [WhatsApp](03-case-studies/05-whatsapp/README.md)                                       | Case Studies | 90 min    | Message delivery guarantees                           |
+| 39 | [Google Drive](03-case-studies/06-google-drive/README.md)                               | Case Studies | 90 min    | Delta sync, deduplication                             |
+| 40 | [Web Crawler](03-case-studies/07-web-crawler/README.md)                                 | Case Studies | 90 min    | URL frontier, politeness                              |
+| 41 | [Search Engine](03-case-studies/08-search-engine/README.md)                             | Case Studies | 90 min    | Inverted index, ranking pipeline                      |
+| 42 | [Notification System](03-case-studies/09-notification-system/README.md)                 | Case Studies | 90 min    | Multi-channel fan-out                                 |
+| 43 | [Distributed Rate Limiter](03-case-studies/10-rate-limiter/README.md)                   | Case Studies | 90 min    | Redis-backed enforcement                              |
+| 44 | [Distributed Cache](03-case-studies/11-distributed-cache/README.md)                     | Case Studies | 90 min    | Redis internals, eviction                             |
+| 45 | [Payment System](03-case-studies/12-payment-system/README.md)                           | Case Studies | 90 min    | Idempotency, double-entry ledger                      |
 
 **Total estimated time:** ~46 hours of focused study across all topics.
 

@@ -1,6 +1,7 @@
 # Case Study: Google Drive
 
-**Prerequisites:** `../../01-foundations/12-blob-object-storage/`, `../../01-foundations/04-replication/`,
+**Prerequisites:
+** [12 — Blob / Object Storage](../../01-foundations/12-blob-object-storage/README.md), [Replication](../../01-foundations/04-replication/README.md),
 `../../02-advanced/14-idempotency-exactly-once/`
 
 ---
@@ -427,3 +428,10 @@ docker compose down -v
     flight — synchronous deletion would cause that upload to succeed at the DB level but point to a missing object. The
     async GC job runs after a quiescence window (e.g., 1 hour), by which time any in-flight uploads using the same hash
     have either completed (and incremented ref_count above 0) or failed.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [12 — Blob / Object Storage](../../01-foundations/12-blob-object-storage/README.md), [Replication](../../01-foundations/04-replication/README.md),
+`../../02-advanced/14-idempotency-exactly-once/`

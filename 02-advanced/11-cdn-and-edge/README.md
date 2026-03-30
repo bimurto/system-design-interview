@@ -1,7 +1,7 @@
 # CDN & Edge
 
 **Prerequisites:** `../09-rate-limiting-algorithms/`
-**Next:** `../12-observability/`
+**Next:** [Observability](../12-observability/README.md)
 
 ---
 
@@ -287,3 +287,9 @@ docker compose down
 - **Over-relying on CDN purge APIs for deployment.** Purge APIs have eventual consistency — propagation across all PoPs
   can take 10-60 seconds. If your deploy process relies on instant purge, some users will see old content during the
   propagation window. URL versioning eliminates this risk entirely.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../09-rate-limiting-algorithms/`
+**Next:** [Observability](../12-observability/README.md)

@@ -1,7 +1,7 @@
 # Consistent Hashing
 
-**Prerequisites:** `../../01-foundations/05-partitioning-sharding/`
-**Next:** `../02-distributed-transactions/`
+**Prerequisites:** [Partitioning & Sharding](../../01-foundations/05-partitioning-sharding/README.md)
+**Next:** [Distributed Transactions](../02-distributed-transactions/README.md)
 
 ---
 
@@ -299,3 +299,9 @@ docker compose down
 - **Treating replication as automatic.** `get_nodes(key, N)` tells you which N nodes *should* hold the key. The actual
   replication protocol (quorum writes, read repair, anti-entropy) must be implemented separately. Consistent hashing is
   only the routing layer.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Partitioning & Sharding](../../01-foundations/05-partitioning-sharding/README.md)
+**Next:** [Distributed Transactions](../02-distributed-transactions/README.md)

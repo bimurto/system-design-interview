@@ -1,7 +1,9 @@
 # Case Study: YouTube
 
-**Prerequisites:** `../../01-foundations/06-caching/`, `../../01-foundations/10-networking-basics/`,
-`../../01-foundations/12-blob-object-storage/`, `../../02-advanced/10-cdn-and-edge/`
+**Prerequisites:
+** [Caching](../../01-foundations/06-caching/README.md), [10 — Networking Basics](../../01-foundations/10-networking-basics/README.md),
+[12 — Blob / Object Storage](../../01-foundations/12-blob-object-storage/README.md),
+`../../02-advanced/10-cdn-and-edge/`
 
 ---
 
@@ -486,3 +488,11 @@ docker compose down -v
     bandwidth, selects quality variant, fetches segment manifest. (9) Player downloads first segments, buffers, starts
     playback. (10) Seek: player computes segment index from manifest timestamp, issues byte-range GET for that segment
     only.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Caching](../../01-foundations/06-caching/README.md), [10 — Networking Basics](../../01-foundations/10-networking-basics/README.md),
+[12 — Blob / Object Storage](../../01-foundations/12-blob-object-storage/README.md),
+`../../02-advanced/10-cdn-and-edge/`

@@ -1,7 +1,8 @@
 # Case Study: Payment System
 
-**Prerequisites:** `../../02-advanced/02-distributed-transactions/`, `../../02-advanced/14-idempotency-exactly-once/`,
-`../../01-foundations/08-databases-sql-vs-nosql/`
+**Prerequisites:
+** [Distributed Transactions](../../02-advanced/02-distributed-transactions/README.md), [Idempotency & Exactly-Once](../../02-advanced/15-idempotency-exactly-once/README.md),
+[Databases — SQL vs NoSQL](../../01-foundations/08-databases-sql-vs-nosql/README.md)
 
 ---
 
@@ -638,3 +639,10 @@ docker compose down -v
     same ACID transaction, no concurrent request can see the old `completed` status after the commit. The refund's own
     idempotency_key provides safe retry semantics: a retry of the exact same refund returns the original refund result
     without re-applying the reversal.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Distributed Transactions](../../02-advanced/02-distributed-transactions/README.md), [Idempotency & Exactly-Once](../../02-advanced/15-idempotency-exactly-once/README.md),
+[Databases — SQL vs NoSQL](../../01-foundations/08-databases-sql-vs-nosql/README.md)

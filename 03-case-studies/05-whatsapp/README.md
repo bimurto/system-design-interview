@@ -1,6 +1,7 @@
 # Case Study: WhatsApp
 
-**Prerequisites:** `../../01-foundations/04-replication/`, `../../02-advanced/04-event-driven-architecture/`,
+**Prerequisites:
+** [Replication](../../01-foundations/04-replication/README.md), [Event-Driven Architecture](../../02-advanced/04-event-driven-architecture/README.md),
 `../../02-advanced/14-idempotency-exactly-once/`
 
 ---
@@ -127,7 +128,8 @@ correct server. Simple but adds a network hop and creates a bottleneck.
 
 **Consistent hashing:** assign users to servers deterministically by `hash(user_id) % ring`. Any server can route a
 message to user A's server without a directory lookup. When a server is added/removed, only a fraction of users are
-remapped (graceful via consistent hashing properties — see `../../02-advanced/01-consistent-hashing/`).
+remapped (graceful via consistent hashing properties —
+see [Consistent Hashing](../../02-advanced/01-consistent-hashing/README.md)).
 
 **Redis pub/sub as the routing layer (this lab):** each chat server subscribes to Redis channels for the users it
 currently hosts. Simpler to implement but adds latency (Redis hop) for cross-server messages. Works well at moderate
@@ -490,3 +492,10 @@ docker compose down -v
     `SELECT * FROM messages WHERE recipient='bob' AND status='sent'`. (7) Server delivers ciphertext to Bob's device. (
     8) Bob's app decrypts with his private key. (9) Server updates status='delivered', sends ACK2 to Alice. (10) Bob
        opens chat → app sends read event → ACK3 to Alice.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Replication](../../01-foundations/04-replication/README.md), [Event-Driven Architecture](../../02-advanced/04-event-driven-architecture/README.md),
+`../../02-advanced/14-idempotency-exactly-once/`

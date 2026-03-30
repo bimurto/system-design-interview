@@ -1,7 +1,7 @@
 # Probabilistic Data Structures
 
 **Prerequisites:** `../14-idempotency-exactly-once/`
-**Next:** `../../03-case-studies/01-url-shortener/`
+**Next:** [URL Shortener](../../03-case-studies/01-url-shortener/README.md)
 
 ---
 
@@ -387,3 +387,9 @@ docker compose down
   double-hashing approximation, not k provably independent hash functions. For non-adversarial inputs this is fine in
   practice, and the FPR math holds empirically. For adversarial inputs (security-sensitive contexts), use multiple
   unrelated hash families (SHA-256, FNV-1a, xxHash) to prevent an attacker from crafting targeted false positives.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../14-idempotency-exactly-once/`
+**Next:** [URL Shortener](../../03-case-studies/01-url-shortener/README.md)

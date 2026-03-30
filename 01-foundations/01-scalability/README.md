@@ -1,7 +1,7 @@
 # Scalability
 
 **Prerequisites:** none (this is the first topic)
-**Next:** `../02-cap-theorem/`
+**Next:** [CAP Theorem](../02-cap-theorem/README.md)
 
 ---
 
@@ -263,3 +263,9 @@ docker compose down -v
   in-flight requests. Always configure a drain timeout and verify it covers your p99 request latency.
 - **Choosing the wrong health check model.** Using passive health checks in latency-sensitive systems means one client
   absorbs each backend failure. For user-facing APIs, use active probes so failures are detected proactively.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** none (this is the first topic)
+**Next:** [CAP Theorem](../02-cap-theorem/README.md)

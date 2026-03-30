@@ -1,7 +1,7 @@
 # Proxies & Reverse Proxies
 
-**Prerequisites:** `../11-api-design/`
-**Next:** `../14-failure-modes-reliability/`
+**Prerequisites:** [11 — API Design](../11-api-design/README.md)
+**Next:** [Failure Modes & Reliability Patterns](../14-failure-modes-reliability/README.md)
 
 ---
 
@@ -285,3 +285,9 @@ docker compose down -v
 - **Using IP hash with scaling events.** Adding or removing a backend changes the hash ring and redistributes all
   sessions. If the backend holds session state, users are logged out. Move session state to an external store (Redis)
   before enabling IP hash.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [11 — API Design](../11-api-design/README.md)
+**Next:** [Failure Modes & Reliability Patterns](../14-failure-modes-reliability/README.md)

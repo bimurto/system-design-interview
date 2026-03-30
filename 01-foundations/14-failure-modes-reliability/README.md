@@ -1,7 +1,7 @@
 # Failure Modes & Reliability Patterns
 
-**Prerequisites:** `../13-proxies-reverse-proxies/`
-**Next:** `../../02-advanced/01-consistent-hashing/`
+**Prerequisites:** [Proxies & Reverse Proxies](../13-proxies-reverse-proxies/README.md)
+**Next:** [Consistent Hashing](../../02-advanced/01-consistent-hashing/README.md)
 
 ---
 
@@ -302,3 +302,9 @@ docker compose down -v
   SLA. Pass the remaining deadline budget downstream; gRPC does this automatically.
 - **No dead letter queue in async pipelines.** A single malformed message (poison pill) that consistently fails
   processing will block the consumer and halt the entire queue unless you implement DLQ routing after N failures.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Proxies & Reverse Proxies](../13-proxies-reverse-proxies/README.md)
+**Next:** [Consistent Hashing](../../02-advanced/01-consistent-hashing/README.md)

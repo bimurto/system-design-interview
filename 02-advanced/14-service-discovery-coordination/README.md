@@ -302,3 +302,9 @@ docker compose down
   service crashing and all clients removing it from their routing tables. Clients must be built to retry on failure and
   handle 503s gracefully — the registry is eventually consistent from the client's perspective even when the registry
   itself is strongly consistent.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../12-security-at-scale/`
+**Next:** `../14-idempotency-exactly-once/`

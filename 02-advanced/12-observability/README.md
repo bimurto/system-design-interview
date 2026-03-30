@@ -1,7 +1,7 @@
 # Observability
 
 **Prerequisites:** `../10-cdn-and-edge/`
-**Next:** `../13-security-at-scale/`
+**Next:** [Security at Scale](../13-security-at-scale/README.md)
 
 ---
 
@@ -432,3 +432,9 @@ docker compose down
   evaluated by every panel and alert simultaneously. Without recording rules, a busy Grafana deployment can bring
   Prometheus to its knees. Pre-compute all SLO-relevant queries as recording rules; dashboards reference the
   pre-computed series.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../10-cdn-and-edge/`
+**Next:** [Security at Scale](../13-security-at-scale/README.md)

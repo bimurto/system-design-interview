@@ -1,6 +1,6 @@
 # Event-Driven Architecture
 
-**Prerequisites:** `../03-consensus-paxos-raft/`
+**Prerequisites:** [Consensus — Paxos & Raft](../03-consensus-paxos-raft/README.md)
 **Next:** `../05-message-queues-kafka/`
 
 ---
@@ -365,3 +365,9 @@ docker compose down -v
   of events. Replaying all of them on every command is O(n) and gets worse over time. In production, persist a snapshot
   of the aggregate state every N events and replay only from the last snapshot. Snapshots are an optimisation, not a
   source of truth — the event log remains the ground truth.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Consensus — Paxos & Raft](../03-consensus-paxos-raft/README.md)
+**Next:** `../05-message-queues-kafka/`

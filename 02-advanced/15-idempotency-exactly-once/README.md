@@ -329,3 +329,9 @@ docker compose down
 - **Setting the deduplication window shorter than the retry timeout.** If clients retry for up to 30 minutes with
   exponential back-off, but you only store keys for 10 minutes, a late retry after 15 minutes re-executes the operation.
   The deduplication window must be longer than the maximum possible retry duration.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../13-service-discovery-coordination/`
+**Next:** `../15-probabilistic-data-structures/`

@@ -1,7 +1,8 @@
 # Database Internals
 
-**Prerequisites:** `../../01-foundations/08-databases-sql-vs-nosql/`, `../../01-foundations/09-indexes/`
-**Next:** `../18-backpressure-flow-control/`
+**Prerequisites:
+** [Databases — SQL vs NoSQL](../../01-foundations/08-databases-sql-vs-nosql/README.md), [Indexes](../../01-foundations/09-indexes/README.md)
+**Next:** [Backpressure & Flow Control](../18-backpressure-flow-control/README.md)
 
 ---
 
@@ -204,3 +205,10 @@ docker compose down -v
   ```
   Alert when `xid_age > 1.5 billion`. Autovacuum triggers a freeze pass at `autovacuum_freeze_max_age` (default 200M).
   For write-heavy databases, tune this lower and ensure autovacuum is not blocked by long-running transactions.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Databases — SQL vs NoSQL](../../01-foundations/08-databases-sql-vs-nosql/README.md), [Indexes](../../01-foundations/09-indexes/README.md)
+**Next:** [Backpressure & Flow Control](../18-backpressure-flow-control/README.md)

@@ -371,3 +371,9 @@ docker compose down -v
 - **Exposing internal database IDs in URLs** — `/users/12345` leaks your primary key sequence (competitors can enumerate
   your user count), complicates database migrations (changing ID type or sharding strategy requires URL changes), and
   creates a coupling between your storage layer and your API contract.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [10 — Networking Basics](../10-networking-basics/)
+**Next:** [12 — Blob/Object Storage](../12-blob-object-storage/)

@@ -1,7 +1,7 @@
 # CAP Theorem
 
-**Prerequisites:** `../01-scalability/`
-**Next:** `../03-consistency-models/`
+**Prerequisites:** [Scalability](../01-scalability/README.md)
+**Next:** [Consistency Models](../03-consistency-models/README.md)
 
 ---
 
@@ -293,3 +293,9 @@ docker compose down -v
 - **Assuming CP means "safe" and AP means "risky."** CP systems that lose quorum become completely unavailable — which
   can be more dangerous than stale reads in some operational contexts. Choose based on which failure mode is less
   catastrophic for your use case.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Scalability](../01-scalability/README.md)
+**Next:** [Consistency Models](../03-consistency-models/README.md)

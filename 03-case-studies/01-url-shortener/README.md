@@ -1,7 +1,8 @@
 # Case Study: URL Shortener
 
-**Prerequisites:** `../../01-foundations/05-partitioning-sharding/`, `../../01-foundations/06-caching/`,
-`../../01-foundations/09-indexes/`
+**Prerequisites:
+** [Partitioning & Sharding](../../01-foundations/05-partitioning-sharding/README.md), [Caching](../../01-foundations/06-caching/README.md),
+[Indexes](../../01-foundations/09-indexes/README.md)
 
 ---
 
@@ -402,3 +403,10 @@ docker compose down -v
     A: Never flush during peak traffic. Use a rolling warm-up: before cutting traffic post-maintenance, run
     `SELECT short_code, original FROM urls ORDER BY hits DESC LIMIT 100000` and pre-populate Redis. Then gradually shift
     traffic (5% → 20% → 100%), watching Postgres `pg_stat_activity` for connection saturation at each step.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Partitioning & Sharding](../../01-foundations/05-partitioning-sharding/README.md), [Caching](../../01-foundations/06-caching/README.md),
+[Indexes](../../01-foundations/09-indexes/README.md)

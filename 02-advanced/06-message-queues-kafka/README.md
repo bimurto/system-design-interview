@@ -1,7 +1,7 @@
 # Message Queues & Kafka
 
-**Prerequisites:** `../05-message-queues-fundamentals/`
-**Next:** `../07-stream-processing/`
+**Prerequisites:** [Message Queues — Fundamentals](../05-message-queues-fundamentals/README.md)
+**Next:** [Stream Processing](../07-stream-processing/README.md)
 
 ---
 
@@ -345,3 +345,9 @@ docker compose down -v
   a global service), all traffic for large countries concentrates on a single partition. This creates a hot partition
   that exceeds the throughput of a single consumer and cannot be parallelized. Choose a high-cardinality key (user_id,
   order_id) or add a random suffix for workloads where per-entity ordering isn't required.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Message Queues — Fundamentals](../05-message-queues-fundamentals/README.md)
+**Next:** [Stream Processing](../07-stream-processing/README.md)

@@ -1,7 +1,7 @@
 # Distributed Caching
 
 **Prerequisites:** `../06-stream-processing/`
-**Next:** `../09-search-systems/`
+**Next:** [Search Systems](../09-search-systems/README.md)
 
 ---
 
@@ -380,3 +380,9 @@ docker compose down -v
   hash tag requirements, cluster bus monitoring. If your dataset fits in 100GB (well within a single server's RAM),
   Redis Sentinel or single Redis is simpler, cheaper, and easier to operate. Choose Cluster when you need horizontal
   write scaling, not just HA.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../06-stream-processing/`
+**Next:** [Search Systems](../09-search-systems/README.md)

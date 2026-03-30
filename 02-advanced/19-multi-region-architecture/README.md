@@ -1,7 +1,8 @@
 # Multi-Region Architecture
 
-**Prerequisites:** `../../01-foundations/04-replication/`, `../02-distributed-transactions/`,
-`../03-consensus-paxos-raft/`
+**Prerequisites:
+** [Replication](../../01-foundations/04-replication/README.md), [Distributed Transactions](../02-distributed-transactions/README.md),
+[Consensus — Paxos & Raft](../03-consensus-paxos-raft/README.md)
 **Next:** `../../03-case-studies/`
 
 ---
@@ -281,3 +282,11 @@ docker compose down -v
 - **Forgetting DNS TTL during failover.** If DNS TTL is 300s (5 minutes), it takes up to 5 minutes for all clients to
   see a region failover in their DNS responses. For low-RTO failover, set DNS TTL to 30–60s (accepting higher DNS query
   volume) and use Anycast routing where possible.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Replication](../../01-foundations/04-replication/README.md), [Distributed Transactions](../02-distributed-transactions/README.md),
+[Consensus — Paxos & Raft](../03-consensus-paxos-raft/README.md)
+**Next:** `../../03-case-studies/`

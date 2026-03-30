@@ -1,7 +1,7 @@
 # Load Balancing
 
-**Prerequisites:** `../06-caching/`
-**Next:** `../08-databases-sql-vs-nosql/`
+**Prerequisites:** [Caching](../06-caching/README.md)
+**Next:** [Databases — SQL vs NoSQL](../08-databases-sql-vs-nosql/README.md)
 
 ---
 
@@ -278,3 +278,9 @@ docker compose down -v
 - **Forgetting SSL certificate renewal.** With TLS termination at the load balancer, the certificate lives in one place.
   Forgetting to renew it takes down HTTPS for all backends simultaneously. Use auto-renewal (Let's Encrypt / ACM) and
   monitor certificate expiry as a metric.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Caching](../06-caching/README.md)
+**Next:** [Databases — SQL vs NoSQL](../08-databases-sql-vs-nosql/README.md)

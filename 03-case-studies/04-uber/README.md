@@ -1,6 +1,7 @@
 # Case Study: Uber
 
-**Prerequisites:** `../../01-foundations/06-caching/`, `../../01-foundations/08-databases-sql-vs-nosql/`,
+**Prerequisites:
+** [Caching](../../01-foundations/06-caching/README.md), [Databases — SQL vs NoSQL](../../01-foundations/08-databases-sql-vs-nosql/README.md),
 `../../02-advanced/07-distributed-caching/`
 
 ---
@@ -571,3 +572,10 @@ docker compose down -v
     driver via push notification. (7) Driver has 15s to accept; on accept: HSET driver:status TRIP, create trip record
     in Postgres, notify rider. (8) On decline/timeout: offer to #2. (9) Fallback: if all candidates decline, expand
     radius to 10km and retry once. (10) If still no acceptance: return "no drivers available" after ~90 seconds total.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Caching](../../01-foundations/06-caching/README.md), [Databases — SQL vs NoSQL](../../01-foundations/08-databases-sql-vs-nosql/README.md),
+`../../02-advanced/07-distributed-caching/`

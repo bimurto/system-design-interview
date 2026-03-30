@@ -244,3 +244,9 @@ docker compose down
 - **Ignoring the cost of the rate-limit check itself.** A Redis round-trip adds 0.5-2ms to every request. For very
   high-throughput endpoints, move the check to a local counter with periodic Redis sync, or use Nginx's `limit_req_zone`
   which runs in shared memory without a network hop.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../08-search-systems/`
+**Next:** `../10-cdn-and-edge/`

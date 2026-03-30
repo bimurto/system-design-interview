@@ -1,7 +1,7 @@
 # Replication
 
-**Prerequisites:** `../03-consistency-models/`
-**Next:** `../05-partitioning-sharding/`
+**Prerequisites:** [Consistency Models](../03-consistency-models/README.md)
+**Next:** [Partitioning & Sharding](../05-partitioning-sharding/README.md)
 
 ---
 
@@ -242,3 +242,9 @@ docker compose down -v
 - **Treating multi-leader as a solution to everything.** Multi-leader replication is complex and conflicts are hard to
   resolve correctly. Use it only when geo-distributed write latency is a real business requirement, not as a premature
   optimization.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Consistency Models](../03-consistency-models/README.md)
+**Next:** [Partitioning & Sharding](../05-partitioning-sharding/README.md)

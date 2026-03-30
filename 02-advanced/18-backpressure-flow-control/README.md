@@ -1,7 +1,8 @@
 # Backpressure & Flow Control
 
-**Prerequisites:** `../05-message-queues-fundamentals/`, `../10-rate-limiting-algorithms/`
-**Next:** `../19-multi-region-architecture/`
+**Prerequisites:
+** [Message Queues — Fundamentals](../05-message-queues-fundamentals/README.md), [Rate Limiting Algorithms](../10-rate-limiting-algorithms/README.md)
+**Next:** [Multi-Region Architecture](../19-multi-region-architecture/README.md)
 
 ---
 
@@ -294,3 +295,10 @@ docker compose down -v
 - **Static thresholds that don't adapt.** A fixed `503 when queue > 100` threshold may be too aggressive during normal
   variance and too lenient during sustained overload. Adaptive throttling or sliding-window-based limits respond more
   gracefully than hard cutoffs.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:
+** [Message Queues — Fundamentals](../05-message-queues-fundamentals/README.md), [Rate Limiting Algorithms](../10-rate-limiting-algorithms/README.md)
+**Next:** [Multi-Region Architecture](../19-multi-region-architecture/README.md)

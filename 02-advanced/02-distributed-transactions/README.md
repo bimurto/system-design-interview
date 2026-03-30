@@ -1,7 +1,7 @@
 # Distributed Transactions
 
-**Prerequisites:** `../01-consistent-hashing/`
-**Next:** `../03-consensus-paxos-raft/`
+**Prerequisites:** [Consistent Hashing](../01-consistent-hashing/README.md)
+**Next:** [Consensus — Paxos & Raft](../03-consensus-paxos-raft/README.md)
 
 ---
 
@@ -309,3 +309,9 @@ docker compose down -v
   and update your database in another, a crash between the two will cause one without the other. Use the Outbox Pattern:
   write the event to an outbox table in the same local database transaction, and use a separate process (or
   CDC/Debezium) to relay it to the message bus.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Consistent Hashing](../01-consistent-hashing/README.md)
+**Next:** [Consensus — Paxos & Raft](../03-consensus-paxos-raft/README.md)

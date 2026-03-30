@@ -1,7 +1,7 @@
 # Stream Processing
 
 **Prerequisites:** `../05-message-queues-kafka/`
-**Next:** `../08-distributed-caching/`
+**Next:** [Distributed Caching](../08-distributed-caching/README.md)
 
 ---
 
@@ -378,3 +378,9 @@ docker compose down -v
 - **Ignoring the idle partition problem.** In multi-partition Kafka topics, the watermark is the minimum across all
   partitions. One idle partition stalls the entire pipeline. Use idle partition detection or per-partition watermarks
   with periodic wall-clock advancement.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** `../05-message-queues-kafka/`
+**Next:** [Distributed Caching](../08-distributed-caching/README.md)

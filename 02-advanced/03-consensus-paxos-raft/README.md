@@ -1,7 +1,7 @@
 # Consensus — Paxos & Raft
 
-**Prerequisites:** `../02-distributed-transactions/`
-**Next:** `../04-event-driven-architecture/`
+**Prerequisites:** [Distributed Transactions](../02-distributed-transactions/README.md)
+**Next:** [Event-Driven Architecture](../04-event-driven-architecture/README.md)
 
 ---
 
@@ -317,3 +317,9 @@ docker compose down -v
 - **Ignoring membership change complexity.** Adding or removing a node mid-operation requires joint consensus or
   single-server changes. Skipping this and manually reconfiguring can create split-brain during the transition window.
   Always use the cluster's built-in membership change API.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Distributed Transactions](../02-distributed-transactions/README.md)
+**Next:** [Event-Driven Architecture](../04-event-driven-architecture/README.md)

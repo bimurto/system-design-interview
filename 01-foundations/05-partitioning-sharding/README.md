@@ -1,7 +1,7 @@
 # Partitioning & Sharding
 
-**Prerequisites:** `../04-replication/`
-**Next:** `../06-caching/`
+**Prerequisites:** [Replication](../04-replication/README.md)
+**Next:** [Caching](../06-caching/README.md)
 
 ---
 
@@ -249,3 +249,9 @@ docker compose down -v
   between shards on update. Use stable, immutable keys (surrogate IDs, UUIDs) as shard keys to avoid this class of bug.
 - **Ignoring the logical shard layer.** Jumping straight from "3 physical hosts" to "hash % 3" locks you in. Starting
   with "1024 logical shards → 3 physical hosts" makes future rebalancing a metadata change rather than a data migration.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Replication](../04-replication/README.md)
+**Next:** [Caching](../06-caching/README.md)

@@ -1,6 +1,7 @@
 # Case Study: Web Crawler
 
-**Prerequisites:** `../../01-foundations/05-partitioning-sharding/`, `../../02-advanced/09-rate-limiting-algorithms/`,
+**Prerequisites:** [Partitioning & Sharding](../../01-foundations/05-partitioning-sharding/README.md),
+`../../02-advanced/09-rate-limiting-algorithms/`,
 `../../02-advanced/15-probabilistic-data-structures/`
 
 ---
@@ -477,3 +478,10 @@ docker compose down -v
     `hash(domain) % partitions` to find target Kafka partition. (6) Produce URL to frontier Kafka topic. (7) Worker
     assigned to that partition eventually consumes the URL, checks robots.txt cache, waits for politeness delay,
     fetches, and repeats.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Partitioning & Sharding](../../01-foundations/05-partitioning-sharding/README.md),
+`../../02-advanced/09-rate-limiting-algorithms/`,
+`../../02-advanced/15-probabilistic-data-structures/`

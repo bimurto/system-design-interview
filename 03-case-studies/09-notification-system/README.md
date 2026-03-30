@@ -1,6 +1,7 @@
 # Case Study: Notification System
 
-**Prerequisites:** `../../02-advanced/05-message-queues-kafka/`, `../../02-advanced/04-event-driven-architecture/`,
+**Prerequisites:**
+`../../02-advanced/05-message-queues-kafka/`, [Event-Driven Architecture](../../02-advanced/04-event-driven-architecture/README.md),
 `../../02-advanced/14-idempotency-exactly-once/`
 
 ---
@@ -533,3 +534,10 @@ docker compose --profile experiment down -v
     sliding window: `INCR notif:rl:{user_id}:{channel}:{minute}`. If the count exceeds the limit (e.g., 10 push/minute),
     suppress and drop the notification. This is distinct from third-party API rate limits (which are per-sender, not
     per-recipient). The limit should be configurable per notification type — transactional OTPs may be exempt.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:**
+`../../02-advanced/05-message-queues-kafka/`, [Event-Driven Architecture](../../02-advanced/04-event-driven-architecture/README.md),
+`../../02-advanced/14-idempotency-exactly-once/`

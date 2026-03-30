@@ -1,7 +1,7 @@
 # Message Queues — Fundamentals
 
-**Prerequisites:** `../../01-foundations/14-failure-modes-reliability/`
-**Next:** `../06-message-queues-kafka/`
+**Prerequisites:** [Failure Modes & Reliability Patterns](../../01-foundations/14-failure-modes-reliability/README.md)
+**Next:** [Message Queues & Kafka](../06-message-queues-kafka/README.md)
 
 ---
 
@@ -285,3 +285,9 @@ docker compose down -v
 - **Fanout to unbound queues.** In RabbitMQ, if a subscriber queue is not declared and bound to the exchange before the
   event is published, the event is silently dropped. Unlike Kafka (where a log retains messages for replay), RabbitMQ
   fanout only routes to currently bound queues. Late-joining consumers miss historical events.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Failure Modes & Reliability Patterns](../../01-foundations/14-failure-modes-reliability/README.md)
+**Next:** [Message Queues & Kafka](../06-message-queues-kafka/README.md)

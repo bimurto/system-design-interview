@@ -288,3 +288,9 @@ docker compose down -v
   managers (AWS Secrets Manager, Vault), or .env files excluded from git.
 - **Infinite refresh token lifetimes.** Refresh tokens that never expire create permanent backdoors if stolen. Implement
   refresh token expiration and rotation.
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [11 — API Design](../11-api-design/)
+**Next:** [12 — Blob/Object Storage](../12-blob-object-storage/)

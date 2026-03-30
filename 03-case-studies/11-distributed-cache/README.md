@@ -1,7 +1,7 @@
 # Case Study: Distributed Cache (Redis Internals)
 
-**Prerequisites:** `../../01-foundations/06-caching/`, `../../02-advanced/07-distributed-caching/`,
-`../../02-advanced/01-consistent-hashing/`
+**Prerequisites:** [Caching](../../01-foundations/06-caching/README.md), `../../02-advanced/07-distributed-caching/`,
+[Consistent Hashing](../../02-advanced/01-consistent-hashing/README.md)
 
 ---
 
@@ -541,3 +541,9 @@ docker compose down -v
     cached data throughout. No lock, no stale window. (3) **Stale-while-revalidate** for cases where brief staleness
     is acceptable — return the cached value immediately and asynchronously refresh. The mutex/single-flight pattern
     is simpler but adds tail latency (threads waiting for the single refresher).
+
+---
+
+<!-- bottom-nav -->
+**Prerequisites:** [Caching](../../01-foundations/06-caching/README.md), `../../02-advanced/07-distributed-caching/`,
+[Consistent Hashing](../../02-advanced/01-consistent-hashing/README.md)
