@@ -60,7 +60,7 @@ services:
   # The experiment uses Postgres for simplicity; this service is here to let
   # learners explore the Redis data structures described in the README.
   redis:
-    image: redis:7-alpine
+    image: redis:7
     ports:
       - "6379:6379"
     healthcheck:
