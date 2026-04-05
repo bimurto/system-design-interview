@@ -44,11 +44,14 @@ services:
     # is not yet ready (race between healthcheck pass and pg_hba reload).
     command: >
       bash -c "
-        until pg_basebackup -h postgres-primary -U postgres -D /var/lib/postgresql/data -Fp -Xs -P -R --checkpoint=fast; do
+        find /var/lib/postgresql/data -mindepth 1 -delete 2>/dev/null; true
+        chown postgres:postgres /var/lib/postgresql/data
+        chmod 0700 /var/lib/postgresql/data
+        until gosu postgres pg_basebackup -h postgres-primary -U postgres -D /var/lib/postgresql/data -Fp -Xs -P -R --checkpoint=fast; do
           echo 'pg_basebackup: primary not ready, retrying in 3s...'
           sleep 3
         done
-        exec postgres
+        exec gosu postgres postgres
       "
     restart: on-failure
     deploy:

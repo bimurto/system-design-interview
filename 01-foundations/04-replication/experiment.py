@@ -422,7 +422,7 @@ def main():
 
     print("  Stopping replica1 to simulate a replica failure...")
     r1_stop = subprocess.run(
-        ["docker", "compose", "stop", "postgres-replica1"],
+        ["docker-compose", "stop", "postgres-replica1"],
         capture_output=True, text=True
     )
     if r1_stop.returncode != 0:
@@ -473,7 +473,7 @@ def main():
     section("Phase 8: Replica Reconnection — WAL Catchup")
 
     print("  Restarting replica1...")
-    subprocess.run(["docker", "compose", "start", "postgres-replica1"],
+    subprocess.run(["docker-compose", "start", "postgres-replica1"],
                    capture_output=True, text=True)
 
     print("  Waiting for replica1 to reconnect and replay missed WAL...")

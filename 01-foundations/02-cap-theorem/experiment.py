@@ -24,7 +24,9 @@ Phases:
 
 import os
 import subprocess
+import sys
 import time
+import threading
 
 try:
     import psycopg2
@@ -66,7 +68,7 @@ def wait_for_postgres(dsn, label, max_attempts=20, delay=2):
 
 def docker_compose(*args):
     """Run a docker compose command from the script's own directory."""
-    cmd = ["docker", "compose"] + list(args)
+    cmd = ["docker-compose"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
     return result
 
@@ -208,7 +210,7 @@ def main():
 
     primary = connect(PRIMARY_DSN, "primary")
     if not primary:
-        print("  ERROR: Primary not reachable. Run 'docker compose up -d' first.")
+        print("  ERROR: Primary not reachable. Run 'docker-compose up -d' first.")
         return
 
     print("  Waiting for replica's pg_basebackup + startup to finish...")
@@ -292,7 +294,7 @@ def main():
 
   PostgreSQL's synchronous_commit=remote_write makes writes wait for the
   replica to confirm before returning. During a partition with no replica
-  reachable, this write will block until statement_timeout fires.
+  reachable, this write will block indefinitely.
 """)
 
     print("  Configuring primary for synchronous CP mode...")
@@ -305,46 +307,77 @@ def main():
         print("  synchronous_standby_names = 'FIRST 1 (*)' — primary now waits for replica WAL ack")
         time.sleep(1)
 
-        # Use a short statement_timeout so we don't hang forever
-        with primary.cursor() as cur:
-            cur.execute("SET statement_timeout = '4s'")
-            cur.execute("SET synchronous_commit = 'remote_write'")
-
         print("  Attempting write with synchronous_commit=remote_write (replica is DOWN)...")
         print("  Expect this to BLOCK then TIMEOUT — demonstrating CP unavailability...\n")
         start = time.perf_counter()
-        try:
-            with primary.cursor() as cur:
-                cur.execute("SET statement_timeout = '4s'")
-                cur.execute("SET synchronous_commit = 'remote_write'")
-                cur.execute(
-                    "UPDATE accounts SET balance = %s, updated_at = now() WHERE name = %s",
-                    (700, "Alice")
-                )
-            elapsed = time.perf_counter() - start
-            print(f"  Write returned in {elapsed:.2f}s — replica may have reconnected unexpectedly.")
-        except psycopg2.errors.QueryCanceled:
-            elapsed = time.perf_counter() - start
+
+        # Track the connection and result so we can close it on timeout
+        sync_conn = [None]
+        result_holder = [None]
+
+        def attempt_sync_write():
+            """Attempt a synchronous write - will block indefinitely without replica."""
+            conn = None
+            try:
+                conn = psycopg2.connect(PRIMARY_DSN)
+                sync_conn[0] = conn  # Store reference for cleanup
+                conn.autocommit = False
+                with conn.cursor() as cur:
+                    cur.execute("SET synchronous_commit = 'remote_write'")
+                    cur.execute(
+                        "UPDATE accounts SET balance = %s, updated_at = now() WHERE name = %s",
+                        (700, "Alice")
+                    )
+                conn.commit()
+                result_holder[0] = "success"
+            except psycopg2.errors.QueryCanceled:
+                result_holder[0] = "timeout"
+            except Exception as e:
+                result_holder[0] = f"error: {e}"
+            finally:
+                sync_conn[0] = None
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        # Use a daemon thread so it doesn't block process exit
+        write_thread = threading.Thread(target=attempt_sync_write, daemon=True)
+        write_thread.start()
+
+        # Wait up to 5 seconds for the write to complete
+        write_thread.join(timeout=5)
+        elapsed = time.perf_counter() - start
+
+        if write_thread.is_alive():
             print(f"  Write TIMED OUT after {elapsed:.1f}s — CP system sacrificed AVAILABILITY.")
             print("  The primary refused to acknowledge the write without replica confirmation.")
             print("  This is ZooKeeper/etcd behavior: correct data or no response.")
-        except Exception as e:
-            elapsed = time.perf_counter() - start
-            print(f"  Write failed after {elapsed:.1f}s: {e}")
+            # Close the connection to unblock the thread
+            if sync_conn[0] is not None:
+                try:
+                    sync_conn[0].close()
+                except Exception:
+                    pass
+        else:
+            if result_holder[0] == "success":
+                print(f"  Write returned in {elapsed:.2f}s — replica may have reconnected unexpectedly.")
+            elif result_holder[0] == "timeout":
+                print(f"  Write TIMED OUT after {elapsed:.1f}s — CP system sacrificed AVAILABILITY.")
+                print("  The primary refused to acknowledge the write without replica confirmation.")
+                print("  This is ZooKeeper/etcd behavior: correct data or no response.")
+            else:
+                print(f"  Write failed: {result_holder[0]}")
 
     except Exception as e:
         print(f"  [!] Could not configure synchronous mode: {e}")
     finally:
-        # Reset to async so partition healing works normally
-        try:
-            with primary.cursor() as cur:
-                cur.execute("ALTER SYSTEM SET synchronous_standby_names = ''")
-                cur.execute("SELECT pg_reload_conf()")
-                cur.execute("SET synchronous_commit = 'local'")
-                cur.execute("SET statement_timeout = 0")
-            print("\n  Reset to async replication (synchronous_standby_names = '') for Phase 5.")
-        except Exception:
-            pass
+        # Note: When synchronous_standby_names requires a standby, ALTER SYSTEM
+        # can also block waiting for WAL acknowledgment. We'll reset it after
+        # bringing the replica back in Phase 5.
+        print("\n  Note: synchronous_standby_names still set. Will reset after replica restart.")
+        sys.stdout.flush()
 
     # ── Phase 5: Heal the partition ────────────────────────────────────────
     section("Phase 5: Healing the Partition — WAL Catchup")
@@ -357,6 +390,16 @@ def main():
 
     print("  Waiting for replica to reconnect and replay missed WAL records...")
     healed_replica = wait_for_postgres(REPLICA_DSN, "replica", max_attempts=25, delay=2)
+
+    # Reset synchronous_standby_names now that replica is back (in case it was set in Phase 4)
+    print("\n  Resetting synchronous_standby_names to '' (async mode)...")
+    try:
+        with primary.cursor() as cur:
+            cur.execute("ALTER SYSTEM SET synchronous_standby_names = ''")
+            cur.execute("SELECT pg_reload_conf()")
+        print("  Reset synchronous_standby_names = '' on primary.")
+    except Exception as e:
+        print(f"  Warning: Could not reset synchronous_standby_names: {e}")
 
     if healed_replica:
         print("  Polling until replica catches up to primary's LSN...")

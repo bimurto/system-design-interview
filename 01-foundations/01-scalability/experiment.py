@@ -67,7 +67,7 @@ def send_requests(n, label, show_latency=False):
 
 def docker_compose(*args):
     """Run a docker compose sub-command, return True on success."""
-    cmd = ["docker", "compose"] + list(args)
+    cmd = ["docker-compose"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0
 

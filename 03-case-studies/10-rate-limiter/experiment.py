@@ -121,7 +121,7 @@ def burst(base_url: str, n: int, api_key: str = "anonymous",
 
 def docker_cmd(args: list[str]) -> tuple[int, str]:
     """Run a docker compose command, return (returncode, stdout+stderr)."""
-    cmd = ["docker", "compose"] + args
+    cmd = ["docker-compose"] + args
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode, (result.stdout + result.stderr).strip()
 

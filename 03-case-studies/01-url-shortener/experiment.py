@@ -496,7 +496,7 @@ def phase8_thundering_herd(codes):
         # Fallback: Docker exec
         import subprocess
         result = subprocess.run(
-            ["docker", "compose", "exec", "-T", "cache", "redis-cli", "FLUSHALL"],
+            ["docker-compose", "exec", "-T", "cache", "redis-cli", "FLUSHALL"],
             capture_output=True, text=True,
             cwd="/Users/bimurto/Work/personal/system-design-content/system-design-interview/03-case-studies/01-url-shortener"
         )
