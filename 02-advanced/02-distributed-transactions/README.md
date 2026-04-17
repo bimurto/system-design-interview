@@ -60,14 +60,14 @@ If any voted NO, coordinator sends ABORT to all. Participants that voted YES rol
   Coordinator        Participant A      Participant B
       |                   |                  |
       |---- PREPARE ----->|                  |
-      |---- PREPARE ----------------------->|
+      |---- PREPARE ------------------------>|
       |<--- YES ----------|                  |
       |<--- YES -----------------------------|
       |                   |                  |
       [coordinator writes "commit" to its own durable log]
       |                   |                  |
       |---- COMMIT ------>|                  |   ← if coordinator crashes HERE
-      |---- COMMIT ----------------------->|       Participant A already committed
+      |---- COMMIT ------------------------->|       Participant A already committed
       |                   |                  |       Participant B is stuck waiting!
       |                   |                  |       (holds write locks indefinitely)
 ```

@@ -182,7 +182,10 @@ class TwoPhaseCoordinator:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(f"ROLLBACK PREPARED '{prepare_name}'")
-                    conn.autocommit = True
+                    try:
+                        conn.autocommit = True
+                    except psycopg2.ProgrammingError:
+                        pass
                 except Exception:
                     pass
             return False
@@ -193,7 +196,10 @@ class TwoPhaseCoordinator:
             for name, conn, prepare_name in prepared_conns:
                 with conn.cursor() as cur:
                     cur.execute(f"COMMIT PREPARED '{prepare_name}'")
-                conn.autocommit = True
+                try:
+                    conn.autocommit = True
+                except psycopg2.ProgrammingError:
+                    pass
                 print(f"    {name}: COMMITTED")
             return True
         else:
@@ -202,10 +208,13 @@ class TwoPhaseCoordinator:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(f"ROLLBACK PREPARED '{prepare_name}'")
-                    conn.autocommit = True
+                    try:
+                        conn.autocommit = True
+                    except psycopg2.ProgrammingError:
+                        pass
                     print(f"    {name}: ROLLED BACK")
                 except Exception:
-                    conn.autocommit = True
+                    pass
             return False
 
 
@@ -244,6 +253,12 @@ class SagaOrchestrator:
                 print(f"      This is a 'stuck saga' — requires manual intervention")
 
 
+def pause_for_user():
+    print("\n" + "=" * 64)
+    input("  Press ENTER to continue to the next phase...")
+    print("=" * 64 + "\n")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -279,6 +294,14 @@ def main():
 
     setup_schemas()
     show_state("Initial state")
+
+    print("""
+  Summary of Phase 1: We will demonstrate a successful Two-Phase Commit (2PC).
+  The coordinator will ask both db-orders and db-inventory to PREPARE. Both
+  will vote YES and write to their durable logs. Then, the coordinator will
+  broadcast a COMMIT command and both will commit their prepared transactions.
+""")
+    pause_for_user()
 
     # ── Phase 1: Successful 2PC ────────────────────────────────────
     section("Phase 1: Successful Two-Phase Commit (2PC)")
@@ -329,6 +352,14 @@ def main():
     print(f"\n  Result: {'COMMITTED' if success else 'ABORTED'}")
     show_state("After successful 2PC")
 
+    print("""
+  Summary of Phase 2: We will demonstrate the fundamental flaw of 2PC - the
+  Blocking Problem. The coordinator will send PREPARE, both databases will
+  vote YES and lock their resources, and then the coordinator will crash before
+  COMMIT. The databases will be stuck waiting with locked rows until recovery.
+""")
+    pause_for_user()
+
     # ── Phase 2: Failed 2PC (coordinator crash) ────────────────────
     section("Phase 2: 2PC Coordinator Crash — The Blocking Problem")
     print("""
@@ -376,7 +407,13 @@ def main():
   BUT: 3PC is still not safe under network partitions (a split-brain can
   cause some participants to commit and others to abort). In practice,
   neither 2PC nor 3PC is used in modern geo-distributed systems.
+
+  Summary of Phase 3: We will transition to the Saga pattern which is non-blocking.
+  The coordinator isn't used. Instead, each local transaction commits immediately.
+  If a subsequent step fails, we run compensating transactions to reverse previous
+  steps. We'll simulate a failure and watch the compensation roll things back.
 """)
+    pause_for_user()
 
     # ── Phase 3: Saga Pattern ──────────────────────────────────────
     section("Phase 3: Saga Pattern — Choreography with Compensations")
@@ -443,7 +480,7 @@ def main():
 
     show_state("After saga compensation (should be back to original)")
 
-    print(f"""
+    print("""
   Result: inventory restored to 50, no order created — consistent!
 
   Saga trade-offs:
@@ -462,7 +499,14 @@ def main():
   Orchestration: a central saga orchestrator (a separate service) directs
   each participant via commands. Easier to track saga state but introduces
   a central point of coordination.
+
+  Summary of Phase 4: We'll see what happens when the compensation transaction
+  itself fails ("Stuck Saga"). The system is caught in an inconsistent state
+  where an order hasn't been created, but inventory is already deducted, and
+  the compensation to restore inventory fails due to a locked row. We'll then
+  simulate an SRE (human) manually intervening to fix it.
 """)
+    pause_for_user()
 
     # ── Phase 4: Stuck Saga ─────────────────────────────────────
     section("Phase 4: Stuck Saga — When Compensation Itself Fails")
@@ -551,6 +595,15 @@ def main():
         print(f"  Recovery complete. Inventory restored.")
 
     show_state("After stuck saga recovery")
+
+    print("""
+  Summary of Phase 5: To prevent double-charging or double-deducting during
+  retries, we'll demonstrate Idempotency using an idempotency key. The
+  transaction will check if a key has already been processed before executing.
+  We will simulate two calls with the same key to verify the second call skips
+  the business logic.
+""")
+    pause_for_user()
 
     # ── Phase 5: Idempotent Saga Steps ────────────────────────────
     section("Phase 5: Idempotent Saga Steps — Preventing Double-Charges on Retry")

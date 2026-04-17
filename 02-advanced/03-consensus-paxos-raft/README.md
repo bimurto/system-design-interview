@@ -214,7 +214,7 @@ docker compose up -d
 
 ```bash
 pip install etcd3
-python experiment.py
+PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python experiment.py
 ```
 
 The script demonstrates:

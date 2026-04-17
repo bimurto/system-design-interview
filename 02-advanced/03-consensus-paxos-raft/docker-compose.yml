@@ -4,7 +4,7 @@ networks:
 
 services:
   etcd0:
-    image: quay.io/etcd-io/etcd:v3.5.9
+    image: gcr.io/etcd-development/etcd:v3.5.9
     container_name: etcd0
     networks:
       - raft-net
@@ -31,7 +31,7 @@ services:
       retries: 10
 
   etcd1:
-    image: quay.io/etcd-io/etcd:v3.5.9
+    image: gcr.io/etcd-development/etcd:v3.5.9
     container_name: etcd1
     networks:
       - raft-net
@@ -58,7 +58,7 @@ services:
       retries: 10
 
   etcd2:
-    image: quay.io/etcd-io/etcd:v3.5.9
+    image: gcr.io/etcd-development/etcd:v3.5.9
     container_name: etcd2
     networks:
       - raft-net

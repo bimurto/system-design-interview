@@ -44,6 +44,11 @@ def section(title):
     print("=" * 60)
 
 
+def pause_for_user():
+    input("\nPress Enter to continue to the next phase...")
+    print("\n")
+
+
 def get_client(host="localhost", port=2379, timeout=3):
     return etcd3.client(host=host, port=port, timeout=timeout)
 
@@ -133,7 +138,7 @@ def main():
 
     ┌──────────────────────────────────────────────────────────────────┐
     │                                                                  │
-    │  FOLLOWER ──(timeout)──► CANDIDATE ──(wins majority)──► LEADER  │
+    │  FOLLOWER ──(timeout)──► CANDIDATE ──(wins majority)──► LEADER   │
     │     ▲                        │                             │     │
     │     └───────(loses or sees   │                             │     │
     │              higher term)────┘                             │     │
@@ -167,6 +172,9 @@ def main():
         print(f"  ERROR: cannot connect to etcd: {e}")
         print("  Run: docker compose up -d && sleep 20")
         sys.exit(1)
+
+    print("\nSUMMARY BEFORE PHASE 1: We have successfully connected to the 3-node etcd cluster. We will now perform a basic write operation (which gets replicated across nodes via Raft) and read it back.\n")
+    pause_for_user()
 
     # ── Phase 1: Write and cross-node read ────────────────────────
     section("Phase 1: Raft Replication — Write and Read")
@@ -211,6 +219,9 @@ def main():
     they hold the lease simultaneously — a subtle but real hazard.
 """)
 
+    print("\nSUMMARY BEFORE PHASE 2: Data has been written and replicated. Now we will inspect the internal state of the Raft cluster, identifying which node is currently the leader, the current term number, and the log index.\n")
+    pause_for_user()
+
     # ── Phase 2: Observe current leader and term ──────────────────
     section("Phase 2: Cluster Status — Leader, Term, and Raft Index")
 
@@ -236,6 +247,9 @@ def main():
   to follower and updates its term. This prevents a partitioned
   ex-leader from accepting writes after a new leader is elected.
 """)
+
+    print("\nSUMMARY BEFORE PHASE 3: We know the current leader. Next, we will simulate a failure by killing the leader node. The cluster will automatically detect this, hold a new election, and promote a follower to leader.\n")
+    pause_for_user()
 
     # ── Phase 3: Kill the leader, measure election latency ────────
     section("Phase 3: Kill the Leader — Measure Election Latency")
@@ -305,6 +319,9 @@ def main():
   The old leader could not commit them (it had no quorum). Safe to retry.
 """)
 
+    print("\nSUMMARY BEFORE PHASE 4: The cluster has recovered from the leader failure and we now have 2 out of 3 nodes running. In this next phase, we will kill a second node. With only 1 node remaining, the cluster will lose its quorum (majority) and refuse new writes.\n")
+    pause_for_user()
+
     # ── Phase 4: Kill a second node — lose quorum ─────────────────
     section("Phase 4: Kill Second Node — Quorum Lost (1/3), Writes Fail")
 
@@ -345,6 +362,9 @@ def main():
     odd-numbered clusters: 3, 5, or 7 nodes.
 """)
 
+    print("\nSUMMARY BEFORE PHASE 5: The cluster is currently unable to accept writes due to lost quorum. Next, we will restart the second node we killed. This will restore quorum, allowing the node to catch up on missed entries and the cluster to resume accepting writes.\n")
+    pause_for_user()
+
     # ── Phase 5: Restart node — quorum restored ───────────────────
     section("Phase 5: Restart One Node — Quorum Restored (2/3)")
 
@@ -378,6 +398,9 @@ def main():
     Safety: the leader only sends entries the rejoined node is MISSING.
     It identifies the gap via the follower's nextIndex (tracked per peer).
 """)
+
+    print("\nSUMMARY BEFORE PHASE 6: The cluster is functional again. We will now demonstrate a critical distributed systems primitive: Compare-and-Swap (CAS). This shows how distributed locking is implemented using etcd transactions.\n")
+    pause_for_user()
 
     # ── Phase 6: Compare-and-swap (distributed lock primitive) ────
     section("Phase 6: Compare-and-Swap — The Distributed Lock Primitive")
@@ -438,6 +461,9 @@ def main():
     active instance. The active pod refreshes the lease; if it fails,
     the lease expires, a standby pod wins the next CAS, and takes over.
 """)
+
+    print("\nSUMMARY BEFORE PHASE 7: We've seen how CAS enables atomic operations. Finally, we'll restore the original killed node to bring the cluster back to its initial 3-node state, and present a theoretical comparison of consensus protocols (Paxos vs Raft vs ZAB).\n")
+    pause_for_user()
 
     # Restart the originally-killed leader container too
     print(f"  Restarting '{leader_container}' to restore full cluster...")
